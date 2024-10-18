@@ -1,6 +1,7 @@
 plugins { id("buildlogic.kotlin-library-conventions") }
 
 dependencies {
+  implementation("org.graalvm.compiler:compiler:24.1.1")
   implementation("org.graalvm.polyglot:polyglot:24.1.1")
   implementation("org.graalvm.polyglot:js:24.1.1")
   implementation("org.graalvm.polyglot:python:24.1.1")
@@ -10,4 +11,5 @@ dependencies {
   implementation("org.graalvm.polyglot:llvm:24.1.1")
   implementation("org.graalvm.polyglot:llvm-native:24.1.1")
   implementation("org.graalvm.ruby:ruby:24.1.1")
+  implementation("io.mvnpm:esbuild-java:1.5.1")
 }

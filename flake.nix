@@ -12,8 +12,10 @@
       devShell = forEachSystem
         (system: pkgs: pkgs.mkShell rec {
           packages = with pkgs; [
-	    graalvm-ce
-	    gradle
+            graalvm-ce
+            (callPackage gradle-packages.gradle_8 {
+              java = graalvm-ce;
+            })
           ];
         });
     };

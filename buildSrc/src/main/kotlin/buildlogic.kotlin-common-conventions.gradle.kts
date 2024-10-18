@@ -1,4 +1,6 @@
-plugins { id("org.jetbrains.kotlin.jvm") }
+plugins {
+    id("org.jetbrains.kotlin.jvm")
+}
 
 repositories { mavenCentral() }
 
@@ -10,6 +12,6 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
-java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }
 
 tasks.named<Test>("test") { useJUnitPlatform() }

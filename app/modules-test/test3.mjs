@@ -1,1 +1,1 @@
-export const i = "eye";
+export const i = "hello from constant!";

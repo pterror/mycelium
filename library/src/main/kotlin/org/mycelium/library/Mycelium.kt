@@ -9,12 +9,15 @@ import java.nio.file.OpenOption
 import java.nio.file.Path
 import java.nio.file.attribute.FileAttribute
 import org.graalvm.polyglot.Context
+import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.FileSystem
+import org.graalvm.polyglot.io.IOAccess
 
 class Mycelium {
-    val context = Context.create()
+    // `allowIO` is required for imports to work
+    val context = Context.newBuilder().allowIO(IOAccess.ALL).build()
 
-    fun runString(code: String, language: String) {
+    fun runString(language: String, code: String) {
         context.eval(language, code)
     }
 
@@ -22,7 +25,8 @@ class Mycelium {
         val file = File(path)
         val language = languageFromExtension(file.extension)!!
         val code = file.readText()
-        runString(language, code)
+        val source = Source.newBuilder(language, code, path).build()
+        context.eval(source)
     }
 
     fun languageFromExtension(extension: String) =

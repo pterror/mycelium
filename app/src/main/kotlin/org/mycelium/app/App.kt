@@ -4,5 +4,5 @@ import org.mycelium.library.Mycelium
 
 fun main() {
   val vm = Mycelium()
-  vm.runString("console.log(1)", "js")
+  vm.runFile("modules-test/test.mjs")
 }

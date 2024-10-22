@@ -22,6 +22,9 @@ class Mycelium {
     // `allowIO` is required for imports to work
     val context =
             Context.newBuilder()
+                    // Enable `Polyglot` and `Java` globals
+                    .allowAllAccess(true)
+                    // Intercept file system calls (used to support HTTP imports)
                     .allowIO(IOAccess.newBuilder().fileSystem(InterceptingFileSystem()).build())
                     .build()
 

@@ -5,11 +5,7 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
-import java.nio.file.AccessMode
 import java.nio.file.DirectoryStream.Filter
-import java.nio.file.LinkOption
-import java.nio.file.OpenOption
-import java.nio.file.Path
 import java.nio.file.attribute.FileAttribute
 import kotlin.math.max
 import kotlin.math.min
@@ -18,11 +14,12 @@ import org.graalvm.polyglot.Context
 import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.FileSystem
 import org.graalvm.polyglot.io.IOAccess
+import java.nio.file.*
 
 class Mycelium {
-    val filesystem = InterceptingFileSystem()
+    private val filesystem = InterceptingFileSystem()
     // `allowIO` is required for imports to work
-    val context =
+    private val context: Context =
             Context.newBuilder()
                     // Enable `Polyglot` and `Java` globals
                     .allowAllAccess(true)
@@ -34,10 +31,6 @@ class Mycelium {
         filesystem.init(context)
     }
 
-    fun runString(language: String, code: String) {
-        context.eval(language, code)
-    }
-
     fun runFile(path: String) {
         val file = File(path)
         val language = languageFromExtension(file.extension)!!
@@ -46,7 +39,7 @@ class Mycelium {
         context.eval(source)
     }
 
-    fun languageFromExtension(extension: String) =
+    private fun languageFromExtension(extension: String) =
             when (extension) {
                 "js", "mjs", "ts", "mts" -> "js"
                 "py" -> "python"
@@ -56,8 +49,8 @@ class Mycelium {
             }
 }
 
-class HttpChannel(val uri: URI) : SeekableByteChannel {
-    private final val connection = uri.toURL().openConnection() as HttpURLConnection
+class HttpChannel(uri: URI) : SeekableByteChannel {
+    private val connection = uri.toURL().openConnection() as HttpURLConnection
     private var buffer = ByteBuffer.allocate(8192)
     private var length = 0
 
@@ -104,9 +97,7 @@ class HttpChannel(val uri: URI) : SeekableByteChannel {
         val end = buffer.position() + p0.limit()
         if (end > length) fetchMoreData()
         val bytesRead = min(p0.limit() - p0.arrayOffset(), length - buffer.position())
-        println("bytesRead=$bytesRead pos=${buffer.position()} end=$end length=$length ${buffer.position()}")
         buffer.get(p0.array(), p0.arrayOffset(), bytesRead)
-        println(p0.array().toString(Charsets.UTF_8))
         return if (bytesRead == 0) -1 else bytesRead
     }
 
@@ -137,7 +128,6 @@ class HttpChannel(val uri: URI) : SeekableByteChannel {
     }
 
     override fun truncate(p0: Long): SeekableByteChannel {
-        println("a")
         length = p0.toInt()
         buffer.limit(length)
         buffer.compact()
@@ -146,17 +136,17 @@ class HttpChannel(val uri: URI) : SeekableByteChannel {
 }
 
 class InterceptingFileSystem : FileSystem {
-    private final var context: Context? = null
-    private final val delegate = FileSystem.newDefaultFileSystem()
+    private var context: Context? = null
+    private val delegate = FileSystem.newDefaultFileSystem()
 
     fun init(context: Context) {
         this.context = context
     }
 
-    override fun parsePath(uri: URI) =
-            if (uri.toString().startsWith('/')) Path.of(uri) else Path.of("/.mycelium/" + uri)
+    override fun parsePath(uri: URI): Path =
+            if (uri.toString().startsWith('/')) Path.of(uri) else Path.of("/.mycelium/$uri")
 
-    override fun parsePath(path: String) = Path.of(path)
+    override fun parsePath(path: String): Path = Path.of(path)
 
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) =
             delegate.checkAccess(path, modes, *linkOptions)
@@ -164,34 +154,32 @@ class InterceptingFileSystem : FileSystem {
     override fun createDirectory(dir: Path, vararg attrs: FileAttribute<*>) =
             delegate.createDirectory(dir, *attrs)
 
-    override fun delete(path: Path) {}
+    override fun delete(path: Path) {
+        delegate.delete(path)
+    }
 
     override fun newByteChannel(
             path: Path,
             options: Set<OpenOption>,
             vararg attrs: FileAttribute<*>
-    ): SeekableByteChannel {
-        if (path.startsWith("/.mycelium/")) {
-            val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
-            return when (uri.scheme) {
-                "http", "https" -> HttpChannel(uri)
-                else -> {
-                    throw Error("Unknown scheme ${uri.scheme}")
-                }
-            }
-        } else {
-            return delegate.newByteChannel(path, options, *attrs)
+    ): SeekableByteChannel = if (path.startsWith("/.mycelium/")) {
+        val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
+        when (uri.scheme) {
+            "http", "https" -> HttpChannel(uri)
+            else -> throw Error("Unknown scheme ${uri.scheme}")
         }
+    } else {
+        delegate.newByteChannel(path, options, *attrs)
     }
 
-    override fun newDirectoryStream(dir: Path, filter: Filter<in Path>) =
+    override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> =
             delegate.newDirectoryStream(dir, filter)
 
-    override fun toAbsolutePath(path: Path) = path.toAbsolutePath()
+    override fun toAbsolutePath(path: Path): Path = path.toAbsolutePath()
 
-    override fun toRealPath(path: Path, vararg linkOptions: LinkOption) =
+    override fun toRealPath(path: Path, vararg linkOptions: LinkOption): Path =
             path.toRealPath(*linkOptions)
 
-    override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption) =
+    override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> =
             delegate.readAttributes(path, attributes, *options)
 }

@@ -3,6 +3,7 @@ import "./app/modulestest/import.mjs";
 import "http://curls.it/hkibj.mjs";
 import "https://curls.it/4JVnm.mjs";
 import { i } from "./app/modulestest/constant.mjs";
+import "./app/modulestest/import.rb";
 console.log(i);
 Polyglot.eval("js", "console.log('hello from js polyglot eval!')")
 Polyglot.eval("python", "print('hello from python polyglot eval!')")

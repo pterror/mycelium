@@ -1,5 +1,7 @@
 package org.mycelium.library
 
+import com.oracle.truffle.api.Truffle
+import com.oracle.truffle.api.frame.FrameInstance
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -15,17 +17,20 @@ import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.FileSystem
 import org.graalvm.polyglot.io.IOAccess
 import java.nio.file.*
+import kotlin.io.path.extension
+import kotlin.io.path.readText
 
 class Mycelium {
     private val filesystem = InterceptingFileSystem()
+
     // `allowIO` is required for imports to work
     private val context: Context =
-            Context.newBuilder()
-                    // Enable `Polyglot` and `Java` globals
-                    .allowAllAccess(true)
-                    // Intercept file system calls (used to support HTTP imports)
-                    .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
-                    .build()
+        Context.newBuilder()
+            // Enable `Polyglot` and `Java` globals
+            .allowAllAccess(true)
+            // Intercept file system calls (used to support HTTP imports)
+            .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
+            .build()
 
     init {
         filesystem.init(context)
@@ -39,7 +44,8 @@ class Mycelium {
         context.eval(source)
     }
 
-    private fun languageFromExtension(extension: String) =
+    companion object {
+        fun languageFromExtension(extension: String) =
             when (extension) {
                 "js", "mjs", "ts", "mts" -> "js"
                 "py" -> "python"
@@ -47,6 +53,7 @@ class Mycelium {
                 "wasm" -> "wasm"
                 else -> null
             }
+    }
 }
 
 class HttpChannel(uri: URI) : SeekableByteChannel {
@@ -83,11 +90,11 @@ class HttpChannel(uri: URI) : SeekableByteChannel {
             val position = buffer.position()
             buffer.position(length)
             val bytesRead =
-                    connection.inputStream.read(
-                            buffer.array(),
-                            buffer.arrayOffset(),
-                            buffer.capacity() - buffer.arrayOffset()
-                    )
+                connection.inputStream.read(
+                    buffer.array(),
+                    buffer.arrayOffset(),
+                    buffer.capacity() - buffer.arrayOffset()
+                )
             length += max(0, bytesRead)
             buffer.position(position)
         }
@@ -144,42 +151,78 @@ class InterceptingFileSystem : FileSystem {
     }
 
     override fun parsePath(uri: URI): Path =
-            if (uri.toString().startsWith('/')) Path.of(uri) else Path.of("/.mycelium/$uri")
+        if (uri.toString().startsWith('/')) Path.of(uri) else Path.of("/.mycelium/$uri")
 
     override fun parsePath(path: String): Path = Path.of(path)
 
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) =
-            delegate.checkAccess(path, modes, *linkOptions)
+        delegate.checkAccess(path, modes, *linkOptions)
 
     override fun createDirectory(dir: Path, vararg attrs: FileAttribute<*>) =
-            delegate.createDirectory(dir, *attrs)
+        delegate.createDirectory(dir, *attrs)
 
     override fun delete(path: Path) {
         delegate.delete(path)
     }
 
     override fun newByteChannel(
-            path: Path,
-            options: Set<OpenOption>,
-            vararg attrs: FileAttribute<*>
-    ): SeekableByteChannel = if (path.startsWith("/.mycelium/")) {
-        val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
-        when (uri.scheme) {
-            "http", "https" -> HttpChannel(uri)
-            else -> throw Error("Unknown scheme ${uri.scheme}")
+        path: Path,
+        options: Set<OpenOption>,
+        vararg attrs: FileAttribute<*>
+    ): SeekableByteChannel {
+        val callTarget = Truffle.getRuntime().iterateFrames(fun(frame) = "${frame.callTarget}")
+        val hostLanguage = if (callTarget.startsWith("GraalJSEvaluator.ModuleScriptRoot@")) {
+            "js"
+        } else {
+            println("Host language module class is $callTarget")
+            "TODO"
         }
-    } else {
-        delegate.newByteChannel(path, options, *attrs)
+        val targetLanguage = Mycelium.languageFromExtension(path.extension)
+        if (hostLanguage == targetLanguage || targetLanguage == null) {
+            return if (path.startsWith("/.mycelium/")) {
+                val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
+                when (uri.scheme) {
+                    "http", "https" -> HttpChannel(uri)
+                    else -> throw Error("Unknown scheme ${uri.scheme}")
+                }
+            } else {
+                delegate.newByteChannel(path, options, *attrs)
+            }
+        } else {
+            // TODO
+            val code = if (path.startsWith("/.mycelium/")) {
+                val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
+                when (uri.scheme) {
+                    "http", "https" -> uri.toURL().readText()
+                    else -> throw Error("Unknown scheme ${uri.scheme}")
+                }
+            } else {
+                path.readText()
+            }
+            val value = context!!.eval(targetLanguage, code)
+            when (hostLanguage) {
+                "js" -> {
+                    val sb = StringBuilder()
+                    for (k in value.memberKeys) {
+                        // TODO: How to bind and inject a reference to this binding?
+                        val v = value.getMember(k)
+                        sb.append("export const $k = Polyglot.getBinding(\"v\")")
+                    }
+                    BufferChannel("")
+                }
+                else -> throw Error("We do not know how to serialize to host language $hostLanguage")
+            }
+        }
     }
 
     override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> =
-            delegate.newDirectoryStream(dir, filter)
+        delegate.newDirectoryStream(dir, filter)
 
     override fun toAbsolutePath(path: Path): Path = path.toAbsolutePath()
 
     override fun toRealPath(path: Path, vararg linkOptions: LinkOption): Path =
-            path.toRealPath(*linkOptions)
+        path.toRealPath(*linkOptions)
 
     override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> =
-            delegate.readAttributes(path, attributes, *options)
+        delegate.readAttributes(path, attributes, *options)
 }

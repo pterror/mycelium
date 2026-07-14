@@ -68,6 +68,19 @@ class Mycelium {
 
         fun needsCompilation(extension: String) =
             extension in listOf("c", "rs", "go")
+
+        private val jsIdentifierRegex = Regex("^[a-zA-Z_$][a-zA-Z0-9_$]*$")
+        private val jsReservedWords = setOf(
+            "break", "case", "catch", "continue", "debugger", "default", "delete",
+            "do", "else", "finally", "for", "function", "if", "in", "instanceof",
+            "new", "return", "switch", "this", "throw", "try", "typeof", "var",
+            "void", "while", "with", "class", "const", "enum", "export", "extends",
+            "import", "super", "implements", "interface", "let", "package", "private",
+            "protected", "public", "static", "yield"
+        )
+
+        fun isValidJsExport(name: String) =
+            jsIdentifierRegex.matches(name) && name !in jsReservedWords
     }
 }
 
@@ -256,8 +269,10 @@ class InterceptingFileSystem : FileSystem {
         val hostLanguage = if (callTarget.startsWith("GraalJSEvaluator.ModuleScriptRoot@")) {
             "js"
         } else {
-            println("Host language module class is $callTarget")
-            "TODO"
+            null
+        }
+        if (hostLanguage == null) {
+            return delegate.newByteChannel(path, options, *attrs)
         }
         val targetLanguage = Mycelium.languageFromExtension(path.extension)
         if (Mycelium.needsCompilation(path.extension) && !path.startsWith("/.mycelium/")) {
@@ -302,14 +317,14 @@ class InterceptingFileSystem : FileSystem {
             return when (hostLanguage) {
                 "js" -> {
                     val sb = StringBuilder()
+                    val bindings = context!!.polyglotBindings
                     for (k in value.memberKeys) {
-                        // TODO: How to bind and inject a reference to this binding?
-                        val v = value.getMember(k)
-                        sb.append("export const $k = Polyglot.getBinding(\"v\")")
+                        if (!Mycelium.isValidJsExport(k)) continue
+                        bindings.putMember(k, value.getMember(k))
+                        sb.append("export const $k = Polyglot.import(\"$k\");\n")
                     }
                     ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(sb.toString()))
                 }
-                // TODO: Other languages
                 else -> throw Error("We do not know how to serialize to host language $hostLanguage")
             }
         }

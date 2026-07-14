@@ -21,20 +21,147 @@ import java.nio.file.*
 import kotlin.io.path.extension
 import kotlin.io.path.readText
 
-class Mycelium {
+interface LanguageSupport {
+    val languageId: String
+    val extensions: List<String>
+    val compilerCommand: List<String>?
+    val needsCompilation: Boolean get() = compilerCommand != null
+
+    fun detectFrame(frame: String): Boolean
+    fun isValidExportName(name: String): Boolean
+    fun generateShim(exports: Map<String, String>): String
+}
+
+object JsSupport : LanguageSupport {
+    override val languageId = "js"
+    override val extensions = listOf("js", "mjs", "ts", "mts")
+    override val compilerCommand = null
+
+    override fun detectFrame(frame: String) =
+        frame.startsWith("GraalJSEvaluator.ModuleScriptRoot@")
+
+    private val identifierRegex = Regex("^[a-zA-Z_$][a-zA-Z0-9_$]*$")
+    private val reservedWords = setOf(
+        "break", "case", "catch", "continue", "debugger", "default", "delete",
+        "do", "else", "finally", "for", "function", "if", "in", "instanceof",
+        "new", "return", "switch", "this", "throw", "try", "typeof", "var",
+        "void", "while", "with", "class", "const", "enum", "export", "extends",
+        "import", "super", "implements", "interface", "let", "package", "private",
+        "protected", "public", "static", "yield"
+    )
+
+    override fun isValidExportName(name: String) =
+        identifierRegex.matches(name) && name !in reservedWords
+
+    override fun generateShim(exports: Map<String, String>): String =
+        exports.entries.joinToString("\n") { (name, key) ->
+            "export const $name = Polyglot.import(\"$key\");"
+        }
+}
+
+object RubySupport : LanguageSupport {
+    override val languageId = "ruby"
+    override val extensions = listOf("rb")
+    override val compilerCommand = null
+
+    override fun detectFrame(frame: String) =
+        frame.startsWith("Kernel#require") ||
+        frame.startsWith("Kernel#gem_original_require") ||
+        frame.startsWith("Truffle::Boot.")
+
+    private val identifierRegex = Regex("^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+    override fun isValidExportName(name: String) =
+        identifierRegex.matches(name)
+
+    override fun generateShim(exports: Map<String, String>): String {
+        val sb = StringBuilder()
+        for ((name, key) in exports) {
+            sb.append("$name = Polyglot.import(\"$key\")\n")
+        }
+        return sb.toString()
+    }
+}
+
+object PythonSupport : LanguageSupport {
+    override val languageId = "python"
+    override val extensions = listOf("py")
+    override val compilerCommand = null
+
+    override fun detectFrame(frame: String) =
+        frame.contains("import") && frame.contains("python")
+
+    private val identifierRegex = Regex("^[a-zA-Z_][a-zA-Z0-9_]*$")
+    private val reservedWords = setOf(
+        "False", "None", "True", "and", "as", "assert", "async", "await",
+        "break", "class", "continue", "def", "del", "elif", "else", "except",
+        "finally", "for", "from", "global", "if", "import", "in", "is",
+        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+        "while", "with", "yield"
+    )
+
+    override fun isValidExportName(name: String) =
+        identifierRegex.matches(name) && name !in reservedWords
+
+    override fun generateShim(exports: Map<String, String>): String =
+        exports.entries.joinToString("\n") { (name, key) ->
+            "$name = polyglot.import_value(\"$key\")"
+        }
+}
+
+object CSupport : LanguageSupport {
+    override val languageId = "llvm"
+    override val extensions = listOf("c")
+    override val compilerCommand = listOf("clang", "-emit-llvm", "-c", "-o")
+
+    override fun detectFrame(frame: String) = false
+    override fun isValidExportName(name: String) =
+        !name.contains('.') && !name.startsWith("__")
+    override fun generateShim(exports: Map<String, String>) = ""
+}
+
+object RustSupport : LanguageSupport {
+    override val languageId = "llvm"
+    override val extensions = listOf("rs")
+    override val compilerCommand = listOf("rustc", "--emit=llvm-bc", "-o")
+
+    override fun detectFrame(frame: String) = false
+    override fun isValidExportName(name: String) =
+        !name.contains('.') && !name.startsWith("__")
+    override fun generateShim(exports: Map<String, String>) = ""
+}
+
+class Mycelium(
+    val languages: List<LanguageSupport> = listOf(
+        JsSupport, RubySupport, PythonSupport, CSupport, RustSupport
+    )
+) {
     private val filesystem = InterceptingFileSystem()
 
-    // `allowIO` is required for imports to work
     private val context: Context =
         Context.newBuilder()
-            // Enable `Polyglot` and `Java` globals
             .allowAllAccess(true)
-            // Intercept file system calls (used to support HTTP imports)
             .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
             .build()
 
     init {
-        filesystem.init(context)
+        filesystem.init(context, this)
+    }
+
+    private val extensionMap: Map<String, LanguageSupport> =
+        languages.flatMap { lang -> lang.extensions.map { it to lang } }.toMap()
+
+    fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
+
+    fun languageFromExtension(extension: String): String? = extensionMap[extension]?.languageId
+
+    fun detectHostLanguage(frames: List<String>): LanguageSupport? {
+        for (frame in frames) {
+            for (lang in languages) {
+                if (lang.detectFrame(frame)) return lang
+            }
+        }
+        return null
     }
 
     fun runFile(path: String) {
@@ -43,44 +170,6 @@ class Mycelium {
         val code = file.readText()
         val source = Source.newBuilder(language, code, path).build()
         context.eval(source)
-    }
-
-    companion object {
-        fun languageFromExtension(extension: String) =
-            when (extension) {
-                "js", "mjs", "ts", "mts" -> "js"
-                "py" -> "python"
-                "rb" -> "ruby"
-                "wasm" -> "wasm"
-                "c", "h" -> "llvm"
-                "rs" -> "llvm"
-                "go" -> "llvm"
-                else -> null
-            }
-
-        fun compilerForExtension(extension: String): List<String>? =
-            when (extension) {
-                "c" -> listOf("clang", "-emit-llvm", "-c", "-o")
-                "rs" -> listOf("rustc", "--emit=llvm-bc", "-o")
-                "go" -> null // TODO: Go -> LLVM bitcode pipeline
-                else -> null
-            }
-
-        fun needsCompilation(extension: String) =
-            extension in listOf("c", "rs", "go")
-
-        private val jsIdentifierRegex = Regex("^[a-zA-Z_$][a-zA-Z0-9_$]*$")
-        private val jsReservedWords = setOf(
-            "break", "case", "catch", "continue", "debugger", "default", "delete",
-            "do", "else", "finally", "for", "function", "if", "in", "instanceof",
-            "new", "return", "switch", "this", "throw", "try", "typeof", "var",
-            "void", "while", "with", "class", "const", "enum", "export", "extends",
-            "import", "super", "implements", "interface", "let", "package", "private",
-            "protected", "public", "static", "yield"
-        )
-
-        fun isValidJsExport(name: String) =
-            jsIdentifierRegex.matches(name) && name !in jsReservedWords
     }
 }
 
@@ -214,10 +303,9 @@ object Compiler {
         "mycelium"
     ).also { it.mkdirs() }
 
-    fun compile(sourcePath: Path): Path {
-        val extension = sourcePath.extension
-        val compilerCmd = Mycelium.compilerForExtension(extension)
-            ?: throw Error("No compiler configured for .$extension files")
+    fun compile(sourcePath: Path, lang: LanguageSupport): Path {
+        val compilerCmd = lang.compilerCommand
+            ?: throw Error("No compiler configured for ${lang.languageId} files")
         val sourceFile = sourcePath.toFile()
         val hash = MessageDigest.getInstance("SHA-256")
             .digest(sourceFile.readBytes())
@@ -239,10 +327,12 @@ object Compiler {
 
 class InterceptingFileSystem : FileSystem {
     private var context: Context? = null
+    private var mycelium: Mycelium? = null
     private val delegate = FileSystem.newDefaultFileSystem()
 
-    fun init(context: Context) {
+    fun init(context: Context, mycelium: Mycelium) {
         this.context = context
+        this.mycelium = mycelium
     }
 
     override fun parsePath(uri: URI): Path =
@@ -265,35 +355,22 @@ class InterceptingFileSystem : FileSystem {
         options: Set<OpenOption>,
         vararg attrs: FileAttribute<*>
     ): SeekableByteChannel {
-        val callTarget = Truffle.getRuntime().iterateFrames(fun(frame) = "${frame.callTarget}")
-        val hostLanguage = if (callTarget.startsWith("GraalJSEvaluator.ModuleScriptRoot@")) {
-            "js"
-        } else {
+        val mc = mycelium!!
+        val frames = mutableListOf<String>()
+        Truffle.getRuntime().iterateFrames { frame ->
+            frames.add("${frame.callTarget}")
             null
         }
-        if (hostLanguage == null) {
-            return delegate.newByteChannel(path, options, *attrs)
-        }
-        val targetLanguage = Mycelium.languageFromExtension(path.extension)
-        if (Mycelium.needsCompilation(path.extension) && !path.startsWith("/.mycelium/")) {
-            val compiled = Compiler.compile(path)
+        val hostLang = mc.detectHostLanguage(frames)
+            ?: return delegate.newByteChannel(path, options, *attrs)
+        val targetLang = mc.supportForExtension(path.extension)
+        if (targetLang != null && targetLang.needsCompilation && !path.startsWith("/.mycelium/")) {
+            val compiled = Compiler.compile(path, targetLang)
             val source = Source.newBuilder("llvm", compiled.toFile()).build()
             val value = context!!.eval(source)
-            return when (hostLanguage) {
-                "js" -> {
-                    val sb = StringBuilder()
-                    val bindings = context!!.polyglotBindings
-                    for (k in value.memberKeys) {
-                        if (k.contains('.') || k.startsWith("llvm.") || k.startsWith("__")) continue
-                        bindings.putMember(k, value.getMember(k))
-                        sb.append("export const $k = Polyglot.import(\"$k\");\n")
-                    }
-                    ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(sb.toString()))
-                }
-                else -> throw Error("We do not know how to serialize to host language $hostLanguage")
-            }
+            return generateShim(hostLang, value)
         }
-        if (hostLanguage == targetLanguage || targetLanguage == null) {
+        if (hostLang.languageId == targetLang?.languageId || targetLang == null) {
             return if (path.startsWith("/.mycelium/")) {
                 val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
                 when (uri.scheme) {
@@ -313,21 +390,21 @@ class InterceptingFileSystem : FileSystem {
             } else {
                 path.readText()
             }
-            val value = context!!.eval(targetLanguage, code)
-            return when (hostLanguage) {
-                "js" -> {
-                    val sb = StringBuilder()
-                    val bindings = context!!.polyglotBindings
-                    for (k in value.memberKeys) {
-                        if (!Mycelium.isValidJsExport(k)) continue
-                        bindings.putMember(k, value.getMember(k))
-                        sb.append("export const $k = Polyglot.import(\"$k\");\n")
-                    }
-                    ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(sb.toString()))
-                }
-                else -> throw Error("We do not know how to serialize to host language $hostLanguage")
-            }
+            val value = context!!.eval(targetLang.languageId, code)
+            return generateShim(hostLang, value)
         }
+    }
+
+    private fun generateShim(hostLang: LanguageSupport, value: org.graalvm.polyglot.Value): SeekableByteChannel {
+        val bindings = context!!.polyglotBindings
+        val exports = mutableMapOf<String, String>()
+        for (k in value.memberKeys) {
+            if (!hostLang.isValidExportName(k)) continue
+            bindings.putMember(k, value.getMember(k))
+            exports[k] = k
+        }
+        val shim = hostLang.generateShim(exports)
+        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(shim))
     }
 
     override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> =

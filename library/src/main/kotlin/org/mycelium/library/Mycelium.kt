@@ -1,7 +1,6 @@
 package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
-import com.oracle.truffle.api.frame.FrameInstance
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -16,6 +15,7 @@ import org.graalvm.polyglot.Context
 import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.FileSystem
 import org.graalvm.polyglot.io.IOAccess
+import java.nio.charset.StandardCharsets
 import java.nio.file.*
 import kotlin.io.path.extension
 import kotlin.io.path.readText
@@ -142,6 +142,44 @@ class HttpChannel(uri: URI) : SeekableByteChannel {
     }
 }
 
+class ReadOnlyBufferChannel(val buffer: ByteBuffer) : SeekableByteChannel {
+    override fun close() {}
+
+    override fun isOpen(): Boolean = false
+
+    override fun read(p0: ByteBuffer): Int {
+        val bytesRead = min(p0.limit() - p0.arrayOffset(), buffer.limit() - buffer.position())
+        buffer.get(p0.array(), p0.arrayOffset(), bytesRead)
+        return if (bytesRead == 0) -1 else bytesRead
+    }
+
+    override fun write(p0: ByteBuffer): Int {
+        val position = buffer.position()
+        buffer.position(buffer.limit())
+        val bytesRead = p0.limit() - p0.arrayOffset()
+        buffer.put(p0.array(), p0.arrayOffset(), bytesRead)
+        buffer.position(position)
+        return p0.array().size
+    }
+
+    override fun position(): Long = buffer.position().toLong()
+
+    override fun position(p0: Long): SeekableByteChannel {
+        buffer.position(p0.toInt())
+        return this
+    }
+
+    override fun size(): Long {
+        return buffer.limit().toLong()
+    }
+
+    override fun truncate(p0: Long): SeekableByteChannel {
+        buffer.limit(p0.toInt())
+        buffer.compact()
+        return this
+    }
+}
+
 class InterceptingFileSystem : FileSystem {
     private var context: Context? = null
     private val delegate = FileSystem.newDefaultFileSystem()
@@ -189,7 +227,6 @@ class InterceptingFileSystem : FileSystem {
                 delegate.newByteChannel(path, options, *attrs)
             }
         } else {
-            // TODO
             val code = if (path.startsWith("/.mycelium/")) {
                 val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
                 when (uri.scheme) {
@@ -208,8 +245,9 @@ class InterceptingFileSystem : FileSystem {
                         val v = value.getMember(k)
                         sb.append("export const $k = Polyglot.getBinding(\"v\")")
                     }
-                    BufferChannel("")
+                    ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(sb.toString()))
                 }
+                // TODO: Other languages
                 else -> throw Error("We do not know how to serialize to host language $hostLanguage")
             }
         }

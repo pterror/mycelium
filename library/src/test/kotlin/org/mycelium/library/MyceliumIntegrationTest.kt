@@ -18,7 +18,7 @@ class MyceliumIntegrationTest {
         mc.runFile(tmpFile.absolutePath)
     }
 
-    // --- Polyglot eval ---
+    // --- Polyglot eval basics ---
 
     @Test fun polyglotEvalJs() {
         val mc = Mycelium()
@@ -32,7 +32,7 @@ class MyceliumIntegrationTest {
         assertEquals(5, result.asInt())
     }
 
-    // --- JS as host ---
+    // --- JS as host: importing each target ---
 
     @Test fun runJsFile() {
         val mc = Mycelium()
@@ -110,7 +110,7 @@ class MyceliumIntegrationTest {
         assertEquals(7, results.getMember("diff").asInt())
     }
 
-    // --- Ruby as host ---
+    // --- Ruby as host: eval into each target ---
 
     @Test fun runRubyFile() {
         val mc = Mycelium()
@@ -120,21 +120,49 @@ class MyceliumIntegrationTest {
     @Test fun rubyEvalsJs() {
         val mc = Mycelium()
         mc.eval("ruby", """
-            result = Polyglot.eval("js", "2 + 3")
-            ${'$'}__rb_test_result = result
+            ${'$'}__rb_result = Polyglot.eval("js", "2 + 3")
         """.trimIndent())
-        val result = mc.eval("ruby", "${'$'}__rb_test_result")
+        val result = mc.eval("ruby", "${'$'}__rb_result")
         assertEquals(5, result.asInt())
     }
 
-    @Test fun rubyEvalsJsExpression() {
+    @Test fun rubyEvalsRuby() {
         val mc = Mycelium()
         mc.eval("ruby", """
-            result = Polyglot.eval("js", "2 * 21")
-            ${'$'}__rb_js_result = result
+            ${'$'}__rb_result = Polyglot.eval("ruby", "7 * 6")
         """.trimIndent())
-        val result = mc.eval("ruby", "${'$'}__rb_js_result")
+        val result = mc.eval("ruby", "${'$'}__rb_result")
         assertEquals(42, result.asInt())
+    }
+
+    @Test fun rubyEvalsCViaModule() {
+        val mc = Mycelium()
+        val cPath = testResourcePath("add.c")
+        mc.eval("ruby", """
+            Polyglot.eval_module("js", "import { add } from '$cPath'; globalThis.__rbCResult = add(11, 22);")
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__rbCResult")
+        assertEquals(33, result.asInt())
+    }
+
+    // --- JS as host: eval into each target ---
+
+    @Test fun jsEvalsRuby() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__jsRbResult = Polyglot.eval("ruby", "7 * 6");
+        """)
+        val result = mc.eval("js", "globalThis.__jsRbResult")
+        assertEquals(42, result.asInt())
+    }
+
+    @Test fun jsEvalsJs() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__jsJsResult = Polyglot.eval("js", "3 * 3");
+        """)
+        val result = mc.eval("js", "globalThis.__jsJsResult")
+        assertEquals(9, result.asInt())
     }
 
     // --- evalModule ---
@@ -168,6 +196,96 @@ class MyceliumIntegrationTest {
         """)
         val result = mc.eval("js", "globalThis.__jsModResult")
         assertEquals(11, result.asInt())
+    }
+
+    // --- Polyglot chains ---
+
+    @Test fun chainJsToRubyToJs() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            const rbResult = Polyglot.eval("ruby", 'Polyglot.eval("js", "10 + 20")');
+            globalThis.__chainResult = rbResult;
+        """)
+        val result = mc.eval("js", "globalThis.__chainResult")
+        assertEquals(30, result.asInt())
+    }
+
+    @Test fun chainRubyToJsToRuby() {
+        val mc = Mycelium()
+        mc.eval("ruby", """
+            ${'$'}__chain_result = Polyglot.eval("js", "Polyglot.eval('ruby', '5 * 5')")
+        """.trimIndent())
+        val result = mc.eval("ruby", "${'$'}__chain_result")
+        assertEquals(25, result.asInt())
+    }
+
+    @Test fun chainSixDeepViaBindings() {
+        val mc = Mycelium()
+        // 6 cross-language hops in a single execution:
+        // Kotlin -> JS -> Ruby -> JS -> Ruby -> JS -> Ruby -> returns 100
+        // Use polyglot bindings to avoid escaping hell
+        mc.eval("ruby", """
+            ${'$'}__hop6 = Proc.new { 100 }
+        """.trimIndent())
+        mc.eval("js", """
+            globalThis.__hop5 = function() {
+                return Polyglot.eval("ruby", "${'$'}__hop6.call");
+            };
+        """)
+        mc.eval("ruby", """
+            ${'$'}__hop4 = Proc.new { Polyglot.eval("js", "globalThis.__hop5()") }
+        """.trimIndent())
+        mc.eval("js", """
+            globalThis.__hop3 = function() {
+                return Polyglot.eval("ruby", "${'$'}__hop4.call");
+            };
+        """)
+        mc.eval("ruby", """
+            ${'$'}__hop2 = Proc.new { Polyglot.eval("js", "globalThis.__hop3()") }
+        """.trimIndent())
+        mc.eval("js", """
+            globalThis.__chain6 = Polyglot.eval("ruby", "${'$'}__hop2.call");
+        """)
+        val result = mc.eval("js", "globalThis.__chain6")
+        assertEquals(100, result.asInt())
+    }
+
+    @Test fun chainJsToRubyToJsToC() {
+        val mc = Mycelium()
+        val cPath = testResourcePath("add.c")
+        mc.eval("js", """
+            const rbVal = Polyglot.eval("ruby", 'Polyglot.eval("js", "100")');
+            globalThis.__chainPreC = rbVal;
+        """)
+        mc.evalModule("js", """
+            import { add } from "$cPath";
+            globalThis.__chainWithC = add(globalThis.__chainPreC, 50);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__chainWithC")
+        assertEquals(150, result.asInt())
+    }
+
+    @Test fun chainFourDeepAlternating() {
+        val mc = Mycelium()
+        // Ruby -> JS -> Ruby -> JS
+        mc.eval("ruby", """
+            result = Polyglot.eval("js", "Polyglot.eval('ruby', 'Polyglot.eval(\"js\", \"42\")')")
+            ${'$'}__chain4 = result
+        """.trimIndent())
+        val result = mc.eval("ruby", "${'$'}__chain4")
+        assertEquals(42, result.asInt())
+    }
+
+    @Test fun chainWithDataTransform() {
+        val mc = Mycelium()
+        // JS multiplies -> Ruby adds -> JS subtracts
+        mc.eval("js", """
+            const step1 = 6 * 7;
+            const step2 = Polyglot.eval("ruby", 'Polyglot.eval("js", "' + step1 + '") + 8');
+            globalThis.__chainTransform = step2 - 10;
+        """)
+        val result = mc.eval("js", "globalThis.__chainTransform")
+        assertEquals(40, result.asInt()) // (6*7) + 8 - 10 = 40
     }
 
     // --- Composability ---

@@ -154,8 +154,7 @@ class MyceliumIntegrationTest {
         val mc = Mycelium()
         val cPath = testResourcePath("add.c")
         mc.eval("ruby", """
-            evalModule = Polyglot.import("evalModule")
-            evalModule.call("js", "import { add } from '$cPath'; globalThis.__rbModResult = add(3, 4);")
+            Polyglot.eval_module("js", "import { add } from '$cPath'; globalThis.__rbModResult = add(3, 4);")
         """.trimIndent())
         val result = mc.eval("js", "globalThis.__rbModResult")
         assertEquals(7, result.asInt())
@@ -165,8 +164,7 @@ class MyceliumIntegrationTest {
         val mc = Mycelium()
         val cPath = testResourcePath("add.c")
         mc.eval("js", """
-            const evalModule = Polyglot.import("evalModule");
-            evalModule("js", "import { add } from '$cPath'; globalThis.__jsModResult = add(5, 6);");
+            Polyglot.evalModule("js", "import { add } from '$cPath'; globalThis.__jsModResult = add(5, 6);");
         """)
         val result = mc.eval("js", "globalThis.__jsModResult")
         assertEquals(11, result.asInt())

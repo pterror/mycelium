@@ -30,6 +30,7 @@ interface LanguageSupport {
     fun detectFrame(frame: String): Boolean
     fun isValidExportName(name: String): Boolean
     fun generateShim(exports: Map<String, String>): String
+    fun injectEvalModule(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {}
 }
 
 object JsSupport : LanguageSupport {
@@ -57,6 +58,10 @@ object JsSupport : LanguageSupport {
         exports.entries.joinToString("\n") { (name, key) ->
             "export const $name = Polyglot.import(\"$key\");"
         }
+
+    override fun injectEvalModule(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {
+        context.getBindings("js").getMember("Polyglot").putMember("evalModule", fn)
+    }
 }
 
 object RubySupport : LanguageSupport {
@@ -80,6 +85,17 @@ object RubySupport : LanguageSupport {
             sb.append("$name = Polyglot.import(\"$key\")\n")
         }
         return sb.toString()
+    }
+
+    override fun injectEvalModule(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {
+        context.eval("ruby", """
+            module Polyglot
+                def self.eval_module(lang, code)
+                    Polyglot.import("__mycelium_eval_module__").call(lang, code)
+                end
+            end
+        """.trimIndent())
+        context.polyglotBindings.putMember("__mycelium_eval_module__", fn)
     }
 }
 
@@ -144,19 +160,21 @@ class Mycelium(
             .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
             .build()
 
-    init {
-        filesystem.init(context, this)
-        context.polyglotBindings.putMember("evalModule",
-            org.graalvm.polyglot.proxy.ProxyExecutable { args ->
-                val lang = args[0].asString()
-                val code = args[1].asString()
-                evalModule(lang, code)
-            }
-        )
-    }
-
     private val extensionMap: Map<String, LanguageSupport> =
         languages.flatMap { lang -> lang.extensions.map { it to lang } }.toMap()
+
+    private val evalModuleFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        val lang = args[0].asString()
+        val code = args[1].asString()
+        evalModule(lang, code)
+    }
+
+    init {
+        filesystem.init(context, this)
+        for (lang in languages) {
+            lang.injectEvalModule(context, evalModuleFn)
+        }
+    }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
 

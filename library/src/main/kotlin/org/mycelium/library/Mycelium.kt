@@ -171,6 +171,12 @@ class Mycelium(
         val source = Source.newBuilder(language, code, path).build()
         context.eval(source)
     }
+
+    fun eval(languageId: String, code: String): org.graalvm.polyglot.Value =
+        context.eval(languageId, code)
+
+    fun getBindings(languageId: String): org.graalvm.polyglot.Value =
+        context.getBindings(languageId)
 }
 
 class HttpChannel(uri: URI) : SeekableByteChannel {

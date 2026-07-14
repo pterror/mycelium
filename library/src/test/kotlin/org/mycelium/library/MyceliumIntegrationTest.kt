@@ -219,35 +219,40 @@ class MyceliumIntegrationTest {
         assertEquals(25, result.asInt())
     }
 
-    @Test fun chainSixDeepViaBindings() {
+    @Test fun chainThreeDeepNested() {
+        // JS -> Ruby -> JS, single expression
         val mc = Mycelium()
-        // 6 cross-language hops in a single execution:
-        // Kotlin -> JS -> Ruby -> JS -> Ruby -> JS -> Ruby -> returns 100
-        // Use polyglot bindings to avoid escaping hell
-        mc.eval("ruby", """
-            ${'$'}__hop6 = Proc.new { 100 }
-        """.trimIndent())
-        mc.eval("js", """
-            globalThis.__hop5 = function() {
-                return Polyglot.eval("ruby", "${'$'}__hop6.call");
-            };
-        """)
-        mc.eval("ruby", """
-            ${'$'}__hop4 = Proc.new { Polyglot.eval("js", "globalThis.__hop5()") }
-        """.trimIndent())
-        mc.eval("js", """
-            globalThis.__hop3 = function() {
-                return Polyglot.eval("ruby", "${'$'}__hop4.call");
-            };
-        """)
-        mc.eval("ruby", """
-            ${'$'}__hop2 = Proc.new { Polyglot.eval("js", "globalThis.__hop3()") }
-        """.trimIndent())
-        mc.eval("js", """
-            globalThis.__chain6 = Polyglot.eval("ruby", "${'$'}__hop2.call");
-        """)
-        val result = mc.eval("js", "globalThis.__chain6")
+        val result = mc.eval("js",
+            """Polyglot.eval("ruby", 'Polyglot.eval("js", "100")')"""
+        )
         assertEquals(100, result.asInt())
+    }
+
+    @Test fun chainFourDeepNested() {
+        // Ruby -> JS -> Ruby -> JS, single expression
+        val mc = Mycelium()
+        val result = mc.eval("ruby",
+            """Polyglot.eval("js", "Polyglot.eval('ruby', 'Polyglot.eval(\"js\", \"42\")')")"""
+        )
+        assertEquals(42, result.asInt())
+    }
+
+    @Test fun chainDeepNested() {
+        // Programmatically build nested Polyglot.eval chains
+        // to test arbitrary recursion depth without escaping hell
+        val mc = Mycelium()
+        for (depth in 3..8) {
+            var code = "1"
+            val outerLang = if (depth % 2 == 0) "js" else "ruby"
+            var lang = if (outerLang == "js") "ruby" else "js"
+            for (i in 1 until depth) {
+                val escaped = code.replace("\\", "\\\\").replace("\"", "\\\"")
+                code = """Polyglot.eval("$lang", "$escaped")"""
+                lang = if (lang == "js") "ruby" else "js"
+            }
+            val result = mc.eval(outerLang, code)
+            assertEquals(1, result.asInt(), "Failed at depth $depth")
+        }
     }
 
     @Test fun chainJsToRubyToJsToC() {

@@ -5,3 +5,7 @@ dependencies {
 }
 
 application { mainClass = "org.mycelium.app.AppKt" }
+
+tasks.named<JavaExec>("run") {
+    workingDir = rootDir
+}

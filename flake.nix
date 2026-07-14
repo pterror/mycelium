@@ -16,6 +16,7 @@
             (callPackage gradle-packages.gradle_8 {
               java = graalvm-ce;
             })
+            llvmPackages.clang
           ];
         });
     };

@@ -2,6 +2,7 @@ package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
 import java.io.File
+import java.security.MessageDigest
 import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.ByteBuffer
@@ -51,8 +52,22 @@ class Mycelium {
                 "py" -> "python"
                 "rb" -> "ruby"
                 "wasm" -> "wasm"
+                "c", "h" -> "llvm"
+                "rs" -> "llvm"
+                "go" -> "llvm"
                 else -> null
             }
+
+        fun compilerForExtension(extension: String): List<String>? =
+            when (extension) {
+                "c" -> listOf("clang", "-emit-llvm", "-c", "-o")
+                "rs" -> listOf("rustc", "--emit=llvm-bc", "-o")
+                "go" -> null // TODO: Go -> LLVM bitcode pipeline
+                else -> null
+            }
+
+        fun needsCompilation(extension: String) =
+            extension in listOf("c", "rs", "go")
     }
 }
 
@@ -180,6 +195,35 @@ class ReadOnlyBufferChannel(val buffer: ByteBuffer) : SeekableByteChannel {
     }
 }
 
+object Compiler {
+    private val cacheDir = File(
+        System.getenv("XDG_CACHE_HOME") ?: File(System.getProperty("user.home"), ".cache").path,
+        "mycelium"
+    ).also { it.mkdirs() }
+
+    fun compile(sourcePath: Path): Path {
+        val extension = sourcePath.extension
+        val compilerCmd = Mycelium.compilerForExtension(extension)
+            ?: throw Error("No compiler configured for .$extension files")
+        val sourceFile = sourcePath.toFile()
+        val hash = MessageDigest.getInstance("SHA-256")
+            .digest(sourceFile.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        val outputFile = File(cacheDir, "$hash.bc")
+        if (outputFile.exists()) return outputFile.toPath()
+        val cmd = compilerCmd + listOf(outputFile.absolutePath, sourceFile.absolutePath)
+        val process = ProcessBuilder(cmd)
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            throw Error("Compilation of ${sourcePath.fileName} failed (exit $exitCode):\n$output")
+        }
+        return outputFile.toPath()
+    }
+}
+
 class InterceptingFileSystem : FileSystem {
     private var context: Context? = null
     private val delegate = FileSystem.newDefaultFileSystem()
@@ -216,6 +260,24 @@ class InterceptingFileSystem : FileSystem {
             "TODO"
         }
         val targetLanguage = Mycelium.languageFromExtension(path.extension)
+        if (Mycelium.needsCompilation(path.extension) && !path.startsWith("/.mycelium/")) {
+            val compiled = Compiler.compile(path)
+            val source = Source.newBuilder("llvm", compiled.toFile()).build()
+            val value = context!!.eval(source)
+            return when (hostLanguage) {
+                "js" -> {
+                    val sb = StringBuilder()
+                    val bindings = context!!.polyglotBindings
+                    for (k in value.memberKeys) {
+                        if (k.contains('.') || k.startsWith("llvm.") || k.startsWith("__")) continue
+                        bindings.putMember(k, value.getMember(k))
+                        sb.append("export const $k = Polyglot.import(\"$k\");\n")
+                    }
+                    ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(sb.toString()))
+                }
+                else -> throw Error("We do not know how to serialize to host language $hostLanguage")
+            }
+        }
         if (hostLanguage == targetLanguage || targetLanguage == null) {
             return if (path.startsWith("/.mycelium/")) {
                 val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
@@ -237,7 +299,7 @@ class InterceptingFileSystem : FileSystem {
                 path.readText()
             }
             val value = context!!.eval(targetLanguage, code)
-            when (hostLanguage) {
+            return when (hostLanguage) {
                 "js" -> {
                     val sb = StringBuilder()
                     for (k in value.memberKeys) {

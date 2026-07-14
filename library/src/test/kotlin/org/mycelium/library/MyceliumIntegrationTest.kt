@@ -137,6 +137,41 @@ class MyceliumIntegrationTest {
         assertEquals(42, result.asInt())
     }
 
+    // --- evalModule ---
+
+    @Test fun evalModuleJs() {
+        val mc = Mycelium()
+        val cPath = testResourcePath("add.c")
+        mc.evalModule("js", """
+            import { add } from "$cPath";
+            globalThis.__evalModuleResult = add(7, 8);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__evalModuleResult")
+        assertEquals(15, result.asInt())
+    }
+
+    @Test fun evalModuleFromRuby() {
+        val mc = Mycelium()
+        val cPath = testResourcePath("add.c")
+        mc.eval("ruby", """
+            evalModule = Polyglot.import("evalModule")
+            evalModule.call("js", "import { add } from '$cPath'; globalThis.__rbModResult = add(3, 4);")
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__rbModResult")
+        assertEquals(7, result.asInt())
+    }
+
+    @Test fun evalModuleFromJs() {
+        val mc = Mycelium()
+        val cPath = testResourcePath("add.c")
+        mc.eval("js", """
+            const evalModule = Polyglot.import("evalModule");
+            evalModule("js", "import { add } from '$cPath'; globalThis.__jsModResult = add(5, 6);");
+        """)
+        val result = mc.eval("js", "globalThis.__jsModResult")
+        assertEquals(11, result.asInt())
+    }
+
     // --- Composability ---
 
     @Test fun composableSubsetRejectsUnknownExtension() {

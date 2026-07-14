@@ -146,6 +146,13 @@ class Mycelium(
 
     init {
         filesystem.init(context, this)
+        context.polyglotBindings.putMember("evalModule",
+            org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+                val lang = args[0].asString()
+                val code = args[1].asString()
+                evalModule(lang, code)
+            }
+        )
     }
 
     private val extensionMap: Map<String, LanguageSupport> =
@@ -175,8 +182,26 @@ class Mycelium(
     fun eval(languageId: String, code: String): org.graalvm.polyglot.Value =
         context.eval(languageId, code)
 
+    fun evalModule(languageId: String, code: String): org.graalvm.polyglot.Value {
+        val tmpFile = File.createTempFile("mycelium-module-", moduleExtensionForLanguage(languageId))
+        tmpFile.deleteOnExit()
+        tmpFile.writeText(code)
+        val source = Source.newBuilder(languageId, tmpFile).build()
+        return context.eval(source)
+    }
+
     fun getBindings(languageId: String): org.graalvm.polyglot.Value =
         context.getBindings(languageId)
+
+    private fun moduleExtensionForLanguage(languageId: String): String =
+        when (languageId) {
+            "js" -> ".mjs"
+            else ->
+                languages.firstOrNull { it.languageId == languageId }
+                    ?.extensions?.firstOrNull()
+                    ?.let { ".$it" }
+                    ?: ".tmp"
+        }
 }
 
 class HttpChannel(uri: URI) : SeekableByteChannel {

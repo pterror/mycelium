@@ -82,6 +82,7 @@ class Mycelium(
         }
         context.getBindings("js").putMember("__mycelium_require__", requireFn)
         context.eval("js", PROCESS_INIT_SCRIPT)
+        context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
@@ -249,25 +250,47 @@ class Mycelium(
                     return JSystem.getenv();
                 }
 
+                // Mutations (process.env.FOO = 'bar') never reach the real OS environment
+                // (the JVM has no supported way to do that) — instead they're tracked here
+                // and take priority over the live `java.lang.System.getenv()` snapshot on
+                // every trap, so a write becomes observable to any later read/has/keys
+                // enumeration/delete, matching what real Node's mutable process.env does.
+                var envOverrides = {};
+
+                function envGet(key) {
+                    if (Object.prototype.hasOwnProperty.call(envOverrides, key)) return envOverrides[key];
+                    var v = getenvMap().get(key);
+                    return v === null || v === undefined ? undefined : String(v);
+                }
+
                 var envProxy = new Proxy({}, {
                     get: function (target, key) {
                         if (typeof key !== 'string') return undefined;
-                        var v = getenvMap().get(key);
-                        return v === null || v === undefined ? undefined : String(v);
+                        return envGet(key);
+                    },
+                    set: function (target, key, value) {
+                        envOverrides[String(key)] = String(value);
+                        return true;
                     },
                     has: function (target, key) {
                         if (typeof key !== 'string') return false;
-                        return !!getenvMap().containsKey(key);
+                        return Object.prototype.hasOwnProperty.call(envOverrides, key) || !!getenvMap().containsKey(key);
+                    },
+                    deleteProperty: function (target, key) {
+                        delete envOverrides[String(key)];
+                        return true;
                     },
                     ownKeys: function () {
-                        var keys = [];
+                        var keys = {};
                         var it = getenvMap().keySet().iterator();
-                        while (it.hasNext()) keys.push(String(it.next()));
-                        return keys;
+                        while (it.hasNext()) keys[String(it.next())] = true;
+                        for (var k in envOverrides) keys[k] = true;
+                        return Object.keys(keys);
                     },
                     getOwnPropertyDescriptor: function (target, key) {
-                        if (!getenvMap().containsKey(key)) return undefined;
-                        return { enumerable: true, configurable: true, value: String(getenvMap().get(key)) };
+                        var v = envGet(String(key));
+                        if (v === undefined) return undefined;
+                        return { enumerable: true, configurable: true, writable: true, value: v };
                     }
                 });
 
@@ -317,6 +340,27 @@ class Mycelium(
                     on: function () { return globalThis.process; },
                     once: function () { return globalThis.process; },
                     removeListener: function () { return globalThis.process; },
+                };
+            })();
+        """.trimIndent()
+
+        // Exposes a minimal Web Crypto API as `globalThis.crypto` — distinct from (and in
+        // addition to) the importable Node `crypto` module (coreModules / crypto.mjs):
+        // packages like `uuid` reference the bare global `crypto.randomUUID`/
+        // `crypto.getRandomValues` directly, the way real Node.js has exposed since Node
+        // 19, rather than importing the `crypto` module.
+        private val GLOBAL_CRYPTO_INIT_SCRIPT = """
+            (function () {
+                globalThis.crypto = {
+                    randomUUID: function () { return Java.type('java.util.UUID').randomUUID().toString(); },
+                    getRandomValues: function (array) {
+                        var sr = new (Java.type('java.security.SecureRandom'))();
+                        var bytes = Java.type('java.lang.reflect.Array').newInstance(Java.type('java.lang.Byte').TYPE, array.length);
+                        sr.nextBytes(bytes);
+                        for (var i = 0; i < array.length; i++) array[i] = bytes[i] & 0xFF;
+                        return array;
+                    },
+                    subtle: {},
                 };
             })();
         """.trimIndent()

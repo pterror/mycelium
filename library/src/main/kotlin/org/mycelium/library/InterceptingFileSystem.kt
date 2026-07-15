@@ -93,6 +93,14 @@ class InterceptingFileSystem : FileSystem {
         // asking about their own internal identifiers are unaffected. Only once we know
         // we're in an npm-style project (some ancestor has a `node_modules` dir) do we
         // treat a missing package as an error worth surfacing.
+        if (path.startsWith("#")) {
+            val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
+            resolveSubpathImport(path, fromDir)?.let { return it }
+            throw MyceliumException(
+                "mycelium: cannot find module '$path' — no matching \"imports\" entry found in any " +
+                    "ancestor package.json from '$fromDir'"
+            )
+        }
         if (isBareSpecifier(path)) {
             coreModules[path]?.let { return syntheticCoreModulePath(it) }
             val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
@@ -361,6 +369,37 @@ class InterceptingFileSystem : FileSystem {
             "index.js"
         }
         return packageDir.resolve(entry).normalize()
+    }
+
+    // Resolves a `#`-prefixed "subpath import" specifier (e.g. `#ansi-styles`) against the
+    // nearest ancestor `package.json`'s `"imports"` field, per Node's subpath-imports
+    // resolution — a private-to-the-package specifier-remapping mechanism distinct from
+    // `"exports"`. Walks up from `fromDir` looking for the first `package.json` that both
+    // exists and declares an `"imports"` entry for `specifier`; returns null (letting the
+    // caller report a "cannot find module" error) if none is found. The resolved value is
+    // returned as an absolute path relative to that package.json's own directory.
+    private fun resolveSubpathImport(specifier: String, fromDir: Path): Path? {
+        var dir: Path? = fromDir.toAbsolutePath().normalize()
+        while (dir != null) {
+            val packageJson = dir.resolve("package.json")
+            if (Files.exists(packageJson)) {
+                val json = packageJson.readText()
+                val resolved = try {
+                    context!!.eval("js", IMPORTS_RESOLVER).execute(json, specifier).let {
+                        if (it.isString) it.asString() else null
+                    }
+                } catch (e: Exception) {
+                    null
+                }
+                if (resolved != null) return dir.resolve(resolved).normalize()
+                // A package.json with no matching (or no) "imports" entry stops the walk —
+                // subpath imports are private to the *nearest* package boundary, mirroring
+                // Node's own behavior of not searching past the first package.json found.
+                return null
+            }
+            dir = dir.parent
+        }
+        return null
     }
 
     // Node stdlib modules Mycelium ships as synthetic ESM resources rather than resolving
@@ -645,6 +684,34 @@ class InterceptingFileSystem : FileSystem {
                     }
                 }
                 return pkg.main || "index.js";
+            })
+        """.trimIndent()
+
+        // Resolves a `#`-prefixed subpath-imports specifier against a package.json's
+        // "imports" field. The mapped value can be a plain string, or a conditions object
+        // keyed by environment (e.g. "node", "import", "require", "default") — per Node's
+        // own resolution order, "node" is preferred, then "import", then "default".
+        // Returns null (not a string) when there's no "imports" field or no matching entry,
+        // which the Kotlin caller distinguishes from a real string result via `isString`.
+        private val IMPORTS_RESOLVER = """
+            (function (json, specifier) {
+                try {
+                    var pkg = JSON.parse(json);
+                    var imports = pkg.imports;
+                    if (!imports || typeof imports !== "object") return null;
+                    var entry = imports[specifier];
+                    if (entry === undefined) return null;
+                    if (typeof entry === "string") return entry;
+                    if (entry && typeof entry === "object") {
+                        if (typeof entry.node === "string") return entry.node;
+                        if (typeof entry.import === "string") return entry.import;
+                        if (typeof entry.require === "string") return entry.require;
+                        if (typeof entry.default === "string") return entry.default;
+                    }
+                    return null;
+                } catch (e) {
+                    return null;
+                }
             })
         """.trimIndent()
     }

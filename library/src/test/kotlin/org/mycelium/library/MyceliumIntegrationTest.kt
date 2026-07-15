@@ -594,6 +594,52 @@ class MyceliumIntegrationTest {
         assertEquals("from exports field", result.asString())
     }
 
+    @Test fun hashSubpathImportResolves() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-hash-imports-").toFile()
+        tmpDir.deleteOnExit()
+        File(tmpDir, "package.json").apply {
+            writeText(
+                """
+                {
+                  "name": "hash-imports-pkg",
+                  "imports": {
+                    "#greeting": "./lib/greeting.js",
+                    "#conditional": { "node": "./lib/node-only.js", "default": "./lib/fallback.js" }
+                  }
+                }
+                """.trimIndent()
+            )
+            deleteOnExit()
+        }
+        val libDir = File(tmpDir, "lib")
+        libDir.mkdirs()
+        libDir.deleteOnExit()
+        File(libDir, "greeting.js").apply {
+            writeText("""export const greeting = "hello from #greeting";""")
+            deleteOnExit()
+        }
+        File(libDir, "node-only.js").apply {
+            writeText("""export const value = "from node condition";""")
+            deleteOnExit()
+        }
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText(
+            """
+            import { greeting } from "#greeting";
+            import { value } from "#conditional";
+            globalThis.__hashImportGreeting = greeting;
+            globalThis.__hashImportConditional = value;
+            """.trimIndent()
+        )
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        assertEquals("hello from #greeting", mc.eval("js", "globalThis.__hashImportGreeting").asString())
+        assertEquals("from node condition", mc.eval("js", "globalThis.__hashImportConditional").asString())
+    }
+
     // --- CommonJS require() (js.commonjs-require experimental option) ---
     //
     // Prototyped and reverted — see the comment on Mycelium.context. Enabling
@@ -959,6 +1005,16 @@ class MyceliumIntegrationTest {
         assertTrue(mc.eval("js", "globalThis.__cryptoTimingSafeEqual").asBoolean())
     }
 
+    // --- `globalThis.crypto` (Web Crypto API) ---
+
+    @Test fun globalCryptoExists() {
+        val mc = vm
+        assertEquals("function", mc.eval("js", "typeof globalThis.crypto.randomUUID").asString())
+        assertEquals("function", mc.eval("js", "typeof globalThis.crypto.getRandomValues").asString())
+        val uuid = mc.eval("js", "globalThis.crypto.randomUUID()")
+        assertTrue(uuid.asString().matches(Regex("[0-9a-f-]{36}")))
+    }
+
     // --- Python site-packages / Ruby gem bare-specifier resolution ---
     //
     // resolvePythonPackage/resolveRubyGem both accept an explicit `searchPaths` override
@@ -1051,6 +1107,14 @@ class MyceliumIntegrationTest {
         val mc = vm
         val result = mc.eval("js", "process.env.HOME || process.env.PATH || ''")
         assertTrue(result.asString().isNotEmpty())
+    }
+
+    @Test fun processEnvSetWorks() {
+        val mc = vm
+        mc.eval("js", "process.env.MYCELIUM_TEST_ENV_SET_VAR = 'bar'")
+        val result = mc.eval("js", "process.env.MYCELIUM_TEST_ENV_SET_VAR")
+        assertEquals("bar", result.asString())
+        assertTrue(mc.eval("js", "'MYCELIUM_TEST_ENV_SET_VAR' in process.env").asBoolean())
     }
 
     @Test fun processCwdWorks() {

@@ -1,10 +1,9 @@
-// FIXME: imports are being resolved from the wrong location
-import "./app/modulestest/import.mjs";
+import "./import.mjs";
 import "http://curls.it/hkibj.mjs";
 import "https://curls.it/4JVnm.mjs";
-import { i } from "./app/modulestest/constant.mjs";
-import "./app/modulestest/import.rb";
-import { add, hello } from "./app/modulestest/hello.c";
+import { i } from "./constant.mjs";
+import "./import.rb";
+import { add, hello } from "./hello.c";
 console.log(i);
 console.log("add(2, 3) =", add(2, 3));
 hello();

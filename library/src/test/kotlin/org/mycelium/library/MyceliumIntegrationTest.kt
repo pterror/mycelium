@@ -2,9 +2,28 @@ package org.mycelium.library
 
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeAll
+import org.graalvm.polyglot.PolyglotException
 import java.io.File
 
 class MyceliumIntegrationTest {
+    companion object {
+        // GraalVM Context instances are very memory-hungry, so most tests below share a
+        // single Mycelium instance (and therefore a single Context) rather than each
+        // creating their own. Tests that need a different set of LanguageSupports (for
+        // the "composable subset" cases) still create their own, since that's the thing
+        // under test. Tests that only exercise error paths that fire before any guest
+        // code runs also reuse `vm` rather than needing an isolated instance.
+        @JvmStatic
+        @BeforeAll
+        fun setUpVm() {
+            vm = Mycelium()
+        }
+
+        lateinit var vm: Mycelium
+    }
+
     private fun testResourcePath(name: String): String {
         val url = javaClass.classLoader.getResource("modulestest/$name")
             ?: throw IllegalArgumentException("Test resource not found: modulestest/$name")
@@ -21,13 +40,13 @@ class MyceliumIntegrationTest {
     // --- Polyglot eval basics ---
 
     @Test fun polyglotEvalJs() {
-        val mc = Mycelium()
+        val mc = vm
         val result = mc.eval("js", "2 + 3")
         assertEquals(5, result.asInt())
     }
 
     @Test fun polyglotEvalRuby() {
-        val mc = Mycelium()
+        val mc = vm
         val result = mc.eval("ruby", "2 + 3")
         assertEquals(5, result.asInt())
     }
@@ -35,12 +54,12 @@ class MyceliumIntegrationTest {
     // --- JS as host: importing each target ---
 
     @Test fun runJsFile() {
-        val mc = Mycelium()
+        val mc = vm
         mc.runFile(testResourcePath("constant.mjs"))
     }
 
     @Test fun jsImportsJs() {
-        val mc = Mycelium()
+        val mc = vm
         val path = testResourcePath("constant.mjs")
         runJsWithImports(mc, """
             import { value } from "$path";
@@ -51,7 +70,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun jsImportsRuby() {
-        val mc = Mycelium()
+        val mc = vm
         val path = testResourcePath("hello.rb")
         runJsWithImports(mc, """
             import "$path";
@@ -61,8 +80,29 @@ class MyceliumIntegrationTest {
         assertEquals("rb_imported", result.asString())
     }
 
+    @Test fun jsImportsTwoRubyModulesWithSameExportName() {
+        val mc = vm
+        val path1 = testResourcePath("greet1.rb")
+        val path2 = testResourcePath("greet2.rb")
+        runJsWithImports(mc, """
+            import { greet as greet1 } from "$path1";
+            import { greet as greet2 } from "$path2";
+            globalThis.__results = {
+                greet1: greet1("world"),
+                greet2: greet2("world")
+            };
+        """.trimIndent())
+        val results = mc.eval("js", "globalThis.__results")
+        assertEquals("hello, world!", results.getMember("greet1").asString())
+        assertEquals("greetings, world.", results.getMember("greet2").asString())
+        assertNotEquals(
+            results.getMember("greet1").asString(),
+            results.getMember("greet2").asString()
+        )
+    }
+
     @Test fun jsImportsC() {
-        val mc = Mycelium()
+        val mc = vm
         val path = testResourcePath("add.c")
         runJsWithImports(mc, """
             import { add } from "$path";
@@ -72,8 +112,34 @@ class MyceliumIntegrationTest {
         assertEquals(5, result.asInt())
     }
 
+    // rustc is not (yet) provisioned by flake.nix — only clang and GraalVM are. Skip
+    // gracefully rather than failing the whole suite on machines/CI where it's absent.
+    // See TODO.md ("Rust / Go support") for the follow-up to add rustc to the flake.
+    private fun isCommandAvailable(cmd: String): Boolean =
+        try {
+            ProcessBuilder(cmd, "--version")
+                .redirectErrorStream(true)
+                .start()
+                .also { it.inputStream.readAllBytes(); it.waitFor() }
+            true
+        } catch (e: java.io.IOException) {
+            false
+        }
+
+    @Test fun jsImportsRust() {
+        assumeTrue(isCommandAvailable("rustc"), "rustc not available in PATH — skipping Rust interop test")
+        val mc = vm
+        val path = testResourcePath("multiply.rs")
+        runJsWithImports(mc, """
+            import { multiply } from "$path";
+            globalThis.__testResult = multiply(6, 7);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__testResult")
+        assertEquals(42, result.asInt())
+    }
+
     @Test fun jsImportsAllAtOnce() {
-        val mc = Mycelium()
+        val mc = vm
         val jsPath = testResourcePath("constant.mjs")
         val rbPath = testResourcePath("hello.rb")
         val cPath = testResourcePath("add.c")
@@ -94,7 +160,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun jsImportsMultipleC() {
-        val mc = Mycelium()
+        val mc = vm
         val addPath = testResourcePath("add.c")
         val subPath = testResourcePath("subtract.c")
         runJsWithImports(mc, """
@@ -113,12 +179,12 @@ class MyceliumIntegrationTest {
     // --- Ruby as host: eval into each target ---
 
     @Test fun runRubyFile() {
-        val mc = Mycelium()
+        val mc = vm
         mc.runFile(testResourcePath("hello.rb"))
     }
 
     @Test fun rubyEvalsJs() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("ruby", """
             ${'$'}__rb_result = Polyglot.eval("js", "2 + 3")
         """.trimIndent())
@@ -127,7 +193,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun rubyEvalsRuby() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("ruby", """
             ${'$'}__rb_result = Polyglot.eval("ruby", "7 * 6")
         """.trimIndent())
@@ -136,7 +202,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun rubyEvalsCViaModule() {
-        val mc = Mycelium()
+        val mc = vm
         val cPath = testResourcePath("add.c")
         mc.eval("ruby", """
             Polyglot.eval_module("js", "import { add } from '$cPath'; globalThis.__rbCResult = add(11, 22);")
@@ -148,7 +214,7 @@ class MyceliumIntegrationTest {
     // --- JS as host: eval into each target ---
 
     @Test fun jsEvalsRuby() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("js", """
             globalThis.__jsRbResult = Polyglot.eval("ruby", "7 * 6");
         """)
@@ -157,7 +223,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun jsEvalsJs() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("js", """
             globalThis.__jsJsResult = Polyglot.eval("js", "3 * 3");
         """)
@@ -168,7 +234,7 @@ class MyceliumIntegrationTest {
     // --- evalModule ---
 
     @Test fun evalModuleJs() {
-        val mc = Mycelium()
+        val mc = vm
         val cPath = testResourcePath("add.c")
         mc.evalModule("js", """
             import { add } from "$cPath";
@@ -179,7 +245,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun evalModuleFromRuby() {
-        val mc = Mycelium()
+        val mc = vm
         val cPath = testResourcePath("add.c")
         mc.eval("ruby", """
             Polyglot.eval_module("js", "import { add } from '$cPath'; globalThis.__rbModResult = add(3, 4);")
@@ -189,7 +255,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun evalModuleFromJs() {
-        val mc = Mycelium()
+        val mc = vm
         val cPath = testResourcePath("add.c")
         mc.eval("js", """
             Polyglot.evalModule("js", "import { add } from '$cPath'; globalThis.__jsModResult = add(5, 6);");
@@ -201,7 +267,7 @@ class MyceliumIntegrationTest {
     // --- Polyglot chains ---
 
     @Test fun chainJsToRubyToJs() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("js", """
             const rbResult = Polyglot.eval("ruby", 'Polyglot.eval("js", "10 + 20")');
             globalThis.__chainResult = rbResult;
@@ -211,7 +277,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun chainRubyToJsToRuby() {
-        val mc = Mycelium()
+        val mc = vm
         mc.eval("ruby", """
             ${'$'}__chain_result = Polyglot.eval("js", "Polyglot.eval('ruby', '5 * 5')")
         """.trimIndent())
@@ -221,7 +287,7 @@ class MyceliumIntegrationTest {
 
     @Test fun chainThreeDeepNested() {
         // JS -> Ruby -> JS, single expression
-        val mc = Mycelium()
+        val mc = vm
         val result = mc.eval("js",
             """Polyglot.eval("ruby", 'Polyglot.eval("js", "100")')"""
         )
@@ -230,7 +296,7 @@ class MyceliumIntegrationTest {
 
     @Test fun chainFourDeepNested() {
         // Ruby -> JS -> Ruby -> JS, single expression
-        val mc = Mycelium()
+        val mc = vm
         val result = mc.eval("ruby",
             """Polyglot.eval("js", "Polyglot.eval('ruby', 'Polyglot.eval(\"js\", \"42\")')")"""
         )
@@ -240,7 +306,7 @@ class MyceliumIntegrationTest {
     @Test fun chainDeepNested() {
         // Programmatically build nested Polyglot.eval chains
         // to test arbitrary recursion depth without escaping hell
-        val mc = Mycelium()
+        val mc = vm
         for (depth in 3..8) {
             var code = "1"
             val outerLang = if (depth % 2 == 0) "js" else "ruby"
@@ -256,7 +322,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun chainJsToRubyToJsToC() {
-        val mc = Mycelium()
+        val mc = vm
         val cPath = testResourcePath("add.c")
         mc.eval("js", """
             const rbVal = Polyglot.eval("ruby", 'Polyglot.eval("js", "100")');
@@ -271,7 +337,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun chainFourDeepAlternating() {
-        val mc = Mycelium()
+        val mc = vm
         // Ruby -> JS -> Ruby -> JS
         mc.eval("ruby", """
             result = Polyglot.eval("js", "Polyglot.eval('ruby', 'Polyglot.eval(\"js\", \"42\")')")
@@ -282,7 +348,7 @@ class MyceliumIntegrationTest {
     }
 
     @Test fun chainWithDataTransform() {
-        val mc = Mycelium()
+        val mc = vm
         // JS multiplies -> Ruby adds -> JS subtracts
         mc.eval("js", """
             const step1 = 6 * 7;
@@ -297,9 +363,11 @@ class MyceliumIntegrationTest {
 
     @Test fun composableSubsetRejectsUnknownExtension() {
         val mc = Mycelium(listOf(JsSupport))
-        assertThrows(NullPointerException::class.java) {
+        val ex = assertThrows(MyceliumException::class.java) {
             mc.runFile(testResourcePath("hello.rb"))
         }
+        assertTrue(ex.message!!.contains("mycelium:"))
+        assertTrue(ex.message!!.contains("hello.rb"))
     }
 
     @Test fun composableJsAndCOnly() {
@@ -328,5 +396,212 @@ class MyceliumIntegrationTest {
         val mc = Mycelium(listOf(JsSupport, RubySupport))
         assertNull(mc.supportForExtension("c"))
         assertNull(mc.languageFromExtension("c"))
+    }
+
+    // --- Friendly error UX ---
+
+    @Test fun runFileWithUnsupportedExtensionGivesFriendlyError() {
+        // No guest code runs before this error fires, so the shared `vm` is fine here —
+        // no need for an isolated Mycelium/Context just to hit this early-exit path.
+        val mc = vm
+        val tmpFile = File.createTempFile("mycelium-test-", ".xyz")
+        tmpFile.deleteOnExit()
+        tmpFile.writeText("irrelevant contents")
+        val ex = assertThrows(MyceliumException::class.java) {
+            mc.runFile(tmpFile.absolutePath)
+        }
+        assertTrue(ex.message!!.startsWith("mycelium:"))
+        assertTrue(ex.message!!.contains("don't know how to run"))
+        assertTrue(ex.message!!.contains(tmpFile.name))
+    }
+
+    @Test fun runNonexistentFileGivesFriendlyError() {
+        // Same rationale as above: the "file not found" check happens before any
+        // Context interaction, so reusing `vm` is safe and avoids another Context.
+        val mc = vm
+        val missingPath = File(File.createTempFile("mycelium-test-", ".mjs").also { it.delete() }.absolutePath)
+        val ex = assertThrows(MyceliumException::class.java) {
+            mc.runFile(missingPath.absolutePath)
+        }
+        assertTrue(ex.message!!.startsWith("mycelium:"))
+        assertTrue(ex.message!!.contains("not found"))
+    }
+
+    @Test fun missingCompilerGivesFriendlyError() {
+        // Exercise Compiler.compile directly with a bogus compiler command instead of
+        // spinning up a whole Mycelium/Context: the friendly-error behavior under test
+        // lives entirely in Compiler.compile, so there's no need to round-trip through
+        // a guest language import to observe it.
+        val bogusCSupport = object : LanguageSupport {
+            override val languageId = "llvm"
+            override val extensions = listOf("c")
+            override val compilerCommand = listOf("nonexistent-compiler-xyz")
+            override fun detectFrame(frame: String) = false
+            override fun isValidExportName(name: String) =
+                !name.contains('.') && !name.startsWith("__")
+            override fun generateShim(exports: Map<String, String>) = ""
+        }
+        val cFile = File.createTempFile("mycelium-nocompiler-", ".c")
+        cFile.deleteOnExit()
+        cFile.writeText("""
+            int add_${System.nanoTime()}(int a, int b) { return a + b; }
+        """.trimIndent())
+        val ex = assertThrows(MyceliumException::class.java) {
+            Compiler.compile(cFile.toPath(), bogusCSupport)
+        }
+        assertTrue(ex.message!!.startsWith("mycelium:"))
+        assertTrue(ex.message!!.contains("nonexistent-compiler-xyz"))
+    }
+
+    // --- Relative import resolution ---
+
+    @Test fun relativeImportResolvesAgainstImportingFileDirectory() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-relimport-").toFile()
+        tmpDir.deleteOnExit()
+        val subDir = File(tmpDir, "sub")
+        subDir.mkdirs()
+        subDir.deleteOnExit()
+
+        val libFile = File(subDir, "lib.mjs")
+        libFile.writeText("""export const value = 99;""".trimIndent())
+        libFile.deleteOnExit()
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""
+            import { value } from "./sub/lib.mjs";
+            globalThis.__testResult = value;
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        // The JVM's actual working directory (used to resolve relative paths
+        // naively) is the project/module directory, not tmpDir. Since tmpDir
+        // is unrelated to the process cwd, this proves that "./sub/lib.mjs"
+        // resolves against main.mjs's own directory rather than cwd.
+        assertNotEquals(tmpDir.absolutePath, File(System.getProperty("user.dir")).absolutePath)
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__testResult")
+        assertEquals(99, result.asInt())
+    }
+
+    // --- npm node_modules bare-specifier resolution ---
+
+    private fun writeFakePackage(tmpDir: File, main: String = "index.js"): File {
+        val pkgDir = File(tmpDir, "node_modules/fake-pkg")
+        pkgDir.mkdirs()
+        pkgDir.deleteOnExit()
+        File(pkgDir, "package.json").apply {
+            writeText("""{"name": "fake-pkg", "version": "1.0.0", "main": "$main"}""")
+            deleteOnExit()
+        }
+        File(pkgDir, main).apply {
+            writeText("""export const greeting = "hello from fake-pkg";""")
+            deleteOnExit()
+        }
+        return pkgDir
+    }
+
+    @Test fun bareSpecifierResolvesAgainstNodeModules() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-").toFile()
+        tmpDir.deleteOnExit()
+        writeFakePackage(tmpDir)
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""
+            import { greeting } from "fake-pkg";
+            globalThis.__npmTestResult = greeting;
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__npmTestResult")
+        assertEquals("hello from fake-pkg", result.asString())
+    }
+
+    @Test fun bareSpecifierWalksUpParentDirectoriesForNodeModules() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-nested-").toFile()
+        tmpDir.deleteOnExit()
+        writeFakePackage(tmpDir)
+
+        val subDir = File(tmpDir, "src/nested")
+        subDir.mkdirs()
+        subDir.deleteOnExit()
+
+        val mainFile = File(subDir, "main.mjs")
+        mainFile.writeText("""
+            import { greeting } from "fake-pkg";
+            globalThis.__npmNestedResult = greeting;
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__npmNestedResult")
+        assertEquals("hello from fake-pkg", result.asString())
+    }
+
+    @Test fun bareSpecifierUsesExportsFieldOverMain() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-exports-").toFile()
+        tmpDir.deleteOnExit()
+        val pkgDir = File(tmpDir, "node_modules/exports-pkg")
+        pkgDir.mkdirs()
+        pkgDir.deleteOnExit()
+        File(pkgDir, "package.json").apply {
+            writeText(
+                """
+                {
+                  "name": "exports-pkg",
+                  "main": "wrong.js",
+                  "exports": { ".": { "import": "esm.js", "default": "wrong.js" } }
+                }
+                """.trimIndent()
+            )
+            deleteOnExit()
+        }
+        File(pkgDir, "esm.js").apply {
+            writeText("""export const value = "from exports field";""")
+            deleteOnExit()
+        }
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""
+            import { value } from "exports-pkg";
+            globalThis.__npmExportsResult = value;
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__npmExportsResult")
+        assertEquals("from exports field", result.asString())
+    }
+
+    @Test fun nonexistentBareSpecifierGivesFriendlyError() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-missing-").toFile()
+        tmpDir.deleteOnExit()
+        // An (empty) node_modules directory marks this as an npm-style project — that's
+        // what makes a missing package worth a friendly error rather than silently falling
+        // back to plain-path behavior (see resolveNodeModule's NoNodeModulesTree case).
+        val nodeModules = File(tmpDir, "node_modules")
+        nodeModules.mkdirs()
+        nodeModules.deleteOnExit()
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""
+            import "does-not-exist-pkg";
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        val ex = assertThrows(PolyglotException::class.java) {
+            mc.runFile(mainFile.absolutePath)
+        }
+        assertTrue(ex.isHostException)
+        val hostException = ex.asHostException()
+        assertTrue(hostException is MyceliumException)
+        assertTrue(hostException.message!!.startsWith("mycelium:"))
+        assertTrue(hostException.message!!.contains("does-not-exist-pkg"))
     }
 }

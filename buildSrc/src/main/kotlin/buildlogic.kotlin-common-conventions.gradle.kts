@@ -14,4 +14,9 @@ dependencies {
 
 java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }
 
-tasks.named<Test>("test") { useJUnitPlatform() }
+tasks.named<Test>("test") {
+    useJUnitPlatform()
+    // GraalVM Context instances are memory-hungry; without a cap the default test JVM
+    // heap sizing can lead to OutOfMemoryError when several tests each spin one up.
+    jvmArgs = listOf("-Xmx2g")
+}

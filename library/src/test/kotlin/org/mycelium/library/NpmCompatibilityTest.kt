@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
+import org.graalvm.polyglot.PolyglotException
 import java.io.File
 
 // Runs *real* npm packages (fetched from the registry via a real `npm install`) end-to-end
@@ -34,6 +35,46 @@ import java.io.File
 //     `java.lang.System.getenv()` snapshot — so `process.env.FOO = 'bar'` is now
 //     observable through a later `process.env.FOO` read, and packages that mutate
 //     process.env at runtime (dotenv being the canonical example) behave correctly.
+//
+// Second round — harder packages (axios, express, semver, ms, debug), 2/5 pass:
+//
+//   - semver (pure JS CJS, no exotic package.json fields): WORKS. Same node_modules ->
+//     "main" -> CJS-to-ESM path as lodash/minimist.
+//   - ms (pure JS CJS): FAILS. Its package.json declares `"main": "./index"` — no file
+//     extension. `InterceptingFileSystem.resolvePackageEntryPoint`
+//     (ENTRY_POINT_RESOLVER + `packageDir.resolve(entry)`) resolves this literally to a
+//     path with no `.js` suffix and no existence check, so it hands GraalJS's own ESM
+//     loader a nonexistent path; GraalJS itself then throws its own guest-side
+//     `Error: Cannot find module '.../ms/index'`. Real Node.js resolution tries
+//     `./index`, then `./index.js`, `./index.json`, `./index.node`, then
+//     `./index/index.js` etc. — that extension/directory-index probing is missing from
+//     Mycelium's `"main"`-field fallback path (it's only implemented for the *no*
+//     package.json / bare-directory-import case, per the `indexJs` fallback elsewhere in
+//     the same file).
+//   - debug (CJS, uses `tty` for TTY-detection): FAILS. `require("tty")` — `tty` is not
+//     among Mycelium's ~16 synthetic core modules (path/events/util/os/fs/buffer/url/
+//     stream/crypto/process/assert/querystring/string_decoder/zlib/http/https), so
+//     resolution throws "mycelium: cannot find module 'tty'". A very common transitive
+//     dependency (express pulls it in via body-parser -> debug), so this single missing
+//     module blocks a lot of the ecosystem.
+//   - axios (pure ESM/dual, v1.x): FAILS, one layer deeper than the `dot.import`/
+//     `dot.default` cases chalk/lodash already cover. axios's `exports["."]` is a
+//     *nested* conditions object — `{types: {...}, bun: {...}, "react-native": {...},
+//     browser: {...}, default: {require: "./dist/node/axios.cjs", default:
+//     "./index.js"}}` — where even the `"default"` condition's value is itself another
+//     `{require, default}` object rather than a string. `ENTRY_POINT_RESOLVER` only
+//     descends one level (`dot.import` / `dot.default`) and then unconditionally
+//     `.asString()`s whatever it finds, so it throws "Cannot convert
+//     '{require: ..., default: ...}' ... to Java type java.lang.String". Proper Node
+//     conditional-exports resolution is recursive over conditions (matching `import`/
+//     `require`/`default`/platform names in priority order) until it bottoms out at a
+//     string; Mycelium's resolver isn't. Note this is purely a resolution-layer bug —
+//     the underlying `http`/`https` core-module shims are a real (if minimal)
+//     `HttpURLConnection`-backed implementation, not stubs, so once resolution is fixed
+//     axios's actual requests have a real chance of working.
+//   - express (CJS, big dependency tree): FAILS for the exact same reason as debug — it
+//     pulls in `debug` transitively (via `body-parser`), so it dies on the same missing
+//     `tty` module. Not a distinct express-specific gap.
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -191,5 +232,132 @@ class NpmCompatibilityTest {
         // envProxy `set` trap tracks overrides that `get` consults before falling back to
         // the live java.lang.System.getenv() snapshot.
         assertEquals("hello_from_dotenv", mc.eval("js", "globalThis.__dotenvEnvVar").asString())
+    }
+
+    // --- 6. semver — version parsing, pure JS CJS. WORKS. ---
+
+    @Test fun semverParsesAndComparesVersions() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-semver-")
+        npmInstall(dir, "semver")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import semver from 'semver';
+            globalThis.__semverValid = semver.valid('1.2.3');
+            globalThis.__semverGt = semver.gt('1.2.3', '1.2.0');
+            """.trimIndent()
+        )
+        assertEquals("1.2.3", mc.eval("js", "globalThis.__semverValid").asString())
+        assertTrue(mc.eval("js", "globalThis.__semverGt").asBoolean())
+    }
+
+    // --- 7. ms — time string parser, pure JS CJS. FAILS: package.json declares
+    // `"main": "./index"` with no file extension, and Mycelium's `resolvePackageEntryPoint`
+    // resolves that literally instead of probing `./index.js` etc. like real Node
+    // resolution does — see class doc comment. GraalJS's own ESM loader (not Mycelium code)
+    // throws the "Cannot find module" guest error once handed the nonexistent path, so
+    // unlike the CJS `require()`-path failures below, this surfaces as a *non*-host
+    // PolyglotException. ---
+
+    @Test fun msFailsOnExtensionlessMainField() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-ms-")
+        npmInstall(dir, "ms")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import ms from 'ms';
+                globalThis.__msResult = ms('2 days');
+                """.trimIndent()
+            )
+        }
+        assertTrue(ex.message?.contains("Cannot find module") == true, "unexpected message: ${ex.message}")
+    }
+
+    // --- 8. debug — logging, CJS, `require("tty")` for TTY detection. FAILS: `tty` is not
+    // among Mycelium's synthetic core modules, so resolution throws a host
+    // MyceliumException ("cannot find module 'tty'") from inside the injected `require()`
+    // callback, which surfaces to guest code as a *host* PolyglotException. ---
+
+    @Test fun debugFailsOnMissingTtyModule() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-debug-")
+        npmInstall(dir, "debug")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import debug from 'debug';
+                const log = debug('mycelium:test');
+                log('hello %s', 'world');
+                """.trimIndent()
+            )
+        }
+        assertTrue(ex.isHostException)
+        assertTrue(ex.asHostException() is MyceliumException)
+        assertTrue(ex.message?.contains("cannot find module 'tty'") == true, "unexpected message: ${ex.message}")
+    }
+
+    // --- 9. axios — HTTP client, ESM/dual (v1.x). FAILS: `exports["."]` is a *nested*
+    // conditions object (the `"default"` condition's own value is itself another
+    // `{require, default}` object rather than a string), one level deeper than
+    // `ENTRY_POINT_RESOLVER` currently descends — see class doc comment. Surfaces as a host
+    // MyceliumException wrapping the JS-to-Java string coercion failure. ---
+
+    @Test fun axiosFailsOnNestedConditionalExports() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-axios-")
+        npmInstall(dir, "axios")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import axios from 'axios';
+                globalThis.__axiosType = typeof axios;
+                """.trimIndent()
+            )
+        }
+        assertTrue(ex.isHostException)
+        assertTrue(ex.asHostException() is MyceliumException)
+        assertTrue(
+            ex.message?.contains("Cannot convert") == true || ex.message?.contains("Invalid coercion") == true,
+            "unexpected message: ${ex.message}"
+        )
+    }
+
+    // --- 10. express — HTTP server framework, CJS, big dependency tree. FAILS for the same
+    // underlying reason as debug (#8): express -> body-parser -> debug -> `require("tty")`.
+    // Not a distinct express-specific gap — included here to document that the failure is
+    // reached (and is the *same* failure) via a realistic multi-level dependency chain. ---
+
+    @Test fun expressFailsTransitivelyOnMissingTtyModule() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-express-")
+        npmInstall(dir, "express")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import express from 'express';
+                const app = express();
+                globalThis.__expressType = typeof app.listen;
+                """.trimIndent()
+            )
+        }
+        assertTrue(ex.isHostException)
+        assertTrue(ex.asHostException() is MyceliumException)
+        assertTrue(ex.message?.contains("cannot find module 'tty'") == true, "unexpected message: ${ex.message}")
     }
 }

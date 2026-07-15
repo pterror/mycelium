@@ -1,46 +1,105 @@
-# Mycelium — Open Threads
+# Mycelium — Project State & Open Threads
 
-*Updated 2026-07-15. Treat as starting context, not instructions — verify relevance before acting.*
+*Updated 2026-07-15. This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
 
 ## Vision
 
-Mycelium's purpose: make every language's package ecosystem available to every other language. npm + PyPI + RubyGems + crates.io, all importable from anywhere. Not just "write in the best language" — unlock every package registry at once.
+Mycelium's purpose: make every language's package ecosystem available to every other language. npm + PyPI + RubyGems + crates.io, all importable from anywhere, cross-language, in one shared GraalVM polyglot `Context`. Not just "write in the best language" — unlock every package registry at once.
+
+## Architecture decisions (with rationale)
+
+- **CJS support implemented as a JS-side wrapper**, not GraalJS's built-in loader: `(function(exports, require, module, __filename, __dirname) { ... })`, with the module cache populated before execution to support circular `require()`s (mirrors Node's own resolution order).
+- **GraalJS's `js.commonjs-require` / `js.commonjs-require-cwd` options tried and rejected.** Enabling them swaps GraalJS's ES module loader for `NpmCompatibleESModuleLoader`, which hard-rejects any import specifier extension outside a hardcoded whitelist (`js`/`mjs`/`cjs`/`json`/`node`) with `TypeError: Unsupported file extension` — before Mycelium's custom `InterceptingFileSystem` ever sees the read. Mycelium's entire cross-language-import mechanism (`.c`/`.rb`/`.rs`/`.ts`/wasm) depends on GraalJS handing "unrecognized" extensions to that FileSystem to shim, so the option can't be turned on globally without redesigning that mechanism (e.g. a second, CJS-only Context for a subtree — conflicts with the single shared Context/polyglot-bindings architecture used everywhere).
+- **Forking GraalJS's CJS loader rejected** — too tightly coupled to internal Truffle APIs to maintain.
+- **Embedding GraalVM's Node.js distribution rejected** — it's a forked C++ binary, not a Truffle language; can't be embedded in a JVM `Context`.
+- **WASM loaded via GraalJS's `WebAssembly` JS API, not the raw Truffle "wasm" language.** `context.eval("wasm", ...)` exposes zero `memberKeys` — no way to read a compiled module's exports. Fix: read the compiled `.wasm` bytes, hand them to the JS context via `context.polyglotBindings` as a plain Java `ByteArray`, and evaluate JS that builds a `Uint8Array` and calls `new WebAssembly.Module(...)` / `new WebAssembly.Instance(...)`. Requires the `js.webassembly` context option (off by default). `instance.exports` is then an ordinary JS object, reusing the same shim-generation path as LLVM exports.
+- **esbuild used for TypeScript transpilation only, not for CJS.** Bundling/transpiling CJS would break Node's circular-dependency semantics; esbuild is invoked transform-only (`bundle = false`) purely to strip TS types/syntax, leaving `import`/`export` specifiers untouched so Mycelium's own resolver still handles them.
+- **Node stdlib implemented as synthetic core modules backed by Java interop**, cross-referencing Node/Deno/Bun source for exact semantics (must mirror Node 1:1, not just approximate it).
+- **Cross-language binding namespacing**: polyglot bindings keyed as `"modulepath:exportname"` to avoid collisions between languages/modules sharing one bindings object.
+
+## Hard constraints / gotchas
+
+- TruffleRuby is not published above 25.0.0 on Maven Central — this is the practical ceiling for GraalVM version bumps (see "GraalVM version" below).
+- GraalPython upstream bug blocks Python support entirely — see dedicated section below.
+- Maven Central's search API is stale/unreliable for checking whether a version exists — always verify against the raw repo (e.g. `repo1.maven.org`), not the search UI/API.
+- GraalJS auto-unboxes host `String`s to JS primitives — use `Charset#encode`, not `String.getBytes`, when producing bytes from JS-originated strings.
+- GraalJS ships no `URL`/`URLSearchParams` globals — had to be implemented in pure JS.
+- GraalVM `Context` is single-threaded for JS — the httpserver dispatch thread cannot share a `Context` across threads.
+- `native-image` peaks at ~17GB RAM during build; capped via `-J-Xmx8g`; produces an ~887MB binary.
+- Rust compilation needs `--crate-type=lib` or `rustc` fails with "main function not found".
+- Go→LLVM is not viable — stock Go does not emit LLVM bitcode via any single-command pipeline. Only Go→WASM via tinygo works (see Go section).
+
+## npm compatibility status
+
+**Round 1 (5/5 pass, unpinned versions):** lodash, minimist, chalk, uuid, dotenv.
+
+**Round 2 (2/5 pass):**
+- `semver` — WORKS (plain CJS, same `"main"` → CJS-to-ESM path as lodash).
+- `ms` — FAILS. `"main": "./index"` has no file extension; `InterceptingFileSystem.resolvePackageEntryPoint` resolves it literally with no extension-probing fallback (real Node tries `./index`, `./index.js`, `./index.json`, `./index.node`, `./index/index.js`).
+- `debug` — FAILS. `require("tty")`; `tty` is not among Mycelium's ~16 synthetic core modules. Common transitive dep (pulled in by express via body-parser), so this one gap blocks a lot of the ecosystem.
+- `axios` — FAILS. `exports["."]` is a *nested* conditions object where even the `"default"` condition's value is itself another `{require, default}` object. `ENTRY_POINT_RESOLVER` only descends one level before unconditionally `.asString()`-ing the result. Proper Node conditional-exports resolution is recursive; Mycelium's isn't. (The underlying `http`/`https` core-module shims are a real, if minimal, implementation — this is purely a resolution-layer gap.)
+- `express` — FAILS, for the same reason as `debug` (transitively pulls it in via body-parser) — not a distinct express-specific gap.
+
+**Chalk regression (pre-existing, confirmed via `git stash` to predate this session):** `chalkResolvesSubpathImports` fails against whatever chalk version npm currently resolves as "latest" (5.6.2 as of last check) — `#ansi-styles` fails with "no matching imports entry found", i.e. the fallback path (`sourceDirectoryStack.get().firstOrNull() ?: process.cwd()`) is hit instead of chalk's real `source/` directory. Suggests the source-directory `ThreadLocal` stack (pushed/popped around `newByteChannel` reads in `InterceptingFileSystem.kt`) is empty by the time GraalJS resolves the import. This is a flake risk for the whole `NpmCompatibilityTest` suite, since no test there pins package versions.
+
+All findings above are cataloged as tests in `NpmCompatibilityTest.kt` (see its class doc comment for full detail) — **cataloged, not yet fixed**, per the project's "find gaps, don't fix them yet" sweep approach.
+
+### Known npm gaps to fix (ordered simplest → hardest)
+1. Extensionless `"main"` field resolution — probe `.js`/`.json`/`index.js` etc. like Node does.
+2. Add a `tty` core module (a stub is fine — just needs `isatty()` and a `WriteStream`).
+3. Recursive/nested conditional-exports resolution in `package.json`'s `"exports"` field.
+4. Chalk subpath-import regression (`sourceDirectoryStack` empty for subpath imports).
+
+### Missing Node stdlib modules
+`net`, `child_process`, `worker_threads`, `readline`, `tty`, `dns`, `dgram`, `cluster`. Also: console output could be improved beyond GraalJS's defaults.
+
+## Language support status
+
+### JavaScript / TypeScript — working
+Core language. TypeScript (`.ts`/`.mts`, routed to `js` via `JsSupport.extensions`) transpiles through `TsCompiler` (`library/src/main/kotlin/org/mycelium/library/TsCompiler.kt`) using `io.mvnpm:esbuild-java:1.5.1`. `InterceptingFileSystem.newByteChannel` intercepts `.ts`/`.mts` reads before any other routing and hands GraalJS the transpiled JS. Output cached on disk by source-content hash (`~/.cache/mycelium/ts`, same pattern as `Compiler.compile`'s LLVM cache) since esbuild spawns a subprocess and downloads a platform binary on first use (network required once; ~5s cold, near-instant cached). esbuild hashes output filenames unpredictably, so `TsCompiler` picks the lone `.js` file in the esbuild dist dir (safe since each transpile is a single non-bundled entry point). Covered by `jsImportsTypeScript` in `MyceliumIntegrationTest.kt`.
+
+### Go — working (WASM only)
+`TinyGoSupport` (Go → WASM via `tinygo build -target=wasi`, languageId = `"wasm"`) is wired into Mycelium's default language list. `tinygo` is in `flake.nix`'s devShell. Go→LLVM was investigated and ruled out (see doc comment on `TinyGoSupport` in `Languages.kt`). `LanguageSupport` has an `outputExtension` property so the compiled-import branch keys off it instead of hardcoding `"llvm"`; Go overrides it to `"wasm"`.
+
+The first end-to-end test (`jsImportsGoWasm`) initially failed because the raw Truffle "wasm" language exposes zero `memberKeys` for module exports — fixed by routing through GraalJS's `WebAssembly` API instead (see architecture section above). tinygo's `-target=wasi` output imports several WASI preview1 functions even for WASI-oblivious code (runtime init pulls them in); `wasi_snapshot_preview1.*` is stubbed with no-ops in the instantiation snippet.
+
+All `:library:test` tests pass including `jsImportsGoWasm` (tinygo 0.41.1, GraalVM CE 25.0.2 in devShell, Maven artifacts pinned at 25.0.0). Open/unexplored: `gccgo` as an alternative Go→LLVM path was never investigated.
+
+### Rust — working
+`--crate-type=lib` fix applied; compiles end-to-end. `rustc` is now in `flake.nix`'s devShell (added since last update), so `jsImportsRust` runs by default rather than skipping.
+
+### Ruby, C — working
+Cross-language imports for `.rb`/`.c` function via the same `InterceptingFileSystem` shimming mechanism as the other compiled/foreign languages.
+
+### Python — blocked upstream
+GraalPython crashes with `SystemError: Unable to set dict of object of type foreign` when evaluating Python through a named `Source` with a custom `FileSystem` attached. Confirmed on both 24.1.1 and 25.0.0 — a GraalPython bug, not a Mycelium issue (disappears if either the custom FileSystem or the named Source is removed). Separately fixed a Mycelium-side bug where it was hard-failing on GraalPython's internal `<frozen importlib._bootstrap>` synthetic identifiers — that fix is in the tree independent of the blocker. As of the 25.0.0 bump, the underlying crash now manifests as a host `NullPointerException` instead of an opaque `HostException` wrapper, but is otherwise unresolved. Repro tests in `PythonInteropExperimentTest.kt`. Next step: try a newer GraalVM/GraalPython release, or file a minimal repro upstream.
+
+## GraalVM version: pinned at 25.0.0 (bump to 25.1.3 attempted, blocked)
+
+Attempted bumping `library/build.gradle.kts`'s `graalVersion` from 24.2.1 to 25.1.3. `truffle-api` and `polyglot:{polyglot,js,python,java,wasm,llvm-native}` are published at 25.1.3 on Maven Central, but `polyglot:ruby`, `org.graalvm.ruby:ruby`, and the old `polyglot:llvm` coordinate are not — they stop at 25.0.0/25.0.1. Mixing `truffle-api` 25.1.3 with `truffleruby` 25.0.0 fails hard at runtime (`ClassCastException: Invalid inline context node passed to an inlined field`, deep in Truffle DSL-generated inline-cache code) — an ABI break between Truffle DSL versions, not just a version mismatch.
+
+Landed on **25.0.0 uniformly** (up from 24.2.1) — the highest version where every required GraalVM Maven artifact (including Ruby/LLVM) is simultaneously available. Two integration tests needed updates for behavior changes between 24.2.1 and 25.0.0: `MyceliumIntegrationTest.nonexistentBareSpecifierGivesFriendlyError` (host-exception shape reverted to pre-24.2.1 form) and `PythonInteropExperimentTest.mycelium_runFile_jsPolyglotEvalPython_noLongerHardFailsOnFrozenBootstrap` (same underlying GraalPython bug, now a host NPE instead of an opaque HostException).
+
+All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `flake.nix` uses nixpkgs' stock `graalvmPackages.graalvm-ce`, currently 25.0.2 — close enough to Maven's 25.0.0 that native-image works without incident.
+
+**Revisit when:** upstream publishes matching 25.1.x Ruby/LLVM Maven artifacts, or confirms they're dropped for good — `org.graalvm.polyglot:ruby` / `org.graalvm.ruby:ruby` is already marked deprecated upstream ("retained only for Maven compatibility").
 
 ## Open threads
 
-### CommonJS `require()` support (prototyped, reverted — not viable as a global Context option)
-Tried enabling `js.commonjs-require` + `js.commonjs-require-cwd` on the shared Context (`allowExperimentalOptions(true)`). Result: **16 of 62 `:library:test` tests broke**, all of Mycelium's cross-language imports (`.c`/`.rb`/`.rs`) and the new TypeScript-via-esbuild import (`.ts`). Root cause: enabling the option swaps GraalJS's ES module loader for `NpmCompatibleESModuleLoader`, which rejects any import specifier extension not on its own hardcoded whitelist (`js`/`mjs`/`cjs`/`json`/`node`) with `TypeError: Unsupported file extension` — before `InterceptingFileSystem.newByteChannel` ever runs. Mycelium's whole cross-language-import mechanism depends on GraalJS handing "unrecognized" extensions to the custom FileSystem to shim, so this can't be turned on globally without redesigning that mechanism (e.g. a second, CJS-only Context for a subtree — conflicts with the single shared Context/polyglot-bindings architecture used everywhere else).
-Two more findings surfaced along the way, one a real bug fix kept in the tree:
-- **Fixed a latent bug** in `InterceptingFileSystem.parsePath(URI)`: the old `uri.toString().startsWith('/')` check is never true for real `file:` URIs (they stringify as `"file:/…"`, not `"/…"`), so every file URI fell into the "wrap as synthetic `/.mycelium/` URL" branch. This was invisible until something actually exercised that overload with plain file URIs — which `js.commonjs-require`'s package-scope lookup does, by walking a file's ancestor directories via repeated `Env.getPublicTruffleFile(URI)` calls. The bug turned each "step up to the parent directory" into a *longer* synthetic path instead of a shorter real one, producing an unbounded loop that pegged a CPU core indefinitely (confirmed via `jstack` — same call chain revisited on every sample, values growing without bound) until something on the outside killed the process. Fixed by checking `uri.scheme` (`null` or `"file"` → real path; anything else → synthetic `/.mycelium/` wrap) instead of the string's first character. This fix is independent of the (reverted) commonjs option and is kept.
-- Once the extension-whitelist blocker and the infinite loop were both worked around/fixed, `require()` itself (as an injected global) DID successfully load a CJS module — but only via an **absolute path**. Relative specifiers (`require("./foo.js")`) resolve against the fixed `js.commonjs-require-cwd` the Context was built with, not against the requiring file's own directory (confirmed experimentally). Since that cwd is a Context-build-time option, it can't be re-pointed per `runFile` call without rebuilding the Context per entry point.
-Net: not pursued further. If revisited, the extension whitelist is the real blocker — worth checking whether a newer GraalVM version exposes a way to extend/bypass `NpmCompatibleESModuleLoader`'s whitelist, or whether CJS support could be scoped to only the language's own untouched file-extension set (`.js`/`.mjs`/`.cjs`) rather than the whole shared Context.
-
-### TypeScript via esbuild (prototyped, working)
-`.ts`/`.mts` files (already routed to `js` via `JsSupport.extensions`) are transpiled to plain JS by `TsCompiler` (new file, `library/src/main/kotlin/org/mycelium/library/TsCompiler.kt`) using `io.mvnpm:esbuild-java:1.5.1`, which is already a `library/build.gradle.kts` dependency. `InterceptingFileSystem.newByteChannel` intercepts `.ts`/`.mts` reads before any other routing and hands GraalJS the transpiled JS instead of the raw source. Transform-only (`bundle = false`) — esbuild strips types/syntax from exactly the one file handed to it and leaves `import`/`export` specifiers untouched, so relative and cross-language imports inside the output still go through `InterceptingFileSystem`'s normal resolution rather than esbuild's own bundling resolver. Output is cached on disk by source-content hash (`~/.cache/mycelium/ts`, mirroring `Compiler.compile`'s cache for the LLVM path), since esbuild spawns a subprocess and downloads a platform binary on first use (network access required the first time; ~5s cold, near-instant once cached). One quirk worth flagging: esbuild's default config hashes output filenames (e.g. `typed-C4ASCX62.js`), so `TsCompiler` can't predict the exact output name — it picks the lone `.js` file in the esbuild dist dir instead (safe because each transpile is a single, non-bundled entry point). Covered by `jsImportsTypeScript` in `MyceliumIntegrationTest.kt` and `library/src/test/resources/modulestest/typed.ts`.
-
 ### Package manager auto-install
-npm bare specifier resolution works against existing `node_modules` (walks parent dirs, reads package.json exports/main). But there's no auto-install — users must `npm install` packages themselves first. Open question: eager (install on first import, magical but unpredictable) vs declarative (manifest file, explicit but adds friction). Neither pip nor gem resolution is implemented yet.
-
-### Python support (blocked upstream)
-GraalPython 24.1.1 crashes with `SystemError: Unable to set dict of object of type foreign` when evaluating Python through a named Source with a custom FileSystem attached. This is a GraalPython bug, not a Mycelium issue — disappears if either the custom FileSystem or the named Source is removed. Fixed a separate bug where Mycelium was hard-failing on GraalPython's internal `<frozen importlib._bootstrap>` synthetic identifiers. See `PythonInteropExperimentTest.kt` for repro tests. Next step: try newer GraalVM/GraalPython release, or file minimal repro upstream.
-
-### Go support (FIXED — WASM loaded via GraalJS's WebAssembly API, not the raw "wasm" language)
-`TinyGoSupport` (Go → WASM via `tinygo build -target=wasi`, languageId = "wasm") was wired into Mycelium's default language list in commit c922485, and `tinygo` was added to `flake.nix`'s devShell. Go → LLVM was investigated and ruled out entirely (no viable single-command bitcode pipeline for stock Go — see the doc comment on `TinyGoSupport` in `Languages.kt`), so Go only ever compiles to WASM. `LanguageSupport` gained an `outputExtension` property so the compiled-import branch keys off it instead of hardcoding `"llvm"` — Go overrides it to `"wasm"`.
-
-**BLOCKER DISCOVERED AND FIXED 2026-07-15**: The first end-to-end test run (`jsImportsGoWasm`, which compiles `add.go` and tries to import the `add` function from JavaScript) initially failed because **GraalVM's raw "wasm" Truffle language does not expose module exports as `Value.memberKeys`** — `context.eval("wasm", binary_file)` hands back a Value with zero members and no way to instantiate the module or read its exports.
-
-**Fix**: stopped using `context.eval("wasm", ...)` entirely for the compiled-import path. Instead, `InterceptingFileSystem.loadWasmExports` reads the compiled `.wasm` bytes, hands them to the *JS* context as a polyglot binding (`context.polyglotBindings.putMember(...)`, a plain Java `ByteArray`), and evaluates a small JS snippet that builds a `Uint8Array` from those bytes and calls the standard `new WebAssembly.Module(...)` / `new WebAssembly.Instance(...)` — GraalJS ships a full `WebAssembly` JS API builtin (`com.oracle.truffle.js.runtime.builtins.wasm.*` in `org.graalvm.polyglot:js:25.0.0`), it's just gated behind a context option (`js.webassembly`, not enabled by default) that wasn't set. Added `.option("js.webassembly", "true")` to the shared `Context.newBuilder()` in `Mycelium.kt`. `instance.exports` is an ordinary JS object whose `memberKeys` `generateShim` already knows how to enumerate — same code path as LLVM exports, no shim-generation changes needed. tinygo's `-target=wasi` output imports several WASI preview1 functions even for WASI-oblivious code (its runtime init pulls them in), so `wasi_snapshot_preview1.*` is stubbed with harmless no-ops in the instantiation snippet.
-
-All `:library:test` tests pass, including `jsImportsGoWasm`, run via `nix develop --command bash -c "cd library && ../gradlew test"` (tinygo 0.41.1, GraalVM CE 25.0.2 in the devShell, Maven artifacts pinned at 25.0.0).
-
-### Distribution form
-CLI exists (`mycelium run/version/help`) but only via `./gradlew :app:run --args="..."`. Open question: use GraalVM native-image for a standalone binary? Is GraalVM's weight acceptable for end users, or explore lighter paths?
-
-### Add rustc to flake.nix
-Rust compilation works end-to-end (`--crate-type=lib` fix applied), but the integration test (`jsImportsRust`) skips because `rustc` isn't in `flake.nix`. Add it to make the test run by default.
+npm bare-specifier resolution works against an existing `node_modules` (walks parent dirs, reads `package.json` exports/main), but there's no auto-install — users must `npm install` packages themselves first. Open design question: eager (install on first import — magical but unpredictable) vs. declarative (manifest file — explicit but adds friction). Neither pip nor gem resolution exists yet at all (see below).
 
 ### pip / gem resolution
-npm node_modules resolution is implemented. Analogous resolution for Python (pip/site-packages) and Ruby (gem) packages is not. Design question: each ecosystem has different conventions for installed package layout — worth investigating what "already installed" looks like for pip and gem before building resolvers.
+npm's `node_modules` resolution is implemented; analogous resolution for Python (pip/site-packages) and Ruby (gem) packages is not. Each ecosystem has different conventions for "already installed" package layout — worth investigating those conventions before building resolvers. Blocked in practice for Python by the GraalPython upstream bug above, but the resolver work itself is independent and could proceed for Ruby.
 
-### GraalVM bump to 25.1.3 (blocked on Ruby/LLVM Maven publishing)
-Attempted bumping `library/build.gradle.kts`'s `graalVersion` from 24.2.1 to 25.1.3. `org.graalvm.truffle:truffle-api`, `org.graalvm.polyglot:{polyglot,js,python,java,wasm,llvm-native}` are published at 25.1.3 on Maven Central, but `org.graalvm.polyglot:ruby`, `org.graalvm.ruby:ruby`, and the old `org.graalvm.polyglot:llvm` coordinate are not — they stop at 25.0.0/25.0.1. Mixing truffle-api 25.1.3 with truffleruby 25.0.0 was tried and fails hard at runtime: `ClassCastException: Invalid inline context node passed to an inlined field` deep in Truffle's DSL-generated inline-cache code (`InlineSupport$UnsafeField`), i.e. an ABI break between Truffle DSL versions, not just a version-number mismatch. Landed on **25.0.0 uniformly** instead (up from 24.2.1) — the highest version where every required GraalVM Maven artifact is simultaneously available. Two integration tests had to be updated for behavior that changed again between 24.2.1 and 25.0.0 (`MyceliumIntegrationTest.nonexistentBareSpecifierGivesFriendlyError` — host-exception shape reverted to the pre-24.2.1 form; `PythonInteropExperimentTest.mycelium_runFile_jsPolyglotEvalPython_noLongerHardFailsOnFrozenBootstrap` — same underlying GraalPython bug now manifests as a host NullPointerException instead of an opaque HostException wrapper). All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. Nix's `flake.nix` uses nixpkgs' stock `graalvmPackages.graalvm-ce`, currently 25.0.2 — close enough to Maven's 25.0.0 that native-image worked without incident. Revisit once upstream publishes matching 25.1.x Ruby/LLVM Maven artifacts (or confirms they're being dropped for good — the `org.graalvm.polyglot:ruby`/`org.graalvm.ruby:ruby` distribution is marked deprecated upstream, "retained only for Maven compatibility").
+### Distribution form
+CLI exists (`mycelium run/version/help`) but is only invoked via `./gradlew :app:run --args="..."`. `native-image` produces a standalone binary but at ~887MB; `installDist` is ~709MB but needs a JRE. User wants a genuinely self-contained binary (not Nix-only) — neither current option is fully satisfying. Open question: is GraalVM's weight simply acceptable for end users, or is a lighter packaging path worth exploring?
+
+## User preferences (for future sessions)
+
+- "Simplest first, sweep everything, note blockers, don't get stuck" — the general working style for compatibility sweeps.
+- Node stdlib compatibility is CORE to the project, not a nice-to-have.
+- Must mirror Node semantics 1:1, not approximate them.
+- End goal is a self-contained binary, not a Nix-only distribution.
+- User fact-checks claims — verify before relaying anything as confirmed.
+- Prefers architecturally sound solutions over expedient ones (e.g. rejecting `js.commonjs-require` rather than papering over its incompatibility).

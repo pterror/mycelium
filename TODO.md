@@ -29,6 +29,25 @@ Mycelium's purpose: make every language's package ecosystem available to every o
 - Rust compilation needs `--crate-type=lib` or `rustc` fails with "main function not found".
 - Go→LLVM is not viable — stock Go does not emit LLVM bitcode via any single-command pipeline. Only Go→WASM via tinygo works (see Go section).
 
+## Bun/Deno Compatibility Strategy
+
+### Runtime Detection (per-package)
+Check lockfiles/config in order of broadest support — short circuit on first match:
+1. Node: `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` → present as Node
+2. Bun: `bun.lockb`, `bunfig.toml` → present as Bun
+3. Deno: `deno.lock`, `deno.json`/`deno.jsonc`, URL imports → present as Deno
+
+Detection order IS the priority order. Never check Bun/Deno signals before Node signals — a project with both `bunfig.toml` and `pnpm-lock.yaml` is Node, not Bun.
+
+### Runtime Identity
+- Present as exactly ONE runtime per package — never expose multiple runtime globals simultaneously
+- Cross-runtime packages (code that detects and supports multiple runtimes) always fall through to their Node path, which is the most tested
+- Bun/Deno APIs available as importable modules (`import ... from "bun"`, etc.) but runtime globals (`Bun`, `Deno`) only exposed when detected as that runtime
+- The Trojan horse is Node compat. The payload is polyglot.
+
+### Why Not "Be All Runtimes"
+If all runtime globals are defined simultaneously, a package with inconsistent detection order across files (checks Bun first in one file, Deno first in another) enters a mixed-codepath state that never exists on any real runtime and was never tested by the package author.
+
 ## npm compatibility status
 
 **Round 1 (5/5 pass, unpinned versions):** lodash, minimist, chalk, uuid, dotenv.

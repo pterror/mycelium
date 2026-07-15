@@ -7,7 +7,10 @@ dependencies {
     implementation(project(":library"))
 }
 
-application { mainClass = "org.mycelium.app.AppKt" }
+application {
+    mainClass = "org.mycelium.app.AppKt"
+    applicationName = "mycelium"
+}
 
 // Run via: ./gradlew :app:run --args="run path/to/file.mjs"
 // (the `application` plugin forwards --args to main(args) automatically)
@@ -19,6 +22,7 @@ graalvmNative {
     binaries {
         named("main") {
             mainClass.set("org.mycelium.app.AppKt")
+            imageName.set("mycelium")
             buildArgs.add("--initialize-at-build-time")
             buildArgs.add("-H:+ReportExceptionStackTraces")
             buildArgs.add("-J-Xmx8g")

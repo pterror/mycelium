@@ -913,6 +913,81 @@ class MyceliumIntegrationTest {
         assertEquals("hello from mycelium fs", result.asString())
     }
 
+    // fs's createWriteStream/createReadStream open their backing fd asynchronously (a
+    // microtask 'open' event, mirroring real Node), and every subsequent step —
+    // read/write chunks, 'finish'/'end'/'close' — is itself microtask-based too (see
+    // fs.mjs's `nextTick`), so this fully settles before `runFile` returns, same as the
+    // stream.mjs-only tests above.
+    @Test fun fsCreateWriteStreamAndReadStreamRoundTrip() {
+        val mc = vm
+        val tmpFile = java.nio.file.Files.createTempFile("mycelium-fs-stream-test-", ".txt").toFile()
+        tmpFile.delete()
+        tmpFile.deleteOnExit()
+
+        runJsWithImports(mc, """
+            import fs from 'fs';
+
+            const ws = fs.createWriteStream("${tmpFile.absolutePath}");
+            let opened = false;
+            let finished = false;
+            ws.on('open', () => { opened = true; });
+            ws.on('finish', () => { finished = true; });
+            ws.write('hello ');
+            ws.write('from ');
+            ws.end('write stream', () => {
+                const rs = fs.createReadStream("${tmpFile.absolutePath}");
+                const chunks = [];
+                let ended = false;
+                rs.on('data', (chunk) => chunks.push(chunk));
+                rs.on('end', () => { ended = true; });
+                globalThis.__fsStreamResult = () => {
+                    let s = '';
+                    for (const chunk of chunks) {
+                        for (let i = 0; i < chunk.length; i++) s += String.fromCharCode(chunk[i]);
+                    }
+                    return s;
+                };
+                globalThis.__fsStreamEnded = () => ended;
+            });
+            globalThis.__fsStreamOpened = () => opened;
+            globalThis.__fsStreamFinished = () => finished;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__fsStreamOpened()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__fsStreamFinished()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__fsStreamEnded()").asBoolean())
+        assertEquals(
+            "hello from write stream",
+            mc.eval("js", "globalThis.__fsStreamResult()").asString()
+        )
+    }
+
+    @Test fun fsOpenSyncReadWriteCloseFdApi() {
+        val mc = vm
+        val tmpFile = java.nio.file.Files.createTempFile("mycelium-fs-fd-test-", ".txt").toFile()
+        tmpFile.deleteOnExit()
+
+        runJsWithImports(mc, """
+            import fs from 'fs';
+
+            const fd = fs.openSync("${tmpFile.absolutePath}", 'w');
+            const data = 'fd based write';
+            fs.writeSync(fd, data);
+            fs.closeSync(fd);
+
+            const readFd = fs.openSync("${tmpFile.absolutePath}", 'r');
+            const buf = new Array(data.length).fill(0);
+            const n = fs.readSync(readFd, buf, 0, data.length, 0);
+            fs.closeSync(readFd);
+
+            let s = '';
+            for (let i = 0; i < n; i++) s += String.fromCharCode(buf[i]);
+            globalThis.__fsFdResult = s;
+            globalThis.__fsFdBytesRead = n;
+        """.trimIndent())
+        assertEquals("fd based write", mc.eval("js", "globalThis.__fsFdResult").asString())
+        assertEquals(14, mc.eval("js", "globalThis.__fsFdBytesRead").asInt())
+    }
+
     // --- Node stdlib `buffer` module ---
 
     @Test fun importBufferModule() {
@@ -1393,6 +1468,77 @@ class MyceliumIntegrationTest {
             "hello mycelium, this is a gzip round trip test",
             mc.eval("js", "globalThis.__zlibDeflateRoundTrip").asString()
         )
+    }
+
+    // GraalJS drains the microtask queue to completion before a top-level `context.eval`
+    // call returns (see importStreamModule's comment above), and every async step in
+    // zlib.mjs's streaming Transform classes and stream.mjs's Readable/Writable base
+    // classes is microtask-based (`Promise.resolve().then`) rather than a real timer or
+    // background thread — so the whole gzip.pipe(gunzip) chain, including the final
+    // 'end' event, has already settled by the time `runFile` returns below.
+    @Test fun zlibStreamingGzipGunzipRoundTrip() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import zlib from 'zlib';
+
+            const gzip = zlib.createGzip();
+            const gunzip = zlib.createGunzip();
+            const chunks = [];
+            let ended = false;
+            gunzip.on('data', (chunk) => chunks.push(chunk));
+            gunzip.on('end', () => { ended = true; });
+
+            gzip.pipe(gunzip);
+            gzip.write('hello ');
+            gzip.write('streaming ');
+            gzip.end('world, this is a longer message to span a couple of chunks');
+
+            globalThis.__zlibStreamResult = () => {
+                let s = '';
+                for (const chunk of chunks) {
+                    for (let i = 0; i < chunk.length; i++) s += String.fromCharCode(chunk[i]);
+                }
+                return s;
+            };
+            globalThis.__zlibStreamEnded = () => ended;
+        """.trimIndent())
+        assertEquals(
+            "hello streaming world, this is a longer message to span a couple of chunks",
+            mc.eval("js", "globalThis.__zlibStreamResult()").asString()
+        )
+        assertTrue(mc.eval("js", "globalThis.__zlibStreamEnded()").asBoolean())
+    }
+
+    @Test fun zlibStreamingDeflateInflateRoundTrip() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import zlib from 'zlib';
+
+            const deflate = zlib.createDeflate();
+            const inflate = zlib.createInflate();
+            const chunks = [];
+            let finished = false;
+            inflate.on('data', (chunk) => chunks.push(chunk));
+            inflate.on('end', () => { finished = true; });
+
+            deflate.pipe(inflate);
+            deflate.write('the quick brown fox ');
+            deflate.end('jumps over the lazy dog');
+
+            globalThis.__zlibDeflateStreamResult = () => {
+                let s = '';
+                for (const chunk of chunks) {
+                    for (let i = 0; i < chunk.length; i++) s += String.fromCharCode(chunk[i]);
+                }
+                return s;
+            };
+            globalThis.__zlibDeflateStreamFinished = () => finished;
+        """.trimIndent())
+        assertEquals(
+            "the quick brown fox jumps over the lazy dog",
+            mc.eval("js", "globalThis.__zlibDeflateStreamResult()").asString()
+        )
+        assertTrue(mc.eval("js", "globalThis.__zlibDeflateStreamFinished()").asBoolean())
     }
 
     // --- Node stdlib `http` module ---

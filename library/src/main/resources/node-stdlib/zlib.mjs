@@ -174,8 +174,13 @@ class DeflateBase extends Transform {
             const input = toJByteArray(chunk);
             this._deflater.setInput(input);
             const buf = new JByteArray(16384);
+            // Force a sync flush per chunk (rather than the default `deflate(buf)`,
+            // which lets the deflater buffer internally for better compression and may
+            // emit nothing at all until `finish()`), so the stream is genuinely
+            // incremental — each `_transform` call produces output for the bytes it
+            // was just given rather than deferring everything to `_flush`.
             while (!this._deflater.needsInput()) {
-                const n = this._deflater.deflate(buf);
+                const n = this._deflater.deflate(buf, 0, buf.length, JDeflater.SYNC_FLUSH);
                 if (n > 0) this.push(fromJByteArray(buf, n));
                 else break;
             }

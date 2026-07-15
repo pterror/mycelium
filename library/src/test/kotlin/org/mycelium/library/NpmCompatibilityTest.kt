@@ -83,23 +83,31 @@ import java.net.URI
 //     didn't recurse into arrays, silently failing resolution and falling back to a literal
 //     on-disk path check against a directory (`EISDIR`-shaped "Is a directory"). Array
 //     fallback resolution is now implemented (`resolveConditions` tries each array element
-//     in order — see yargsFailsOnMissingNodeModuleCore) and the escalade gap is fixed, but
-//     yargs still doesn't run end-to-end: its platform shim also does `import { builtinModules
-//     } from 'node:module'`, and `module` isn't among Mycelium's core modules at all.
+//     in order) and the escalade gap is fixed; its platform shim also does `import {
+//     builtinModules } from 'node:module'`, and `module` is now a registered core module
+//     too — yargs now WORKS end-to-end (see yargsParsesArgv).
 //   - glob (v11): originally FAILED with "unknown core module 'node:fs/promises'" — fixed by
 //     registering a real `fs-promises.mjs` core module. Now progresses further but still
 //     fails: minimatch/path-scurry construct `new URL(...)` at module scope, and `URL` isn't
 //     exposed as a global in Mycelium's guest environment (only importable via the `url`
-//     core module) — see globFailsOnMissingUrlGlobal.
+//     core module) — see globFailsOnMissingUrlGlobal. Still fails the same way after adding
+//     `module`/readline/worker_threads/etc — this is an unrelated, still-open gap.
 //   - pino: originally FAILED with "unknown core module 'node:diagnostics_channel'" — fixed
-//     by registering a real `diagnostics_channel.mjs` core module. Now progresses further
-//     but still fails on a *different* missing core module: `require('worker_threads')`
-//     (pino's thread-transport machinery) — see pinoFailsOnMissingWorkerThreadsModule.
+//     by registering a real `diagnostics_channel.mjs` core module, then progressed to a
+//     missing `worker_threads` core module (pino's thread-transport machinery). Now that
+//     `worker_threads` is registered too, it progresses further still but fails on a
+//     *different* gap: `node-stdlib/buffer.mjs` doesn't export a `constants` object at all,
+//     so thread-stream's `buffer.constants.MAX_STRING_LENGTH` read throws "Cannot read
+//     property 'MAX_STRING_LENGTH' of undefined" — see
+//     pinoFailsOnMissingBufferConstants.
 //   - inquirer: originally FAILED with "unknown core module 'node:async_hooks'" — fixed by
-//     registering a real `async_hooks.mjs` core module (with a genuinely-working, if
-//     synchronous-only, `AsyncLocalStorage`). Now progresses further but still fails on a
-//     different missing core module: `node:readline` — see
-//     inquirerFailsOnMissingReadlineModule.
+//     registering a real `async_hooks.mjs` core module, then progressed to a missing
+//     `node:readline` core module. Now that `readline` is registered too, it progresses
+//     past both and fails on an unrelated CJS/ESM interop gap instead: `chardet` is CJS and
+//     its named export `detect` is used via `import { detect } from 'chardet'` in
+//     `@inquirer/external-editor`'s ESM entry point, and Mycelium's CJS-to-ESM named-export
+//     inference doesn't pick it up ("The requested module 'chardet' does not provide an
+//     export named 'detect'") — see inquirerFailsOnChardetNamedExportInterop.
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -571,36 +579,26 @@ class NpmCompatibilityTest {
     //
     // `resolveConditions` now recurses into arrays (trying each element in declaration
     // order, recursing into objects/nested-arrays, per Node's own array-fallback
-    // semantics), which fixes the escalade resolution — but yargs still doesn't run
-    // end-to-end: the same platform shim also does `import { builtinModules } from
-    // 'node:module'`, and `module` isn't among Mycelium's core modules at all yet. Open
-    // gap, not part of this sweep. ---
+    // semantics), which fixes the escalade resolution. The same platform shim also does
+    // `import { builtinModules } from 'node:module'` — `module` is now a registered core
+    // module too, so yargs now WORKS end-to-end. ---
 
-    @Test fun yargsFailsOnMissingNodeModuleCore() {
+    @Test fun yargsParsesArgv() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-yargs-")
         npmInstall(dir, "yargs")
 
-        val ex = assertThrows(PolyglotException::class.java) {
-            writeAndRun(
-                dir,
-                """
-                import yargs from 'yargs';
-                import { hideBin } from 'yargs/helpers';
-                const argv = yargs(hideBin(['node', 'test', '--name', 'mycelium'])).argv;
-                globalThis.__yargsName = argv.name;
-                """.trimIndent()
-            )
-        }
-        assertFalse(
-            ex.message!!.contains("Is a directory"),
-            "escalade's array-exports fallback should now resolve — unexpected error: ${ex.message}"
+        val mc = writeAndRun(
+            dir,
+            """
+            import yargs from 'yargs';
+            import { hideBin } from 'yargs/helpers';
+            const argv = yargs(hideBin(['node', 'test', '--name', 'mycelium'])).argv;
+            globalThis.__yargsName = argv.name;
+            """.trimIndent()
         )
-        assertTrue(
-            ex.message!!.contains("node:module"),
-            "unexpected error: ${ex.message}"
-        )
+        assertEquals("mycelium", mc.eval("js", "globalThis.__yargsName").asString())
     }
 
     // --- 16. glob — file matching, uses path/fs. Originally FAILED: glob v11's
@@ -616,7 +614,12 @@ class NpmCompatibilityTest {
     // shape) — but glob still doesn't run end-to-end: minimatch/path-scurry construct `new
     // URL(...)` at module scope, and `URL` isn't exposed as a global in Mycelium's guest
     // environment (only importable via the `url` core module, per the project's TODO —
-    // "GraalJS ships no URL/URLSearchParams globals"). Open gap, not part of this sweep. ---
+    // "GraalJS ships no URL/URLSearchParams globals"). Open gap, not part of this sweep.
+    //
+    // Re-tested after registering readline/readline-promises/worker_threads/module/
+    // http.Agent/fs-promises-alias/util.stripVTControlCharacters/diagnostics_channel/
+    // async_hooks/array-conditional-exports: unchanged — still the exact same "URL is not
+    // defined" error, since none of those additions touch the missing-global-URL gap. ---
 
     @Test fun globFailsOnMissingUrlGlobal() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
@@ -655,11 +658,18 @@ class NpmCompatibilityTest {
     // (node-stdlib/diagnostics_channel.mjs — a genuinely-working pub/sub implementation,
     // not just a stub: `channel`/`subscribe`/`publish`/`hasSubscribers`/`tracingChannel`
     // all function, just with no built-in engine-instrumented channels firing
-    // automatically) — but pino still doesn't run end-to-end: its thread-transport
-    // machinery does `require('worker_threads')`, which isn't registered as a core module
-    // either. Open gap, not part of this sweep. ---
+    // automatically), which unblocked loading but exposed a second gap: pino's
+    // thread-transport machinery does `require('worker_threads')`, which wasn't registered
+    // as a core module either.
+    //
+    // `worker_threads` is now a registered core module too — but pino still doesn't run
+    // end-to-end: thread-stream (pino's worker-thread transport helper) does `const buffer
+    // = require('buffer'); ... buffer.constants.MAX_STRING_LENGTH`, and
+    // node-stdlib/buffer.mjs doesn't export a `constants` object at all (only the `Buffer`
+    // class), so the read throws "Cannot read property 'MAX_STRING_LENGTH' of undefined".
+    // Open gap, not part of this sweep. ---
 
-    @Test fun pinoFailsOnMissingWorkerThreadsModule() {
+    @Test fun pinoFailsOnMissingBufferConstants() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-pino-")
@@ -680,8 +690,12 @@ class NpmCompatibilityTest {
             ex.message!!.contains("diagnostics_channel"),
             "diagnostics_channel should now resolve — unexpected error: ${ex.message}"
         )
-        assertTrue(
+        assertFalse(
             ex.message!!.contains("worker_threads"),
+            "worker_threads should now resolve — unexpected error: ${ex.message}"
+        )
+        assertTrue(
+            ex.message!!.contains("MAX_STRING_LENGTH"),
             "unexpected error: ${ex.message}"
         )
     }
@@ -740,13 +754,20 @@ class NpmCompatibilityTest {
     // async_hooks.mjs — `AsyncLocalStorage` genuinely threads a "current store" through
     // synchronous `run()`/`getStore()`/`enterWith()` calls via a push/pop stack;
     // `createHook`/`executionAsyncId`/`triggerAsyncId`/`AsyncResource` are present as inert
-    // stubs since GraalJS has no underlying async-resource hooks to wire real tracking to)
-    // — but inquirer still doesn't run end-to-end: it also needs `node:readline`, which
-    // isn't registered as a core module either. Open gap, not part of this sweep. Only
-    // checks that importing the module fails at load time — no interactive prompt is
-    // attempted. ---
+    // stubs since GraalJS has no underlying async-resource hooks to wire real tracking to),
+    // which unblocked loading but exposed a second gap: inquirer also needs
+    // `node:readline`, which wasn't registered as a core module either.
+    //
+    // `readline`/`node:readline` (plus `readline/promises`) are now registered core modules
+    // too — but inquirer still doesn't run end-to-end, on a gap unrelated to any missing
+    // core module: `@inquirer/external-editor`'s ESM entry does `import { detect } from
+    // 'chardet'`, chardet is CJS (`module.exports = ChardetCls; ChardetCls.detect = ...`),
+    // and Mycelium's CJS-to-ESM named-export inference doesn't surface `detect` as a named
+    // export of the synthesized ESM wrapper — "The requested module 'chardet' does not
+    // provide an export named 'detect'". Open gap, not part of this sweep. Only checks that
+    // importing the module fails at load time — no interactive prompt is attempted. ---
 
-    @Test fun inquirerFailsOnMissingReadlineModule() {
+    @Test fun inquirerFailsOnChardetNamedExportInterop() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-inquirer-")
@@ -765,8 +786,12 @@ class NpmCompatibilityTest {
             ex.message!!.contains("async_hooks"),
             "async_hooks should now resolve — unexpected error: ${ex.message}"
         )
-        assertTrue(
+        assertFalse(
             ex.message!!.contains("node:readline"),
+            "readline should now resolve — unexpected error: ${ex.message}"
+        )
+        assertTrue(
+            ex.message!!.contains("chardet") && ex.message!!.contains("detect"),
             "unexpected error: ${ex.message}"
         )
     }

@@ -810,4 +810,108 @@ class MyceliumIntegrationTest {
         val result = mc.eval("js", "globalThis.__fsResult")
         assertEquals("hello from mycelium fs", result.asString())
     }
+
+    // --- Python site-packages / Ruby gem bare-specifier resolution ---
+    //
+    // resolvePythonPackage/resolveRubyGem both accept an explicit `searchPaths` override
+    // (defaulting to the real python3/ruby-subprocess-derived paths), which lets the
+    // matching logic itself be tested against a fake site-packages/gem directory layout
+    // without needing a real Python or Ruby installation. The default-parameter behavior
+    // (i.e. the subprocess discovery mechanism) is covered separately below, gated with
+    // assumeTrue exactly like jsImportsRust's rustc check, since python3/ruby aren't
+    // provisioned by flake.nix.
+
+    @Test fun resolvePythonPackageFindsPackageWithInitPy() {
+        val siteDir = java.nio.file.Files.createTempDirectory("mycelium-site-").toFile()
+        siteDir.deleteOnExit()
+        val pkgDir = File(siteDir, "fakepkg")
+        pkgDir.mkdirs()
+        pkgDir.deleteOnExit()
+        val initPy = File(pkgDir, "__init__.py")
+        initPy.writeText("value = 42")
+        initPy.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        val resolved = fs.resolvePythonPackage("fakepkg", listOf(siteDir.toPath()))
+        assertEquals(initPy.absoluteFile.toPath(), resolved)
+    }
+
+    @Test fun resolvePythonPackageFindsPlainModuleFile() {
+        val siteDir = java.nio.file.Files.createTempDirectory("mycelium-site-").toFile()
+        siteDir.deleteOnExit()
+        val moduleFile = File(siteDir, "fakemodule.py")
+        moduleFile.writeText("value = 1")
+        moduleFile.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        val resolved = fs.resolvePythonPackage("fakemodule", listOf(siteDir.toPath()))
+        assertEquals(moduleFile.absoluteFile.toPath(), resolved)
+    }
+
+    @Test fun resolvePythonPackageReturnsNullWhenNotFound() {
+        val siteDir = java.nio.file.Files.createTempDirectory("mycelium-site-").toFile()
+        siteDir.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        assertNull(fs.resolvePythonPackage("does-not-exist", listOf(siteDir.toPath())))
+    }
+
+    @Test fun resolveRubyGemFindsDirectFile() {
+        val loadDir = java.nio.file.Files.createTempDirectory("mycelium-loadpath-").toFile()
+        loadDir.deleteOnExit()
+        val gemFile = File(loadDir, "fakegem.rb")
+        gemFile.writeText("FAKEGEM_VALUE = 1")
+        gemFile.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        val resolved = fs.resolveRubyGem("fakegem", listOf(loadDir.toPath()))
+        assertEquals(gemFile.absoluteFile.toPath(), resolved)
+    }
+
+    @Test fun resolveRubyGemFindsNestedGemLayout() {
+        val loadDir = java.nio.file.Files.createTempDirectory("mycelium-loadpath-").toFile()
+        loadDir.deleteOnExit()
+        val gemSubDir = File(loadDir, "nestedgem")
+        gemSubDir.mkdirs()
+        gemSubDir.deleteOnExit()
+        val gemFile = File(gemSubDir, "nestedgem.rb")
+        gemFile.writeText("NESTEDGEM_VALUE = 1")
+        gemFile.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        val resolved = fs.resolveRubyGem("nestedgem", listOf(loadDir.toPath()))
+        assertEquals(gemFile.absoluteFile.toPath(), resolved)
+    }
+
+    @Test fun resolveRubyGemReturnsNullWhenNotFound() {
+        val loadDir = java.nio.file.Files.createTempDirectory("mycelium-loadpath-").toFile()
+        loadDir.deleteOnExit()
+
+        val fs = InterceptingFileSystem()
+        assertNull(fs.resolveRubyGem("does-not-exist", listOf(loadDir.toPath())))
+    }
+
+    // Real python3/ruby-subprocess-dependent: verifies the "run once at startup, cache the
+    // result" discovery mechanism itself actually produces a usable, non-empty list of
+    // real directories on a machine where the respective runtime is installed. Skipped
+    // (not failed) wherever the runtime isn't on PATH — python3/ruby aren't provisioned by
+    // flake.nix (only GraalVM, clang, and rustc are), mirroring jsImportsRust's
+    // assumeTrue-gated skip for rustc.
+    @Test fun pythonSearchPathDiscoveryFindsRealDirectoriesWhenAvailable() {
+        assumeTrue(isCommandAvailable("python3"), "python3 not available in PATH — skipping Python resolution test")
+
+        val fs = InterceptingFileSystem()
+        val paths = fs.computePythonSearchPaths()
+        assertTrue(paths.isNotEmpty(), "expected python3's sys.path to yield at least one real directory")
+        assertTrue(paths.all { java.nio.file.Files.isDirectory(it) })
+    }
+
+    @Test fun rubySearchPathDiscoveryFindsRealDirectoriesWhenAvailable() {
+        assumeTrue(isCommandAvailable("ruby"), "ruby not available in PATH — skipping Ruby resolution test")
+
+        val fs = InterceptingFileSystem()
+        val paths = fs.computeRubySearchPaths()
+        assertTrue(paths.isNotEmpty(), "expected ruby's \$LOAD_PATH to yield at least one real directory")
+        assertTrue(paths.all { java.nio.file.Files.isDirectory(it) })
+    }
 }

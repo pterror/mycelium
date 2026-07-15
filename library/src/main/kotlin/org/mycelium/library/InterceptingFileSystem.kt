@@ -86,6 +86,22 @@ class InterceptingFileSystem : FileSystem {
         if (isBareSpecifier(path)) {
             coreModules[path]?.let { return syntheticCoreModulePath(it) }
             val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
+            val hostLang = detectHostLanguageFromCallStack()
+
+            // "Try all, ordered by host language": a bare specifier encountered while the
+            // guest call stack is inside Ruby or Python is checked against that language's
+            // own package ecosystem (gems / site-packages) first, since that's by far the
+            // most likely match and doesn't require walking a node_modules tree that will
+            // never exist for it. Node's own resolution (below) is still attempted
+            // afterwards for every host language — a Ruby file might, e.g., import a
+            // cross-language JS package — and whichever of gem/site-packages resolution
+            // wasn't already tried up front is attempted last, as a final fallback.
+            if (hostLang?.languageId == "ruby") {
+                resolveRubyGem(path)?.let { return it }
+            } else if (hostLang?.languageId == "python") {
+                resolvePythonPackage(path)?.let { return it }
+            }
+
             when (val resolution = resolveNodeModule(path, fromDir)) {
                 is NodeModuleResolution.Found -> return resolution.path
                 is NodeModuleResolution.PackageNotFound -> {
@@ -104,8 +120,30 @@ class InterceptingFileSystem : FileSystem {
                 }
                 NodeModuleResolution.NoNodeModulesTree -> {}
             }
+
+            if (hostLang?.languageId != "ruby") {
+                resolveRubyGem(path)?.let { return it }
+            }
+            if (hostLang?.languageId != "python") {
+                resolvePythonPackage(path)?.let { return it }
+            }
         }
         return Path.of(path)
+    }
+
+    // Inspects the current Truffle call stack the same way newByteChannel does for
+    // cross-language shim generation, to figure out which guest language is asking for a
+    // bare specifier to be resolved. Returns null (rather than defaulting to JS) when no
+    // language can be identified from the stack, e.g. resolution triggered outside of any
+    // guest call (there is then nothing more specific to prefer over plain npm lookup).
+    private fun detectHostLanguageFromCallStack(): LanguageSupport? {
+        val mc = mycelium ?: return null
+        val frames = mutableListOf<String>()
+        Truffle.getRuntime().iterateFrames { frame ->
+            frames.add("${frame.callTarget}")
+            null
+        }
+        return mc.detectHostLanguage(frames)
     }
 
     // A "bare specifier" is a package import like `express` or `@scope/pkg`, as opposed to
@@ -165,6 +203,85 @@ class InterceptingFileSystem : FileSystem {
             dir = dir.parent
         }
         return if (sawNodeModulesTree) NodeModuleResolution.PackageNotFound else NodeModuleResolution.NoNodeModulesTree
+    }
+
+    // Python's `sys.path` (site-packages directories plus the stdlib's own library dirs),
+    // discovered once by shelling out to `python3` and cached for the process's lifetime —
+    // mirrors the "run once at startup" approach the task called for, just done lazily
+    // (on first bare-specifier resolution that needs it) rather than eagerly at
+    // InterceptingFileSystem construction, so paying the subprocess cost is skipped
+    // entirely for JS-only or Ruby-only projects that never touch Python. Falls back to
+    // an empty list (rather than throwing) when python3 isn't on PATH, so Python package
+    // resolution just always misses in that case instead of breaking every other import.
+    private val pythonSitePackages: List<Path> by lazy { computePythonSearchPaths() }
+
+    internal fun computePythonSearchPaths(): List<Path> =
+        try {
+            val process = ProcessBuilder(
+                "python3", "-c", "import sys; print('\\n'.join(sys.path))"
+            ).redirectErrorStream(false).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor()
+            output.lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .map { Path.of(it) }
+                .filter { Files.isDirectory(it) }
+                .toList()
+        } catch (e: java.io.IOException) {
+            emptyList()
+        }
+
+    // Resolves a bare specifier (e.g. "numpy" or "pkg/submodule") against Python's search
+    // path: a package directory with an `__init__.py`, or a plain `<specifier>.py` module
+    // file. `searchPaths` defaults to the real, subprocess-derived `sys.path` but can be
+    // overridden by tests to point at a fake site-packages layout without needing a real
+    // Python installation.
+    internal fun resolvePythonPackage(specifier: String, searchPaths: List<Path> = pythonSitePackages): Path? {
+        for (dir in searchPaths) {
+            val initPy = dir.resolve(specifier).resolve("__init__.py")
+            if (Files.isRegularFile(initPy)) return initPy
+            val moduleFile = dir.resolve("$specifier.py")
+            if (Files.isRegularFile(moduleFile)) return moduleFile
+        }
+        return null
+    }
+
+    // Ruby's `$LOAD_PATH` (covers both installed gems' `lib/` directories and the
+    // interpreter's own stdlib), discovered once by shelling out to `ruby` and cached —
+    // same lazy-on-first-use, empty-list-on-missing-binary approach as
+    // pythonSitePackages/computePythonSearchPaths above.
+    private val rubyLoadPaths: List<Path> by lazy { computeRubySearchPaths() }
+
+    internal fun computeRubySearchPaths(): List<Path> =
+        try {
+            val process = ProcessBuilder("ruby", "-e", "puts \$LOAD_PATH")
+                .redirectErrorStream(false).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor()
+            output.lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .map { Path.of(it) }
+                .filter { Files.isDirectory(it) }
+                .toList()
+        } catch (e: java.io.IOException) {
+            emptyList()
+        }
+
+    // Resolves a bare specifier against Ruby's load path: either `<specifier>.rb` directly
+    // in a load-path directory, or the conventional `<specifier>/<specifier>.rb` layout
+    // gems use for their main entry file. `searchPaths` defaults to the real,
+    // subprocess-derived `$LOAD_PATH` but can be overridden by tests to point at a fake
+    // gem directory layout without needing a real Ruby installation.
+    internal fun resolveRubyGem(specifier: String, searchPaths: List<Path> = rubyLoadPaths): Path? {
+        for (dir in searchPaths) {
+            val direct = dir.resolve("$specifier.rb")
+            if (Files.isRegularFile(direct)) return direct
+            val nested = dir.resolve(specifier).resolve("$specifier.rb")
+            if (Files.isRegularFile(nested)) return nested
+        }
+        return null
     }
 
     // `--yolo` support: when a bare specifier can't be found in any node_modules tree,

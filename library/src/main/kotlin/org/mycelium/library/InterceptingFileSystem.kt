@@ -602,6 +602,8 @@ class InterceptingFileSystem : FileSystem {
         "node:timers" to "timers.mjs",
         "timers/promises" to "timers-promises.mjs",
         "node:timers/promises" to "timers-promises.mjs",
+        "perf_hooks" to "perf_hooks.mjs",
+        "node:perf_hooks" to "perf_hooks.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =
@@ -652,6 +654,18 @@ class InterceptingFileSystem : FileSystem {
     fun requireModule(specifier: String, fromDirStr: String): org.graalvm.polyglot.Value {
         val fromDir = Path.of(fromDirStr)
         val resolved = resolveRequireTarget(specifier, fromDir)
+        // Mycelium has no real N-API/native-addon loader (no dlopen, no Node-API host
+        // bridge) — a `.node` file can never actually be `require()`d, whether or not it
+        // exists on disk. Reporting it the same way Node reports a genuinely-missing
+        // module (MODULE_NOT_FOUND, rather than e.g. attempting to read the binary as JS
+        // source and letting GraalJS's parser choke on it with a `.code`-less SyntaxError)
+        // is what lets packages with a graceful "no prebuilt binary for this platform"
+        // fallback path — like sharp's own `errors.push(err)`-per-candidate loop in
+        // dist/sharp.mjs — actually take it instead of crashing on a missing `.code`. See
+        // throwModuleNotFound and NpmCompatibilityTest.sharpFailsGracefullyWithNodeShapedError.
+        if (!resolved.startsWith(CORE_MODULE_PREFIX) && resolved.extension == "node") {
+            throwModuleNotFound(specifier, fromDir)
+        }
         val cacheKey = resolved.toString()
 
         cjsModuleCache[cacheKey]?.let { return it.getMember("exports") }
@@ -900,7 +914,17 @@ class InterceptingFileSystem : FileSystem {
             // choked on with an unqualified, guest-stack-free "Is a directory" IOException
             // (see engine.io, a socket.io transitive dependency, in NpmCompatibilityTest).
             if (Files.isRegularFile(candidate)) return candidate
-            return resolveExtensionlessPath(candidate)
+            val resolved = resolveExtensionlessPath(candidate)
+            // resolveExtensionlessPath hands back `candidate` itself, unresolved, when none
+            // of the probed variants exist — surface Node's usual "cannot find module"
+            // error here (with a real `.code`, see throwModuleNotFound) rather than letting
+            // the caller's `Path.readText()` blow up with a raw, unqualified
+            // FileSystemException that has no `.code` for guest code to inspect (e.g.
+            // sharp's native-binding loader probes several `require("../src/build/Release/
+            // sharp-*.node")`-shaped relative paths that are never actually shipped in the
+            // npm package, expecting a Node-shaped MODULE_NOT_FOUND it can catch).
+            if (!Files.isRegularFile(resolved)) throwModuleNotFound(specifier, fromDir)
+            return resolved
         }
         coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
         // preferRequire = true: this is a CJS require() target, so a dual-mode package's
@@ -909,10 +933,36 @@ class InterceptingFileSystem : FileSystem {
         return when (val resolution = resolveNodeModule(specifier, fromDir, preferRequire = true)) {
             is NodeModuleResolution.Found -> resolution.path
             is NodeModuleResolution.PackageNotFound, NodeModuleResolution.NoNodeModulesTree ->
-                throw MyceliumException(
-                    "mycelium: cannot find module '$specifier' required from '$fromDir'"
-                )
+                throwModuleNotFound(specifier, fromDir)
         }
+    }
+
+    // Throws a genuine, guest-catchable JS `Error` shaped like Node's own require()
+    // failure — `code: "MODULE_NOT_FOUND"` and a "Cannot find module '...'" message —
+    // rather than letting a Kotlin `MyceliumException` (or a raw filesystem exception)
+    // cross the polyglot boundary as an opaque host exception. GraalJS surfaces an
+    // uncaught Kotlin/Java exception thrown from a `ProxyExecutable` (the `require()` shim
+    // — see Mycelium.requireFn) to guest `catch` blocks as a value with no `.code`
+    // property at all, which is exactly what used to make sharp's own error-formatting
+    // loop (`err.code.endsWith("MODULE_NOT_FOUND")`) crash with a `TypeError: Cannot read
+    // property 'endsWith' of undefined` instead of reporting its own "no native binding
+    // found" message — see NpmCompatibilityTest.sharpFailsGracefullyWithNodeShapedError. Building the `Error` via
+    // `context.eval` and handing it to `Value.throwException()` (rather than just
+    // `throw MyceliumException(...)`) is what makes it arrive in guest code as a real,
+    // `instanceof Error` object with a working `.code`.
+    private fun throwModuleNotFound(specifier: String, fromDir: Path): Nothing {
+        val errorValue = context!!.eval(
+            "js",
+            "(function (message, code) {\n" +
+                "    var e = new Error(message);\n" +
+                "    e.code = code;\n" +
+                "    return e;\n" +
+                "})"
+        ).execute(
+            "Cannot find module '$specifier'\nRequire stack:\n- $fromDir",
+            "MODULE_NOT_FOUND"
+        )
+        throw errorValue.throwException()
     }
 
     // Whether `content`'s top level actually uses ESM `import`/`export` syntax, regardless

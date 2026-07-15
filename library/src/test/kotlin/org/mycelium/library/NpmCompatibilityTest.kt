@@ -120,19 +120,41 @@ import java.net.URI
 //     counterpart) exist, inquirer WORKS end-to-end — see inquirerLoadsWithNamedCjsExports.
 //
 // Fourth round — heavier, more complex real-world packages (fastify, jsonwebtoken, bcryptjs,
-// moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — now 8/10 pass; `fastify` and
-// `sharp` remain `@Disabled`, each on its own distinct gap unrelated to the ones fixed
-// below (see their own entries further down):
+// moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — 9/10 fully WORK end-to-end;
+// `sharp` is the one exception, and by design rather than an outstanding gap — it needs a
+// real native N-API/dlopen addon loader (out of scope for this round; see its own entry
+// further down), so its test instead asserts that it now fails *gracefully*, the same way
+// real Node would report "no prebuilt binary for this platform," rather than crashing on a
+// Mycelium implementation bug on the way to that diagnosis:
 //
 //   - bcryptjs (password hashing, pure JS): WORKS. No native bindings involved (that's the
 //     real `bcrypt` package, not tested here) — hashSync/compareSync round-trip cleanly.
 //   - moment (legacy date library, pure JS): WORKS. No core-module or exports-resolution
 //     surface at all — same "just works" shape as lodash/semver/zod.
 //   - yaml (pure JS YAML parser): WORKS. Same shape as moment/bcryptjs.
-//   - fastify (HTTP framework): FAILS. `node_modules/fastify/lib` does
-//     `require('node:dns')` at module scope — `dns` is not among Mycelium's synthetic core
-//     modules (it's listed under "Missing Node stdlib modules" in TODO.md, alongside `net`,
-//     `worker_threads`/`readline`/`module` — the latter three since fixed in round 3).
+//   - fastify (HTTP framework): WORKS as of this round. Was FAILing on `require('node:dns')`
+//     (now a registered core module — see dns.mjs), which unblocked a GraalJS parser gap in
+//     transitive dependency toad-cache's `.mjs` build (a class declaration immediately
+//     followed by `export{...}` with no separating token, `}export{` — valid per the
+//     ECMAScript grammar but rejected by GraalJS's parser) — resolved not by working around
+//     the parser but by `preferRequire`-aware `exports` condition resolution (see mongoose's
+//     entry below) correctly routing fastify's `require('toad-cache')` to toad-cache's own
+//     CJS build (`dist/toad-cache.cjs`, declared under its `exports["."].require` condition)
+//     instead of the ESM one the parser chokes on. That surfaced three further gaps, now all
+//     fixed: `node:perf_hooks` (used for `performance.now()` timing in fastify's logger
+//     factory) registered as a core module; `http.Server` gained a `setTimeout()` method
+//     (fastify's `getServerInstance` unconditionally calls `server.setTimeout(...)` while
+//     building the server) and now emits a `"listening"` event on `listen()` regardless of
+//     whether a callback was passed (previously only invoked an explicit callback, so
+//     fastify's own `server.once("listening", ...)`-based promise — used whenever `listen()`
+//     is called with no callback of its own, which is how `await app.listen(...)` works —
+//     never resolved); and `globalThis.queueMicrotask` (missing entirely) — avvio, fastify's
+//     plugin-loading/boot library, calls the bare global `queueMicrotask(...)` with no
+//     feature-detection guard from deep inside its plugin-queue-draining logic, so the
+//     resulting bare `TypeError: queueMicrotask is not a function` (thrown from a callback
+//     with no surrounding `try`/`catch` on the stack) silently aborted the plugin boot
+//     sequence partway through, leaving `app.listen()`'s returned promise forever pending
+//     instead of ever resolving *or* rejecting.
 //   - jsonwebtoken (JWT sign/verify, uses crypto): FAILS. `sign.js` does
 //     `secretOrPrivateKey instanceof KeyObject` where `KeyObject` comes from
 //     `require('crypto')`. Mycelium's `node-stdlib/crypto.mjs` *has* a working internal
@@ -184,13 +206,11 @@ import java.net.URI
 //     as a core module but has no `util/types` (or `node:util/types`) module of its own;
 //     real Node's `util/types` exposes `isDate`/`isRegExp`/`isProxy`/etc. type-tag checks
 //     pg's binary-protocol type coercion relies on.
-//   - sharp (native image-processing addon): FAILS — but not on the native binding, which
-//     was the expected failure mode going in. `dist/utility.mjs` does `import {
-//     availableParallelism } from 'node:os'` at module scope; `node-stdlib/os.mjs` is
-//     registered but doesn't export `availableParallelism` (Node 19+), so ES module linking
-//     rejects the whole graph before any native-addon loading is ever attempted:
-//     `SyntaxError: The requested module 'node:os' does not provide an export named
-//     'availableParallelism'`.
+//   - sharp (native image-processing addon): FAILS on the native binding, which is the
+//     expected failure mode (Mycelium has no real N-API/dlopen addon loading) — but see the
+//     class doc above and the test's own doc comment further down for why it was FAILing in
+//     the *wrong* way (a `.code`-less require() error crashing sharp's own graceful
+//     "no binary for this platform" diagnosis) before this round, and now fails gracefully.
 //   - esbuild (build tool, spawns a native `esbuild` binary via child_process): FAILS.
 //     `lib/main.js`'s `downloadedBinPath` calls `require.resolve(...)` to locate the
 //     platform-specific binary package — Mycelium's CJS shim provides a `require()`
@@ -931,13 +951,6 @@ class NpmCompatibilityTest {
     // cataloged as a new, distinct gap. ---
 
     @Test
-    @Disabled(
-        "FAILS (new blocker, dns gap now fixed): com.oracle.truffle.host.HostException: " +
-            "SyntaxError: node_modules/toad-cache/dist/toad-cache.mjs:849:1 Expected an " +
-            "operand but found export — GraalJS's parser rejects a class declaration " +
-            "immediately followed by `export{...}` with no separating token/newline " +
-            "(`}export{`), even though that's valid per the ECMAScript grammar."
-    )
     fun fastifyListensAndCloses() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
@@ -1082,39 +1095,88 @@ class NpmCompatibilityTest {
     }
 
     // --- 29. sharp — native image-processing addon. `node:os` now exports
-    // `availableParallelism`, which was the originally cataloged blocker — but the package
-    // now progresses past module-link time into its native-binding loader, which FAILS as
-    // expected going in (Mycelium has no real native N-API addon loading): every
-    // `require("@img/sharp-*")` candidate throws, but the error objects those `require()`
-    // calls throw don't carry a `.code` property the way Node's real MODULE_NOT_FOUND errors
-    // do, so sharp's own error-formatting loop (`err.code.endsWith("MODULE_NOT_FOUND")`)
-    // throws on the missing `.code` before it can report "no native binding found". Not
-    // fixed this round — cataloged as a new, distinct gap (native addon loading is out of
-    // scope for a synthetic-core-module fix). ---
+    // `availableParallelism`, which was the originally cataloged blocker — the package then
+    // progressed past module-link time into its native-binding loader, which was expected
+    // to fail going in (Mycelium has no real native N-API/dlopen addon loading and never
+    // will for this round) — but it was failing in the *wrong* way: `dist/sharp.mjs` tries
+    // every platform-specific `require("@img/sharp-*")`/`require("../src/build/Release/
+    // sharp-*.node")` candidate in turn, catching each failure into an `errors` array, and
+    // once every candidate is exhausted it builds a friendly "Could not load the sharp
+    // module" diagnostic — but only after checking `err.code.endsWith("MODULE_NOT_FOUND")`
+    // on each caught error first, to decide whether to also append that error's own
+    // message to the diagnostic. Two bugs conspired to crash that check instead of ever
+    // reaching the diagnostic:
+    //
+    //   1. `InterceptingFileSystem.requireModule`'s "cannot find module" / relative-path
+    //      failures threw a Kotlin `MyceliumException`, which crosses the polyglot
+    //      boundary into guest `catch` blocks as an opaque host-exception value with no
+    //      `.code` property at all (unlike a real Node `Error`) — so `err.code.endsWith`
+    //      itself threw `TypeError: Cannot read property 'endsWith' of undefined`.
+    //      `resolveRequireTarget`'s "cannot find module" paths (both the bare-specifier
+    //      `NodeModuleResolution.PackageNotFound`/`NoNodeModulesTree` case and, new this
+    //      round, a relative/absolute specifier that doesn't resolve to any real file —
+    //      previously left for the caller's raw `Path.readText()` to blow up on with an
+    //      even less guest-friendly `FileSystemException`) now go through the new
+    //      `throwModuleNotFound` helper, which builds a genuine JS `Error` via
+    //      `context.eval` — `code: "MODULE_NOT_FOUND"`, matching real Node — and hands it
+    //      to `Value.throwException()` so it arrives in guest code as a real,
+    //      `instanceof Error` object with a working `.code`.
+    //   2. Even with that fixed, the *first* few candidates sharp tries are `.node`
+    //      files that really do exist on disk (npm installs the real platform-matching
+    //      `@img/sharp-linux-x64` prebuilt binary as an optional dependency) — Mycelium's
+    //      `require()` has no native-addon loader, so it would otherwise try to read that
+    //      binary's raw bytes as JS source text and hand GraalJS's parser a wall of binary
+    //      garbage, which fails with a `SyntaxError` that *also* has no `.code`. Since a
+    //      `.node` file can never actually be `require()`-able here regardless of whether
+    //      it exists on disk, `requireModule` now special-cases the `.node` extension and
+    //      reports it as `MODULE_NOT_FOUND` immediately, without ever attempting to read
+    //      or parse its contents — the same honest "no native binding available" signal
+    //      sharp already knows how to handle gracefully.
+    //
+    // With both fixed, sharp's own error-formatting loop no longer crashes — it now
+    // produces exactly the friendly diagnostic it was designed to produce when no prebuilt
+    // binary is loadable, and `import sharp from 'sharp'` fails with that clean message
+    // instead of an internal Mycelium implementation bug. Actually loading the native
+    // binding (so `sharp` becomes a usable function) needs real N-API/dlopen support,
+    // which is out of scope here — see the class doc's "not fixed this round" framing —
+    // so this test asserts the *shape* of the (still-expected) failure instead of asserting
+    // sharp itself works. ---
 
     @Test
-    @Disabled(
-        "FAILS (new blocker, availableParallelism gap now fixed): TypeError: Cannot read " +
-            "property 'endsWith' of undefined (node_modules/sharp/dist/sharp.mjs) — sharp's " +
-            "native-binding loader assumes every require() failure is a Node-shaped " +
-            "MODULE_NOT_FOUND error with a `.code` string; Mycelium's require() throws " +
-            "errors without a `.code` property, and there is no real native N-API addon " +
-            "loading for sharp to fall back to anyway."
-    )
-    fun sharpLoads() {
+    fun sharpFailsGracefullyWithNodeShapedError() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-sharp-")
         npmInstall(dir, "sharp")
 
+        // A static top-level `import` failing aborts module evaluation before any guest
+        // code could inspect the error — dynamic `import()` is used instead so the
+        // rejection can be caught and its shape asserted on, the same way real Node code
+        // would handle an optional/best-effort dependency that might not have a native
+        // binding available for the current platform.
         val mc = writeAndRun(
             dir,
             """
-            import sharp from 'sharp';
-            globalThis.__sharpType = typeof sharp;
+            let caughtMessage = null;
+            try {
+                await import('sharp');
+            } catch (e) {
+                caughtMessage = e && e.message;
+            }
+            globalThis.__sharpErrorMessage = caughtMessage;
             """.trimIndent()
         )
-        assertEquals("function", mc.eval("js", "globalThis.__sharpType").asString())
+        val message = mc.eval("js", "globalThis.__sharpErrorMessage").asString()
+        // The old bug's signature — confirms this isn't silently passing because the
+        // failure mode regressed back to the crash this test used to catch.
+        assertFalse(
+            message.contains("endsWith") || message.contains("Cannot read property"),
+            "expected sharp's own graceful diagnostic, got Mycelium's old require()-error-shape bug instead: $message"
+        )
+        assertTrue(
+            message.contains("Could not load the \"sharp\" module"),
+            "expected sharp's own 'Could not load the sharp module' diagnostic, got: $message"
+        )
     }
 
     // --- 30. esbuild — build tool, spawns a native binary via child_process. Fixed:

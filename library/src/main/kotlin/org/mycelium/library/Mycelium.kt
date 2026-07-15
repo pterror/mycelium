@@ -721,6 +721,25 @@ class Mycelium(
                 if (typeof globalThis.clearImmediate === 'undefined') {
                     globalThis.clearImmediate = clear;
                 }
+                // Standard web-platform/Node global (unrelated to the CommonJS `module`
+                // object despite the similar name) — queues `fn` to run as a microtask,
+                // the same "drain before the next macrotask" timing `Promise.prototype.then`
+                // callbacks get, just without needing an actual `Promise` object around.
+                // avvio (fastify's plugin-loading/boot library) calls the bare global
+                // `queueMicrotask(...)` unconditionally — with no feature-detection guard —
+                // from several points in its plugin-queue-draining logic (see
+                // avvio/lib/plugin.js's `check()`). Previously undefined here, so that call
+                // threw a bare `TypeError: queueMicrotask is not a function` from deep
+                // inside a queue callback with no surrounding `try`/`catch` anywhere on the
+                // call stack to report it — silently aborting `fastify().listen()`'s plugin
+                // boot sequence partway through, which left its returned promise forever
+                // unresolved instead of ever rejecting — see
+                // NpmCompatibilityTest.fastifyListensAndCloses.
+                if (typeof globalThis.queueMicrotask === 'undefined') {
+                    globalThis.queueMicrotask = function (fn) {
+                        Promise.resolve().then(fn);
+                    };
+                }
             })();
         """.trimIndent()
 

@@ -492,10 +492,20 @@ class Server extends EventEmitter {
         this._httpServer = null;
     }
 
-    listen(port, hostnameOrCallback, callback) {
+    // Accepts every shape real Node's `server.listen(...)` does that guest code actually
+    // exercises: `listen(port[, host][, cb])` and the options-object form
+    // `listen({ port, host }[, cb])` (e.g. fastify always calls the latter,
+    // `server.listen(listenOptions)`, with no separate callback argument — it waits for
+    // the `"listening"` event instead, via its own `listenPromise` helper).
+    listen(portOrOptions, hostnameOrCallback, callback) {
         let host = "0.0.0.0";
+        let port = portOrOptions;
         let cb = callback;
-        if (typeof hostnameOrCallback === "function") {
+        if (portOrOptions !== null && typeof portOrOptions === "object") {
+            port = portOrOptions.port;
+            if (portOrOptions.host !== undefined && portOrOptions.host !== null) host = portOrOptions.host;
+            if (typeof hostnameOrCallback === "function") cb = hostnameOrCallback;
+        } else if (typeof hostnameOrCallback === "function") {
             cb = hostnameOrCallback;
         } else if (typeof hostnameOrCallback === "string") {
             host = hostnameOrCallback;
@@ -526,7 +536,14 @@ class Server extends EventEmitter {
         this._httpServer.setExecutor(null);
         this._httpServer.start();
         this.listening = true;
-        if (typeof cb === "function") nextTick(cb);
+        // Real Node emits `"listening"` whether or not a callback was passed — packages
+        // like fastify rely on the event alone (`server.once("listening", ...)`) rather
+        // than ever passing a callback to `listen()` itself. Previously this only ever
+        // invoked `cb` and never emitted the event at all, so any caller relying on the
+        // event (rather than a callback) hung forever waiting on a promise that never
+        // resolved — see NpmCompatibilityTest.fastifyListensAndCloses.
+        if (typeof cb === "function") this.once("listening", cb);
+        nextTick(function () { self.emit("listening"); });
         return this;
     }
 
@@ -542,6 +559,25 @@ class Server extends EventEmitter {
             this.listening = false;
         }
         if (typeof callback === "function") nextTick(callback);
+        return this;
+    }
+
+    // Real Node ties this to the underlying sockets' idle-timeout behavior (emitting a
+    // `"timeout"` event on both the server and the affected socket after `msecs` of
+    // inactivity). The JDK's `com.sun.net.httpserver.HttpServer` backing `_httpServer`
+    // has no equivalent per-connection idle-timeout knob exposed through this API, so
+    // this only stores the value/registers the callback (mirroring how `keepAliveTimeout`/
+    // `requestTimeout` above are just plain settable properties with no enforcement
+    // behind them either) — enough for callers like fastify's `getServerInstance` (which
+    // unconditionally calls `server.setTimeout(options.connectionTimeout)` while building
+    // the server) to not crash on a missing method, without actually timing anything out.
+    setTimeout(msecs, callback) {
+        if (typeof msecs === "function") {
+            callback = msecs;
+            msecs = 0;
+        }
+        this.timeout = msecs === undefined ? 0 : msecs;
+        if (typeof callback === "function") this.on("timeout", callback);
         return this;
     }
 }

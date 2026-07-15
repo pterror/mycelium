@@ -21,6 +21,7 @@ graalvmNative {
             mainClass.set("org.mycelium.app.AppKt")
             buildArgs.add("--initialize-at-build-time")
             buildArgs.add("-H:+ReportExceptionStackTraces")
+            buildArgs.add("-J-Xmx8g")
         }
     }
 }

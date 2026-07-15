@@ -828,6 +828,21 @@ class MyceliumIntegrationTest {
         assertEquals("hello world", result.asString())
     }
 
+    // Mirrors Node's actual `events` module shape: `require('events')` (here, the ESM
+    // default export) is the `EventEmitter` constructor itself, with `EventEmitter` also
+    // attached to it as a self-referencing static property — see events.mjs's own doc
+    // comment on `EventEmitter.EventEmitter = EventEmitter`. Packages that destructure
+    // `const { EventEmitter } = require('events')` and packages that use the module's
+    // default export directly both need to land on the exact same constructor.
+    @Test fun eventEmitterSelfReference() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import events from 'events';
+            globalThis.__eventsSelfRef = events.EventEmitter === events;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__eventsSelfRef").asBoolean())
+    }
+
     // --- Node stdlib `util` module ---
 
     @Test fun importUtilModule() {
@@ -983,6 +998,29 @@ class MyceliumIntegrationTest {
         """.trimIndent())
         assertEquals("hello world", mc.eval("js", "globalThis.__streamData()").asString())
         assertTrue(mc.eval("js", "globalThis.__streamFinished()").asBoolean())
+    }
+
+    // Mirrors Node's actual `stream` module shape: `require('stream')` is the `Stream`
+    // constructor itself, with `Readable`/`Writable`/`Duplex`/`Transform`/`PassThrough`
+    // attached as static properties (`util.inherits(SendStream, Stream)`-style consumers
+    // need `Stream` itself; `{ Readable } = require('stream')`-style consumers need the
+    // static properties) — see stream.mjs's own doc comment on `Stream.Readable = Readable`
+    // etc.
+    @Test fun streamStaticProperties() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import Stream from 'stream';
+            globalThis.__streamReadableType = typeof Stream.Readable;
+            globalThis.__streamWritableType = typeof Stream.Writable;
+            globalThis.__streamDuplexType = typeof Stream.Duplex;
+            globalThis.__streamTransformType = typeof Stream.Transform;
+            globalThis.__streamPassThroughType = typeof Stream.PassThrough;
+        """.trimIndent())
+        assertEquals("function", mc.eval("js", "globalThis.__streamReadableType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__streamWritableType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__streamDuplexType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__streamTransformType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__streamPassThroughType").asString())
     }
 
     // --- Node stdlib `crypto` module ---
@@ -1507,5 +1545,208 @@ class MyceliumIntegrationTest {
         } finally {
             plainServer.stop(0)
         }
+    }
+
+    // --- Node stdlib `net` module ---
+    //
+    // net.mjs's server/client machinery is backed by dedicated daemon threads (accept-loop
+    // and per-socket readers, see net.mjs's own doc comment) that call back into the shared
+    // GraalJS context the same way http.mjs's server side does. A real client+server round
+    // trip would need *two* such background threads (accept + reader) potentially touching
+    // the context around the same time, which risks exactly the concurrent-access failure
+    // this module's own comment warns about — so, per the task's own fallback, this only
+    // verifies the module's shape rather than attempting a live round trip.
+
+    @Test fun importNetModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import net from 'net';
+            globalThis.__netCreateServerType = typeof net.createServer;
+            globalThis.__netCreateConnectionType = typeof net.createConnection;
+        """.trimIndent())
+        assertEquals("function", mc.eval("js", "globalThis.__netCreateServerType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__netCreateConnectionType").asString())
+    }
+
+    // --- Node stdlib `tls` module ---
+
+    @Test fun importTlsModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import tls from 'tls';
+            globalThis.__tlsConnectType = typeof tls.connect;
+            globalThis.__tlsCreateServerType = typeof tls.createServer;
+            globalThis.__tlsTLSSocketType = typeof tls.TLSSocket;
+        """.trimIndent())
+        assertEquals("function", mc.eval("js", "globalThis.__tlsConnectType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__tlsCreateServerType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__tlsTLSSocketType").asString())
+    }
+
+    // --- Node stdlib `tty` module ---
+
+    @Test fun importTtyModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import tty from 'tty';
+            globalThis.__ttyIsatty = tty.isatty(0);
+            globalThis.__ttyReadStreamType = typeof tty.ReadStream;
+            globalThis.__ttyWriteStreamType = typeof tty.WriteStream;
+        """.trimIndent())
+        assertEquals(false, mc.eval("js", "globalThis.__ttyIsatty").asBoolean())
+        assertEquals("function", mc.eval("js", "globalThis.__ttyReadStreamType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__ttyWriteStreamType").asString())
+    }
+
+    // --- Global `Buffer` (no import required) ---
+
+    @Test fun globalBufferExists() {
+        val mc = vm
+        assertEquals("function", mc.eval("js", "typeof globalThis.Buffer").asString())
+        val hex = mc.eval("js", "globalThis.Buffer.from('hello').toString('hex')")
+        assertEquals("68656c6c6f", hex.asString())
+    }
+
+    // --- Global `TextEncoder`/`TextDecoder` (WHATWG Encoding API) ---
+
+    @Test fun globalTextEncoderDecoderExist() {
+        val mc = vm
+        assertTrue(mc.eval("js", "new TextEncoder().encode('hello') instanceof Uint8Array").asBoolean())
+        val roundTrip = mc.eval("js", "new TextDecoder().decode(new TextEncoder().encode('hello'))")
+        assertEquals("hello", roundTrip.asString())
+    }
+
+    // --- `setTimeout`/`setInterval`/`setImmediate` globals ---
+    //
+    // setImmediate (and any zero-delay, non-repeating setTimeout) resolves on the JS
+    // microtask queue (see TIMERS_INIT_SCRIPT's `nextTick`), so it fires on whichever
+    // thread is already inside the context — safe to observe on the shared `vm` with a
+    // single eval call.
+    //
+    // A genuine delay (setTimeout with ms > 0, or any setInterval) is instead backed by a
+    // dedicated daemon `java.lang.Thread` that sleeps for real wall-clock time and then
+    // calls back into the context itself (see TIMERS_INIT_SCRIPT's `runDelayed`) — the same
+    // "another thread enters the context" pattern as http.mjs's server dispatch thread,
+    // which (per the doc comment on importHttpModule's server half above) permanently
+    // forfeits the context back to that thread once it touches it. So, like the
+    // http.createServer / express.listen tests above, these use a dedicated, throwaway
+    // Mycelium instance rather than the shared `vm`.
+
+    @Test fun setImmediateWorks() {
+        val mc = vm
+        assertEquals("function", mc.eval("js", "typeof setImmediate").asString())
+        mc.eval("js", """
+            globalThis.__setImmediateFired = false;
+            setImmediate(() => { globalThis.__setImmediateFired = true; });
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__setImmediateFired").asBoolean())
+    }
+
+    // A single-shot (non-repeating) timer's background thread only ever touches the
+    // context for the brief instant it invokes its callback (see TIMERS_INIT_SCRIPT's
+    // runDelayed), so polling from this thread in between is safe the vast majority of the
+    // time — but if a poll's eval() happens to land in that exact instant, GraalJS throws
+    // "Multi threaded access requested ... but is not allowed" rather than queuing or
+    // blocking (confirmed empirically — see setIntervalWorks' doc comment for the repeating
+    // case, which hits this unavoidably rather than just rarely). Retrying past that
+    // exception here is enough for the non-repeating case, where the window is narrow.
+    private fun pollUntilTrue(mc: Mycelium, expr: String, timeoutMs: Long = 5000): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (mc.eval("js", expr).asBoolean()) return true
+            } catch (e: IllegalStateException) {
+                // Raced the timer thread's own brief context entry — just retry.
+            }
+            Thread.sleep(20)
+        }
+        return mc.eval("js", expr).asBoolean()
+    }
+
+    @Test fun setTimeoutWorks() {
+        val mc = Mycelium()
+        assertEquals("function", mc.eval("js", "typeof setTimeout").asString())
+        mc.eval("js", """
+            globalThis.__setTimeoutFired = false;
+            setTimeout(() => { globalThis.__setTimeoutFired = true; }, 10);
+        """.trimIndent())
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__setTimeoutFired"),
+            "setTimeout callback did not fire within the timeout"
+        )
+    }
+
+    @Test fun setIntervalWorks() {
+        val mc = Mycelium()
+        assertEquals("function", mc.eval("js", "typeof setInterval").asString())
+        // Unlike setTimeoutWorks' single-shot fire, an interval's background timer thread
+        // ticks repeatedly (see TIMERS_INIT_SCRIPT's runDelayed do/while loop), staying
+        // inside the context for the entire tick (sleep, then invoke the callback) each
+        // time around. Round-tripping a read-back eval() from *this* thread while that timer
+        // thread could still be mid-tick was found (empirically) to throw "Multi threaded
+        // access requested ... but is not allowed" — GraalJS Contexts don't allow two
+        // threads touching them at once, and there's no reliable window from the host side
+        // to know the timer thread is between ticks rather than inside one. So the callback
+        // below calls `clearInterval` on *itself* once it's fired 3 times — entirely from
+        // within the timer thread's own already-entered call, with no external thread
+        // involved — which both proves the interval fires more than once and exercises
+        // clearInterval, without this thread ever needing to touch the context while a tick
+        // might be in flight.
+        mc.eval("js", """
+            globalThis.__intervalCount = 0;
+            globalThis.__intervalId = setInterval(() => {
+                globalThis.__intervalCount++;
+                if (globalThis.__intervalCount >= 3) {
+                    clearInterval(globalThis.__intervalId);
+                }
+            }, 10);
+        """.trimIndent())
+        // Comfortably longer than 3 ticks' worth of real time (10ms each), so the timer
+        // thread is certain to have already self-cleared and exited by the time this reads
+        // the final count back.
+        Thread.sleep(300)
+        val finalCount = mc.eval("js", "globalThis.__intervalCount").asInt()
+        assertEquals(3, finalCount, "expected setInterval to fire exactly 3 times before self-clearing via clearInterval")
+    }
+
+    // --- Subpath exports (package.json `"exports"` mapping a subpath to a file, distinct
+    // from a wildcard/conditions map like bareSpecifierUsesExportsFieldOverMain's ".") ---
+
+    @Test fun bareSpecifierSubpathUsesExportsField() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-subpath-").toFile()
+        tmpDir.deleteOnExit()
+        val pkgDir = File(tmpDir, "node_modules/subpath-pkg")
+        pkgDir.mkdirs()
+        pkgDir.deleteOnExit()
+        File(pkgDir, "package.json").apply {
+            writeText(
+                """
+                {
+                  "name": "subpath-pkg",
+                  "exports": { "./sub": "./lib/sub.js" }
+                }
+                """.trimIndent()
+            )
+            deleteOnExit()
+        }
+        val libDir = File(pkgDir, "lib")
+        libDir.mkdirs()
+        libDir.deleteOnExit()
+        File(libDir, "sub.js").apply {
+            writeText("""export const value = "hello from subpath export";""")
+            deleteOnExit()
+        }
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""
+            import { value } from "subpath-pkg/sub";
+            globalThis.__subpathExportsResult = value;
+        """.trimIndent())
+        mainFile.deleteOnExit()
+
+        val mc = vm
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__subpathExportsResult")
+        assertEquals("hello from subpath export", result.asString())
     }
 }

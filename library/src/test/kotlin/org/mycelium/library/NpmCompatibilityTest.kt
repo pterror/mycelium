@@ -283,9 +283,17 @@ class NpmCompatibilityTest {
             const log = debug('mycelium:test');
             globalThis.__debugType = typeof log;
             log('hello %s', 'world');
+            globalThis.__debugNamespace = log.namespace;
+            globalThis.__debugEnabledResultType = typeof debug.enabled('test');
             """.trimIndent()
         )
         assertEquals("function", mc.eval("js", "globalThis.__debugType").asString())
+        assertEquals("mycelium:test", mc.eval("js", "globalThis.__debugNamespace").asString())
+        assertEquals(
+            "boolean",
+            mc.eval("js", "globalThis.__debugEnabledResultType").asString(),
+            "debug.enabled('test') should return a boolean"
+        )
     }
 
     // --- 9. axios — HTTP client, ESM/dual (v1.x). WORKS: `exports["."]` is a *nested*
@@ -308,10 +316,20 @@ class NpmCompatibilityTest {
             import axios from 'axios';
             globalThis.__axiosType = typeof axios;
             globalThis.__axiosGetType = typeof axios.get;
+            globalThis.__axiosDefaultsType = typeof axios.defaults;
+            globalThis.__axiosDefaultsHeadersType = typeof axios.defaults.headers;
+            globalThis.__axiosDefaultsHeadersCommonType = typeof axios.defaults.headers.common;
+            globalThis.__axiosDefaultsHasTimeout = 'timeout' in axios.defaults;
+            globalThis.__axiosDefaultsTransformRequestType = typeof axios.defaults.transformRequest;
             """.trimIndent()
         )
         assertEquals("function", mc.eval("js", "globalThis.__axiosType").asString())
         assertEquals("function", mc.eval("js", "globalThis.__axiosGetType").asString())
+        assertEquals("object", mc.eval("js", "globalThis.__axiosDefaultsType").asString())
+        assertEquals("object", mc.eval("js", "globalThis.__axiosDefaultsHeadersType").asString())
+        assertEquals("object", mc.eval("js", "globalThis.__axiosDefaultsHeadersCommonType").asString())
+        assertTrue(mc.eval("js", "globalThis.__axiosDefaultsHasTimeout").asBoolean())
+        assertEquals("object", mc.eval("js", "globalThis.__axiosDefaultsTransformRequestType").asString())
     }
 
     // --- 10. express — HTTP server framework, CJS, big dependency tree. WORKS for the same
@@ -320,10 +338,14 @@ class NpmCompatibilityTest {
     // express-specific fix — included here to document that a realistic multi-level
     // dependency chain resolves correctly too, not just the single-package case. ---
 
-    @Test fun expressLoadsSuccessfully() {
+    // Redundant with expressServerHandlesRequestsAndFourOhFours (below) as a bare "does it
+    // load" check, so this instead exercises middleware registration — app.use() pushing
+    // onto the app's internal router stack — without spinning up a real HTTP server.
+
+    @Test fun expressMiddlewareRegistersOnRouterStack() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
-        val dir = tempProjectDir("mycelium-npm-express-")
+        val dir = tempProjectDir("mycelium-npm-express-middleware-")
         npmInstall(dir, "express")
 
         val mc = writeAndRun(
@@ -331,10 +353,25 @@ class NpmCompatibilityTest {
             """
             import express from 'express';
             const app = express();
-            globalThis.__expressType = typeof app.listen;
+            function myMiddleware(req, res, next) { next(); }
+            // Express 5 exposes the app's underlying router as a lazily-created `app.router`
+            // getter; Express 4 exposes it as `app._router` (also lazily created, on first
+            // app.use()/app.get()/etc). Checking both keeps this working across whichever
+            // major version `npm install express` resolves to.
+            const routerBefore = app.router || app._router;
+            const stackLengthBefore = routerBefore ? routerBefore.stack.length : -1;
+            app.use(myMiddleware);
+            const router = app.router || app._router;
+            globalThis.__expressHasRouter = typeof router === 'object' || typeof router === 'function';
+            globalThis.__expressStackGrew = router.stack.length > stackLengthBefore;
+            globalThis.__expressStackHasMiddleware = router.stack.some(
+                (layer) => layer.handle === myMiddleware
+            );
             """.trimIndent()
         )
-        assertEquals("function", mc.eval("js", "globalThis.__expressType").asString())
+        assertTrue(mc.eval("js", "globalThis.__expressHasRouter").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__expressStackGrew").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__expressStackHasMiddleware").asBoolean())
     }
 
     // --- 11. express, end-to-end: a real HTTP round trip through an express server running

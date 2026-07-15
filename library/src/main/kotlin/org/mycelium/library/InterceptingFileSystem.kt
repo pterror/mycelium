@@ -368,7 +368,29 @@ class InterceptingFileSystem : FileSystem {
         } else {
             "index.js"
         }
-        return packageDir.resolve(entry).normalize()
+        return resolveExtensionlessPath(packageDir.resolve(entry).normalize())
+    }
+
+    // Mirrors Node's extension/directory-index probing for a path that doesn't resolve to
+    // an existing file as-is — e.g. a package.json `"main": "./index"` field with no file
+    // extension, or a `require`/`import` specifier written without one. If `path` itself
+    // exists (or names an existing directory without a usable index file), it's returned
+    // unchanged; otherwise this tries, in order, `<path>.js`, `<path>.mjs`, `<path>.cjs`,
+    // `<path>.json`, then the same four extensions under `<path>/index.*`. Returns `path`
+    // itself if none of the probed candidates exist, leaving the caller to surface Node's
+    // usual "cannot find module" error against the original specifier.
+    private fun resolveExtensionlessPath(path: Path): Path {
+        if (Files.exists(path)) return path
+        val extensions = listOf("js", "mjs", "cjs", "json")
+        for (ext in extensions) {
+            val withExt = Path.of("$path.$ext")
+            if (Files.exists(withExt)) return withExt
+        }
+        for (ext in extensions) {
+            val indexWithExt = path.resolve("index.$ext")
+            if (Files.exists(indexWithExt)) return indexWithExt
+        }
+        return path
     }
 
     // Resolves a `#`-prefixed "subpath import" specifier (e.g. `#ansi-styles`) against the
@@ -440,6 +462,8 @@ class InterceptingFileSystem : FileSystem {
         "node:http" to "http.mjs",
         "https" to "https.mjs",
         "node:https" to "https.mjs",
+        "tty" to "tty.mjs",
+        "node:tty" to "tty.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =
@@ -644,13 +668,7 @@ class InterceptingFileSystem : FileSystem {
         if (specifier.startsWith(".") || specifier.startsWith("/")) {
             val candidate = fromDir.resolve(specifier).normalize()
             if (Files.exists(candidate) || candidate.extension.isNotEmpty()) return candidate
-            for (ext in listOf("js", "cjs", "mjs", "json")) {
-                val withExt = Path.of("$candidate.$ext")
-                if (Files.exists(withExt)) return withExt
-            }
-            val indexJs = candidate.resolve("index.js")
-            if (Files.exists(indexJs)) return indexJs
-            return candidate
+            return resolveExtensionlessPath(candidate)
         }
         coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
         return when (val resolution = resolveNodeModule(specifier, fromDir)) {
@@ -685,17 +703,39 @@ class InterceptingFileSystem : FileSystem {
             })
         """.trimIndent()
 
+        // Resolves a package.json `"exports"` (or `"imports"`) conditions value to a plain
+        // path string. A conditions value isn't necessarily a flat `{import, require,
+        // default}` object with string leaves — packages like axios nest another
+        // conditions object *inside* a condition's own value (e.g. `exports["."].default`
+        // is itself `{require: "...", default: "..."}`), so this recurses into any
+        // condition whose value is an object rather than assuming one level of nesting is
+        // the bottom. `conditions`, in priority order, are the only keys ever descended
+        // into — unlisted keys (`types`, `browser`, `bun`, `react-native`, ...) are
+        // ignored at every level, mirroring how Node only matches conditions it actually
+        // supports rather than falling back to an arbitrary platform-specific one.
+        private val RESOLVE_CONDITIONS_FN = """
+            function resolveConditions(node, conditions) {
+                if (typeof node === "string") return node;
+                if (!node || typeof node !== "object") return null;
+                for (var i = 0; i < conditions.length; i++) {
+                    if (Object.prototype.hasOwnProperty.call(node, conditions[i])) {
+                        var result = resolveConditions(node[conditions[i]], conditions);
+                        if (result) return result;
+                    }
+                }
+                return null;
+            }
+        """.trimIndent()
+
         private val ENTRY_POINT_RESOLVER = """
             (function (json) {
+                $RESOLVE_CONDITIONS_FN
                 var pkg = JSON.parse(json);
                 var exp = pkg.exports;
                 if (exp) {
-                    var dot = typeof exp === "string" ? exp : (exp["."] || exp);
-                    if (typeof dot === "string") return dot;
-                    if (dot && typeof dot === "object") {
-                        if (dot.import) return dot.import;
-                        if (dot.default) return dot.default;
-                    }
+                    var dot = typeof exp === "string" ? exp : (exp["."] !== undefined ? exp["."] : exp);
+                    var resolved = resolveConditions(dot, ["node", "import", "default"]);
+                    if (resolved) return resolved;
                 }
                 return pkg.main || "index.js";
             })
@@ -709,20 +749,14 @@ class InterceptingFileSystem : FileSystem {
         // which the Kotlin caller distinguishes from a real string result via `isString`.
         private val IMPORTS_RESOLVER = """
             (function (json, specifier) {
+                $RESOLVE_CONDITIONS_FN
                 try {
                     var pkg = JSON.parse(json);
                     var imports = pkg.imports;
                     if (!imports || typeof imports !== "object") return null;
                     var entry = imports[specifier];
                     if (entry === undefined) return null;
-                    if (typeof entry === "string") return entry;
-                    if (entry && typeof entry === "object") {
-                        if (typeof entry.node === "string") return entry.node;
-                        if (typeof entry.import === "string") return entry.import;
-                        if (typeof entry.require === "string") return entry.require;
-                        if (typeof entry.default === "string") return entry.default;
-                    }
-                    return null;
+                    return resolveConditions(entry, ["node", "import", "require", "default"]);
                 } catch (e) {
                     return null;
                 }
@@ -730,8 +764,15 @@ class InterceptingFileSystem : FileSystem {
         """.trimIndent()
     }
 
-    override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) =
-        delegate.checkAccess(toAbsolutePath(path), modes, *linkOptions)
+    override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) {
+        val absolute = toAbsolutePath(path)
+        val probed = if (!absolute.startsWith("/.mycelium/") && !absolute.startsWith(CORE_MODULE_PREFIX)) {
+            resolveExtensionlessPath(absolute)
+        } else {
+            absolute
+        }
+        delegate.checkAccess(probed, modes, *linkOptions)
+    }
 
     override fun createDirectory(dir: Path, vararg attrs: FileAttribute<*>) =
         delegate.createDirectory(dir, *attrs)
@@ -747,7 +788,23 @@ class InterceptingFileSystem : FileSystem {
     ): SeekableByteChannel {
         // Resolve relative paths against the currently-loading file's directory (if known)
         // rather than the process's working directory, before doing anything else.
-        val path = if (rawPath.isAbsolute) rawPath else toAbsolutePath(rawPath)
+        val resolvedPath = if (rawPath.isAbsolute) rawPath else toAbsolutePath(rawPath)
+        // GraalJS's own ESM import resolution (unlike Mycelium's require()/node_modules
+        // paths, which already probe extensions themselves — see resolveExtensionlessPath)
+        // hands relative/absolute specifiers straight through as-is, so an extensionless
+        // import (e.g. package "main" fields resolved by a *different* package's own ESM
+        // loader, or hand-written extensionless relative imports) would otherwise 404 here.
+        // Only probe for real filesystem reads — never for synthetic core-module/URL paths,
+        // and never when the caller is writing/creating a file.
+        val path = if (!options.contains(StandardOpenOption.WRITE) &&
+            !options.contains(StandardOpenOption.CREATE) &&
+            !resolvedPath.startsWith("/.mycelium/") &&
+            !resolvedPath.startsWith(CORE_MODULE_PREFIX)
+        ) {
+            resolveExtensionlessPath(resolvedPath)
+        } else {
+            resolvedPath
+        }
         val pushed = path.isAbsolute && !path.startsWith("/.mycelium/") && !path.startsWith(CORE_MODULE_PREFIX)
         if (pushed) {
             val parent = path.parent ?: path

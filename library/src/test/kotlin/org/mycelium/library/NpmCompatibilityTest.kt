@@ -97,11 +97,11 @@ import java.net.URI
 //     by registering a real `diagnostics_channel.mjs` core module, then progressed to a
 //     missing `worker_threads` core module (pino's thread-transport machinery), then to
 //     `node-stdlib/buffer.mjs` not exporting a `constants` object (thread-stream reads
-//     `buffer.constants.MAX_STRING_LENGTH`). `buffer.mjs` now exports `constants` too — but
-//     pino still doesn't run end-to-end: thread-stream also references the bare Node global
-//     `global` (`global.WeakRef`/`global.FinalizationRegistry` fallback checks), and
-//     Mycelium exposes no `global` alias for `globalThis` — "ReferenceError: global is not
-//     defined". Open gap, not part of this sweep — see pinoFailsOnMissingBufferConstants.
+//     `buffer.constants.MAX_STRING_LENGTH`), then to thread-stream referencing the bare Node
+//     global `global` directly (`global.WeakRef`/`global.FinalizationRegistry` fallback
+//     checks), which Mycelium didn't expose. `buffer.mjs` now exports `constants`, and
+//     `globalThis.global = globalThis` is set up during context init — pino now WORKS
+//     end-to-end — see pinoLogsMessage.
 //   - inquirer: originally FAILED with "unknown core module 'node:async_hooks'" — fixed by
 //     registering a real `async_hooks.mjs` core module, then progressed to a missing
 //     `node:readline` core module. Now that `readline` is registered too, it progresses
@@ -665,36 +665,30 @@ class NpmCompatibilityTest {
     // class), so the read threw "Cannot read property 'MAX_STRING_LENGTH' of undefined".
     //
     // `buffer.mjs` now exports a `constants` object too (`MAX_LENGTH`/`MAX_STRING_LENGTH`,
-    // also attached as `Buffer.constants`) — but pino still doesn't run end-to-end:
-    // thread-stream also references the bare Node global `global` directly (not
-    // `globalThis`), and Mycelium's guest environment exposes no `global` alias. Open gap,
-    // not part of this sweep. ---
+    // also attached as `Buffer.constants`), which unblocked loading but exposed a fourth
+    // gap: thread-stream also references the bare Node global `global` directly (not
+    // `globalThis`), and Mycelium's guest environment exposed no `global` alias.
+    //
+    // `globalThis.global = globalThis` is now set up during context init (mirroring real
+    // Node, where `global`/`globalThis` are literally the same object) — pino now WORKS
+    // end-to-end. ---
 
-    @Test fun pinoFailsOnMissingBufferConstants() {
+    @Test fun pinoLogsMessage() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-pino-")
         npmInstall(dir, "pino")
 
-        val ex = assertThrows(PolyglotException::class.java) {
-            writeAndRun(
-                dir,
-                """
-                import pino from 'pino';
-                const logger = pino({ level: 'info' });
-                logger.info('hello from mycelium');
-                globalThis.__pinoLoaded = true;
-                """.trimIndent()
-            )
-        }
-        assertFalse(
-            ex.message!!.contains("MAX_STRING_LENGTH"),
-            "buffer.constants.MAX_STRING_LENGTH should now resolve — unexpected error: ${ex.message}"
+        val mc = writeAndRun(
+            dir,
+            """
+            import pino from 'pino';
+            const logger = pino({ level: 'info' });
+            logger.info('hello from mycelium');
+            globalThis.__pinoLoaded = true;
+            """.trimIndent()
         )
-        assertTrue(
-            ex.message!!.contains("global is not defined"),
-            "unexpected error: ${ex.message}"
-        )
+        assertTrue(mc.eval("js", "globalThis.__pinoLoaded").asBoolean())
     }
 
     // --- 18. zod — schema validation, pure JS/TS, zero deps. WORKS. Same "pure JS, no

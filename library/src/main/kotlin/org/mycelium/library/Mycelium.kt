@@ -81,6 +81,7 @@ class Mycelium(
             lang.injectEvalModule(context, evalModuleFn)
         }
         context.getBindings("js").putMember("__mycelium_require__", requireFn)
+        context.eval("js", GLOBAL_ALIAS_INIT_SCRIPT)
         context.eval("js", PROCESS_INIT_SCRIPT)
         context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
         context.eval("js", ERROR_CAPTURE_STACK_TRACE_INIT_SCRIPT)
@@ -239,6 +240,16 @@ class Mycelium(
                     return false;
                 }
             })
+        """.trimIndent()
+
+        // Aliases the legacy Node.js `global` object to `globalThis` — many older npm
+        // packages (e.g. thread-stream, pino's transport helper) reference the bare `global`
+        // identifier directly rather than the standard `globalThis`, and throw
+        // `ReferenceError: global is not defined` in Mycelium's guest environment without
+        // this. In real Node, `global` and `globalThis` are literally the same object, so a
+        // plain alias is enough — no separate object graph to keep in sync.
+        private val GLOBAL_ALIAS_INIT_SCRIPT = """
+            globalThis.global = globalThis;
         """.trimIndent()
 
         // Injects a Node-compatible `process` global onto `globalThis` before any guest

@@ -42,6 +42,14 @@ class Mycelium(
             // module linker resolves internally without ever handing Java-side code a
             // Value to inspect).
             .option("js.esm-eval-returns-exports", "true")
+            // Enables GraalJS's built-in `WebAssembly` JS API global (WebAssembly.Module /
+            // .Instance / ...), which InterceptingFileSystem.loadWasmExports uses to load
+            // tinygo-compiled Go WASM modules and read their exports off
+            // `instance.exports`. GraalVM's raw "wasm" Truffle language
+            // (context.eval("wasm", ...)) exposes no exports as Value members at all — see
+            // TinyGoSupport in Languages.kt — so the JS WebAssembly API is used instead of
+            // evaluating compiled WASM directly as a "wasm"-language Source.
+            .option("js.webassembly", "true")
             .build()
 
     private val extensionMap: Map<String, LanguageSupport> =

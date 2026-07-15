@@ -151,30 +151,15 @@ object RustSupport : LanguageSupport {
 // output is cached the same way as C/Rust (content-hashed under
 // $XDG_CACHE_HOME/mycelium/<hash>.wasm).
 //
-// CRITICAL BLOCKER (discovered 2026-07-15 during first end-to-end test):
-// GraalVM's WASM language does NOT expose module exports via Value.memberKeys the way
-// the LLVM language does. When a WASM binary is evaluated with context.eval("wasm", ...),
-// the resulting Value has ZERO memberKeys and no methods to instantiate or access exports.
-// This makes the whole cross-language import mechanism impossible — the shim generation
-// needs exports to work, but GraalVM WASM gives us none.
-//
-// The original design assumed WASM would work like LLVM (exposing exports as Value members),
-// by analogy. Testing with tinygo 0.41.1 + GraalVM 25.0.2 proved this wrong. The WASM
-// language in GraalVM may require a different runtime or API — needs investigation.
-//
-// Options going forward:
-//  1. Use a JavaScript-based WASM loader (e.g. WebAssembly API in JS) instead of GraalVM's
-//     WASM language — would require passing WASM binaries to JS and letting JS instantiate
-//     and call them, with Polyglot wrapping the results. More complex, may have ABI issues.
-//  2. Find / contribute a GraalVM patch to make WASM exports available as Value members.
-//  3. Drop Go support from Mycelium (simplest, but limits usefulness).
-//  4. Compile Go → LLVM instead of WASM (Go doesn't have a straightforward LLVM pipeline;
-//     gollvm is unmaintained; not pursued).
-//
-// For now, TinyGoSupport is kept in the default language list to fail gracefully with a
-// clean error message pointing to this blocker, rather than either silently omitting Go or
-// crashing with an opaque error. The test (jsImportsGoWasm) will fail until WASM support
-// is unblocked.
+// RESOLVED BLOCKER (originally discovered 2026-07-15 during first end-to-end test, fixed
+// same day): GraalVM's raw "wasm" Truffle language does NOT expose module exports via
+// Value.memberKeys the way the LLVM language does — context.eval("wasm", file) hands back
+// a Value with zero memberKeys and no way to instantiate/access exports. The fix was to
+// stop using the "wasm" language directly and instead load compiled WASM through GraalJS's
+// built-in `WebAssembly` JS API (WebAssembly.Module/.Instance, enabled via the
+// "js.webassembly" context option set in Mycelium.kt) — see
+// InterceptingFileSystem.loadWasmExports, which returns `instance.exports`, an ordinary JS
+// object generateShim can enumerate exactly like an LLVM Value's members.
 object TinyGoSupport : LanguageSupport {
     override val languageId = "wasm"
     override val extensions = listOf("go")

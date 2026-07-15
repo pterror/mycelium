@@ -383,17 +383,31 @@ class Transform extends Duplex {
         });
     }
 
-    _final(callback) {
+    // Default no-op `_flush`; subclasses following Node's convention override this as
+    // an ordinary class method (e.g. `class Gzip extends Transform { _flush(cb) {...} }`).
+    // `_final` below dispatches to it via `this._flush(...)`, so an overridden method on
+    // the subclass's prototype takes precedence automatically — no separate hook needed
+    // for that path. `options.flush` (the "options object" construction style, `new
+    // Transform({ flush(cb) {...} })`) is supported too, as a fallback when `_flush`
+    // hasn't been overridden.
+    _flush(callback) {
         if (this._flushImpl) {
-            this._flushImpl.call(this, (err, transformed) => {
-                if (transformed !== undefined && transformed !== null) this.push(transformed);
-                this.push(null);
-                callback(err);
-            });
+            this._flushImpl.call(this, callback);
         } else {
-            this.push(null);
             callback();
         }
+    }
+
+    _final(callback) {
+        this._flush((err, transformed) => {
+            if (err) {
+                callback(err);
+                return;
+            }
+            if (transformed !== undefined && transformed !== null) this.push(transformed);
+            this.push(null);
+            callback();
+        });
     }
 
     end(chunk, encoding, callback) {

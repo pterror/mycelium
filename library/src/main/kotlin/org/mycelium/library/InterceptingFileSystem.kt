@@ -511,6 +511,8 @@ class InterceptingFileSystem : FileSystem {
         "node:os" to "os.mjs",
         "fs" to "fs.mjs",
         "node:fs" to "fs.mjs",
+        "fs/promises" to "fs-promises.mjs",
+        "node:fs/promises" to "fs-promises.mjs",
         "buffer" to "buffer.mjs",
         "node:buffer" to "buffer.mjs",
         "url" to "url.mjs",
@@ -545,6 +547,10 @@ class InterceptingFileSystem : FileSystem {
         "node:tls" to "tls.mjs",
         "child_process" to "child_process.mjs",
         "node:child_process" to "child_process.mjs",
+        "diagnostics_channel" to "diagnostics_channel.mjs",
+        "node:diagnostics_channel" to "diagnostics_channel.mjs",
+        "async_hooks" to "async_hooks.mjs",
+        "node:async_hooks" to "async_hooks.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =
@@ -808,6 +814,18 @@ class InterceptingFileSystem : FileSystem {
         private val RESOLVE_CONDITIONS_FN = """
             function resolveConditions(node, conditions) {
                 if (typeof node === "string") return node;
+                if (Array.isArray(node)) {
+                    // Node's array-fallback form for exports/imports targets: try each
+                    // element in declaration order and use the first that resolves to
+                    // something (a string, or an object/nested-array that itself resolves
+                    // via recursion) — e.g. escalade's
+                    // `"./sync": [{"import": "./sync/index.mjs"}, "./sync/index.js"]`.
+                    for (var j = 0; j < node.length; j++) {
+                        var candidate = resolveConditions(node[j], conditions);
+                        if (candidate) return candidate;
+                    }
+                    return null;
+                }
                 if (!node || typeof node !== "object") return null;
                 for (var i = 0; i < conditions.length; i++) {
                     if (Object.prototype.hasOwnProperty.call(node, conditions[i])) {

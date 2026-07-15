@@ -50,8 +50,24 @@ All findings above are cataloged as tests in `NpmCompatibilityTest.kt` (see its 
 3. Recursive/nested conditional-exports resolution in `package.json`'s `"exports"` field.
 4. Chalk subpath-import regression (`sourceDirectoryStack` empty for subpath imports).
 
+**Round 3 (ws, commander, yargs, glob, pino, zod, nanoid, inquirer) — quick-win fixes landed this session:**
+- `ws`, `zod`, `nanoid` — already WORKED (no gaps).
+- `commander` — was FAILING on `util.mjs` missing `stripVTControlCharacters`. Fixed: added to `util.mjs`, now WORKS end-to-end.
+- `yargs` — was FAILING on escalade's `exports["./sync"]` being an *array* of fallback candidates (`RESOLVE_CONDITIONS_FN` didn't recurse into arrays). Fixed: `resolveConditions` in `InterceptingFileSystem.kt` now tries each array element in order. Still fails past that point — yargs's platform shim also needs `node:module` (`builtinModules`), not yet registered.
+- `glob` — was FAILING on missing `fs/promises`/`node:fs/promises` core module. Fixed: added `fs-promises.mjs`, registered in `coreModules`. Still fails past that point — minimatch/path-scurry construct `new URL(...)` at module scope, and `URL` isn't a global in Mycelium's guest environment (only importable via the `url` module).
+- `pino` — was FAILING on missing `diagnostics_channel`/`node:diagnostics_channel`. Fixed: added a real (not just stubbed) pub/sub implementation in `diagnostics_channel.mjs`. Still fails past that point — pino's thread-transport also needs `worker_threads`, not yet registered.
+- `inquirer` — was FAILING on missing `async_hooks`/`node:async_hooks`. Fixed: added `async_hooks.mjs` with a genuinely-working (synchronous-only) `AsyncLocalStorage` plus inert `createHook`/`AsyncResource` stubs. Still fails past that point — inquirer also needs `node:readline`, not yet registered.
+- Also fixed while in the area (not gating any round-3 package directly, but needed for real-world npm compat): `util.mjs` gained `debuglog`/`debug`, `parseArgs`, `promisify.custom`, `styleText`, `formatWithOptions`, `getSystemErrorName`, `toUSVString`.
+- `assert.strict.rejects`/`assert.strict.doesNotReject` — checked, were already correctly implemented (no bug found there).
+
+### Next npm gaps to fix (ordered simplest → hardest)
+1. `node:module` core module (at least `builtinModules`) — unblocks yargs.
+2. `worker_threads` core module (stub acceptable) — unblocks pino.
+3. `readline` core module — unblocks inquirer.
+4. Expose `URL`/`URLSearchParams` as globals (not just importable from `url`) — unblocks glob/minimatch/path-scurry.
+
 ### Missing Node stdlib modules
-`net`, `child_process`, `worker_threads`, `readline`, `tty`, `dns`, `dgram`, `cluster`. Also: console output could be improved beyond GraalJS's defaults.
+`net`, `worker_threads`, `readline`, `module`, `dns`, `dgram`, `cluster`. (`child_process`, `tty`, `diagnostics_channel`, `async_hooks`, `fs/promises` are now implemented.) Also: console output could be improved beyond GraalJS's defaults.
 
 ## Language support status
 

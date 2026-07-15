@@ -66,34 +66,40 @@ import java.net.URI
 //     module. Not a distinct express-specific fix.
 //
 // Third round — harder still (ws, commander, yargs, glob, pino, zod, nanoid, inquirer),
-// 4/8 pass:
+// originally 4/8 pass:
 //
 //   - ws (WebSocket server, uses net/crypto/stream/http/events): WORKS. All transitive
 //     requirements were already-implemented core modules.
 //   - zod (pure JS/TS, zero deps): WORKS. Same shape as lodash/semver.
 //   - nanoid (uses crypto): WORKS. Bottoms out on the same `globalThis.crypto`
 //     (`crypto.getRandomValues`) mechanism uuid's v4 generator already exercises.
-//   - commander (ESM v15): FAILS — but on a different gap than its `node:child_process`
-//     import would suggest. `lib/command.js` also does `import { stripVTControlCharacters }
-//     from 'node:util'` at module scope; `util` *is* registered but doesn't export that
-//     function, and ES module linking validates all named imports before any module body
-//     runs, so this surfaces first as "The requested module 'node:util' does not provide an
-//     export named 'stripVTControlCharacters'" — the also-real child_process gap (no
-//     child_process shim exists at all) never gets exercised.
-//   - yargs (ESM v18): FAILS, but not on a missing core module — its transitive dependency
-//     escalade declares `exports["./sync"]` as an *array* of fallback candidates
+//   - commander (ESM v15): originally FAILED on `import { stripVTControlCharacters } from
+//     'node:util'` — `util` was registered but didn't export that function. Now WORKS:
+//     `util.mjs` gained `stripVTControlCharacters` (see commanderLoadsAndParsesOptions).
+//   - yargs (ESM v18): originally FAILED because its transitive dependency escalade
+//     declares `exports["./sync"]` as an *array* of fallback candidates
 //     (`[{import:{...}, require:{...}}, "./sync/index.js"]`), a distinct exports pattern
-//     from the nested-conditions-object shape axios already covers. `RESOLVE_CONDITIONS_FN`
-//     doesn't recurse into arrays (only plain objects via `hasOwnProperty` on known
-//     condition keys), so resolution silently fails and falls back to treating the export
-//     key itself as a literal on-disk path — which is a directory, producing an
-//     `EISDIR`-shaped "Error: Is a directory" instead of a real resolution.
-//   - glob (v11): FAILS — "unknown core module 'node:fs/promises'". Only plain `fs` is
-//     registered; there's no `fs/promises` core module.
-//   - pino: FAILS — "unknown core module 'node:diagnostics_channel'" / "cannot find module
-//     'node:diagnostics_channel'". Not registered at all, unlike `tty`.
-//   - inquirer: FAILS — "unknown core module 'node:async_hooks'". A separate gap from the
-//     `tty` one debug/chalk/express already exercise; `tty` alone isn't enough for inquirer.
+//     from the nested-conditions-object shape axios already covers — `RESOLVE_CONDITIONS_FN`
+//     didn't recurse into arrays, silently failing resolution and falling back to a literal
+//     on-disk path check against a directory (`EISDIR`-shaped "Is a directory"). Array
+//     fallback resolution is now implemented (`resolveConditions` tries each array element
+//     in order — see yargsFailsOnMissingNodeModuleCore) and the escalade gap is fixed, but
+//     yargs still doesn't run end-to-end: its platform shim also does `import { builtinModules
+//     } from 'node:module'`, and `module` isn't among Mycelium's core modules at all.
+//   - glob (v11): originally FAILED with "unknown core module 'node:fs/promises'" — fixed by
+//     registering a real `fs-promises.mjs` core module. Now progresses further but still
+//     fails: minimatch/path-scurry construct `new URL(...)` at module scope, and `URL` isn't
+//     exposed as a global in Mycelium's guest environment (only importable via the `url`
+//     core module) — see globFailsOnMissingUrlGlobal.
+//   - pino: originally FAILED with "unknown core module 'node:diagnostics_channel'" — fixed
+//     by registering a real `diagnostics_channel.mjs` core module. Now progresses further
+//     but still fails on a *different* missing core module: `require('worker_threads')`
+//     (pino's thread-transport machinery) — see pinoFailsOnMissingWorkerThreadsModule.
+//   - inquirer: originally FAILED with "unknown core module 'node:async_hooks'" — fixed by
+//     registering a real `async_hooks.mjs` core module (with a genuinely-working, if
+//     synchronous-only, `AsyncLocalStorage`). Now progresses further but still fails on a
+//     different missing core module: `node:readline` — see
+//     inquirerFailsOnMissingReadlineModule.
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -524,52 +530,53 @@ class NpmCompatibilityTest {
     // imports from core modules Mycelium only partially supports — `import childProcess
     // from 'node:child_process'` (entirely unregistered, no child_process.mjs at all) and
     // `import { stripVTControlCharacters } from 'node:util'` (util *is* registered, but
-    // node-stdlib/util.mjs doesn't export `stripVTControlCharacters`). ES module linking
-    // resolves/validates named imports for the whole module graph before any module body
-    // runs, and the `node:util` import is what fails first — a `SyntaxError: The requested
-    // module 'node:util' does not provide an export named 'stripVTControlCharacters'` —
-    // so commander never gets far enough to hit the also-real child_process gap. ---
+    // node-stdlib/util.mjs now exports `stripVTControlCharacters` — see util.mjs). ES module
+    // linking resolves/validates named imports for the whole module graph before any module
+    // body runs, so the `node:util` import used to fail first (before commander's own
+    // `node:child_process` gap was ever exercised); now `util` provides the export and
+    // commander runs end-to-end. ---
 
-    @Test fun commanderFailsOnMissingUtilExport() {
+    @Test fun commanderLoadsAndParsesOptions() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-commander-")
         npmInstall(dir, "commander")
 
-        val ex = assertThrows(PolyglotException::class.java) {
-            writeAndRun(
-                dir,
-                """
-                import { Command } from 'commander';
-                const program = new Command();
-                program.name('test').version('1.0.0').option('-d, --debug');
-                program.parse(['node', 'test', '--debug']);
-                globalThis.__commanderDebug = program.opts().debug;
-                """.trimIndent()
-            )
-        }
-        assertTrue(
-            ex.message!!.contains("stripVTControlCharacters"),
-            "unexpected error: ${ex.message}"
+        val mc = writeAndRun(
+            dir,
+            """
+            import { Command } from 'commander';
+            const program = new Command();
+            program.name('test').version('1.0.0').option('-d, --debug');
+            program.parse(['node', 'test', '--debug']);
+            globalThis.__commanderDebug = program.opts().debug;
+            """.trimIndent()
         )
+        assertTrue(mc.eval("js", "globalThis.__commanderDebug").asBoolean())
     }
 
-    // --- 15. yargs — CLI framework, ESM (v18). FAILS, but not on a missing core module:
-    // yargs's platform shim (lib/platform-shims/esm.mjs) does `import escalade from
+    // --- 15. yargs — CLI framework, ESM (v18). Originally FAILED, not on a missing core
+    // module: yargs's platform shim (lib/platform-shims/esm.mjs) does `import escalade from
     // 'escalade/sync'`, and escalade's package.json `exports["./sync"]` is an *array* of
     // fallback candidates — `[{import: {...}, require: {...}}, "./sync/index.js"]` — a
     // distinct "try each in order" exports pattern from the nested-conditions-object shape
     // axios already exercises (see axiosLoadsSuccessfully above). `RESOLVE_CONDITIONS_FN`
-    // in InterceptingFileSystem only recurses into plain conditions *objects* (checking
+    // in InterceptingFileSystem only recursed into plain conditions *objects* (checking
     // `hasOwnProperty` for known condition keys); given an array, `typeof node === "object"`
     // is true (arrays are objects) but none of `node`/`import`/`default` are own keys of an
-    // array (its own keys are `"0"`, `"1"`, ...), so resolution silently returns null and
-    // falls through to a literal on-disk path check against the *export key itself*
+    // array (its own keys are `"0"`, `"1"`, ...), so resolution silently returned null and
+    // fell through to a literal on-disk path check against the *export key itself*
     // (`./sync`) — which exists as a directory (`escalade/sync/`), not a file, hence the
-    // `EISDIR`-shaped "Error: Is a directory" rather than a "no such export" error. Open gap:
-    // exports/imports conditions arrays aren't resolved. ---
+    // `EISDIR`-shaped "Error: Is a directory" rather than a "no such export" error.
+    //
+    // `resolveConditions` now recurses into arrays (trying each element in declaration
+    // order, recursing into objects/nested-arrays, per Node's own array-fallback
+    // semantics), which fixes the escalade resolution — but yargs still doesn't run
+    // end-to-end: the same platform shim also does `import { builtinModules } from
+    // 'node:module'`, and `module` isn't among Mycelium's core modules at all yet. Open
+    // gap, not part of this sweep. ---
 
-    @Test fun yargsFailsOnArrayExportsFallback() {
+    @Test fun yargsFailsOnMissingNodeModuleCore() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-yargs-")
@@ -586,21 +593,32 @@ class NpmCompatibilityTest {
                 """.trimIndent()
             )
         }
-        assertTrue(
+        assertFalse(
             ex.message!!.contains("Is a directory"),
+            "escalade's array-exports fallback should now resolve — unexpected error: ${ex.message}"
+        )
+        assertTrue(
+            ex.message!!.contains("node:module"),
             "unexpected error: ${ex.message}"
         )
     }
 
-    // --- 16. glob — file matching, uses path/fs. FAILS: glob v11's implementation
-    // (via the `path-scurry`/`minimatch` dependency chain) does `require('node:fs/promises')`
-    // (or `import ... from 'node:fs/promises'` depending on the entry point) — the promise-
-    // based `fs` API surface, which isn't registered as its own core module (only plain
-    // `fs` is — see library/src/main/resources/node-stdlib/fs.mjs; there's no
-    // fs/promises.mjs and no `fs`-module `.promises` export wired up as a separate
-    // specifier). ---
+    // --- 16. glob — file matching, uses path/fs. Originally FAILED: glob v11's
+    // implementation (via the `path-scurry`/`minimatch` dependency chain) does
+    // `require('node:fs/promises')` (or `import ... from 'node:fs/promises'` depending on
+    // the entry point) — the promise-based `fs` API surface, which wasn't registered as its
+    // own core module (only plain `fs` was — see library/src/main/resources/node-stdlib/
+    // fs.mjs; there was no fs-promises.mjs).
+    //
+    // `fs/promises`/`node:fs/promises` are now registered core modules (backed by
+    // node-stdlib/fs-promises.mjs, re-exporting fs.mjs's existing `promises` namespace both
+    // as named exports and as the default export, matching Node's `require('fs/promises')`
+    // shape) — but glob still doesn't run end-to-end: minimatch/path-scurry construct `new
+    // URL(...)` at module scope, and `URL` isn't exposed as a global in Mycelium's guest
+    // environment (only importable via the `url` core module, per the project's TODO —
+    // "GraalJS ships no URL/URLSearchParams globals"). Open gap, not part of this sweep. ---
 
-    @Test fun globFailsOnMissingFsPromisesModule() {
+    @Test fun globFailsOnMissingUrlGlobal() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-glob-")
@@ -617,19 +635,31 @@ class NpmCompatibilityTest {
                 """.trimIndent()
             )
         }
+        assertFalse(
+            ex.message!!.contains("fs/promises"),
+            "fs/promises should now resolve — unexpected error: ${ex.message}"
+        )
         assertTrue(
-            ex.message!!.contains("unknown core module 'node:fs/promises'"),
+            ex.message!!.contains("URL is not defined"),
             "unexpected error: ${ex.message}"
         )
     }
 
-    // --- 17. pino — fast logger, uses stream/os/events/sonic-boom. FAILS: pino's core
-    // (lib/tools.js, imported at module scope from pino.js) does
-    // `require('node:diagnostics_channel')` — a core module Mycelium doesn't register at
+    // --- 17. pino — fast logger, uses stream/os/events/sonic-boom. Originally FAILED:
+    // pino's core (lib/tools.js, imported at module scope from pino.js) does
+    // `require('node:diagnostics_channel')` — a core module Mycelium didn't register at
     // all (not even a stub), unlike `tty` (registered specifically to unblock debug/chalk/
-    // express — see class doc above). ---
+    // express — see class doc above).
+    //
+    // `diagnostics_channel`/`node:diagnostics_channel` are now registered core modules
+    // (node-stdlib/diagnostics_channel.mjs — a genuinely-working pub/sub implementation,
+    // not just a stub: `channel`/`subscribe`/`publish`/`hasSubscribers`/`tracingChannel`
+    // all function, just with no built-in engine-instrumented channels firing
+    // automatically) — but pino still doesn't run end-to-end: its thread-transport
+    // machinery does `require('worker_threads')`, which isn't registered as a core module
+    // either. Open gap, not part of this sweep. ---
 
-    @Test fun pinoFailsOnMissingDiagnosticsChannelModule() {
+    @Test fun pinoFailsOnMissingWorkerThreadsModule() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-pino-")
@@ -646,9 +676,12 @@ class NpmCompatibilityTest {
                 """.trimIndent()
             )
         }
+        assertFalse(
+            ex.message!!.contains("diagnostics_channel"),
+            "diagnostics_channel should now resolve — unexpected error: ${ex.message}"
+        )
         assertTrue(
-            ex.message!!.contains("unknown core module 'node:diagnostics_channel'") ||
-                ex.message!!.contains("cannot find module 'node:diagnostics_channel'"),
+            ex.message!!.contains("worker_threads"),
             "unexpected error: ${ex.message}"
         )
     }
@@ -696,15 +729,24 @@ class NpmCompatibilityTest {
         assertEquals(21, result.length)
     }
 
-    // --- 20. inquirer — interactive prompts, uses readline/tty/stream/events. FAILS:
-    // inquirer's core (`@inquirer/core`, pulled in transitively) does
+    // --- 20. inquirer — interactive prompts, uses readline/tty/stream/events. Originally
+    // FAILED: inquirer's core (`@inquirer/core`, pulled in transitively) does
     // `require('node:async_hooks')` (used for its `AsyncLocalStorage`-based prompt-context
-    // tracking) at module scope, and `async_hooks` isn't among Mycelium's synthetic core
+    // tracking) at module scope, and `async_hooks` wasn't among Mycelium's synthetic core
     // modules — a separate gap from the `tty` one debug/chalk/express already exercise (see
-    // class doc above); `tty` alone isn't enough for inquirer to load. Only checks that
-    // importing the module fails at load time — no interactive prompt is attempted. ---
+    // class doc above); `tty` alone wasn't enough for inquirer to load.
+    //
+    // `async_hooks`/`node:async_hooks` are now registered core modules (node-stdlib/
+    // async_hooks.mjs — `AsyncLocalStorage` genuinely threads a "current store" through
+    // synchronous `run()`/`getStore()`/`enterWith()` calls via a push/pop stack;
+    // `createHook`/`executionAsyncId`/`triggerAsyncId`/`AsyncResource` are present as inert
+    // stubs since GraalJS has no underlying async-resource hooks to wire real tracking to)
+    // — but inquirer still doesn't run end-to-end: it also needs `node:readline`, which
+    // isn't registered as a core module either. Open gap, not part of this sweep. Only
+    // checks that importing the module fails at load time — no interactive prompt is
+    // attempted. ---
 
-    @Test fun inquirerFailsOnMissingAsyncHooksModule() {
+    @Test fun inquirerFailsOnMissingReadlineModule() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-inquirer-")
@@ -719,8 +761,12 @@ class NpmCompatibilityTest {
                 """.trimIndent()
             )
         }
+        assertFalse(
+            ex.message!!.contains("async_hooks"),
+            "async_hooks should now resolve — unexpected error: ${ex.message}"
+        )
         assertTrue(
-            ex.message!!.contains("unknown core module 'node:async_hooks'"),
+            ex.message!!.contains("node:readline"),
             "unexpected error: ${ex.message}"
         )
     }

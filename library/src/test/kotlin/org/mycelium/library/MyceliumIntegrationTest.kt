@@ -1011,6 +1011,64 @@ class MyceliumIntegrationTest {
         assertEquals("[1,1,1]", mc.eval("js", "globalThis.__bufAlloc").asString())
     }
 
+    @Test fun bufferTypedReadWrite() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Buffer } from 'buffer';
+
+            const buf = Buffer.alloc(10);
+            buf.writeUInt32BE(0x01020304, 0);
+            buf.writeInt16LE(-1234, 4);
+            buf.writeFloatBE(1.5, 6);
+
+            globalThis.__u32be = buf.readUInt32BE(0);
+            globalThis.__i16le = buf.readInt16LE(4);
+
+            const bigBuf = Buffer.alloc(8);
+            bigBuf.writeBigUInt64BE(1n, 0);
+            globalThis.__bigU64 = bigBuf.readBigUInt64BE(0).toString();
+
+            const negBig = Buffer.alloc(8);
+            negBig.writeBigInt64LE(-5n, 0);
+            globalThis.__bigI64 = negBig.readBigInt64LE(0).toString();
+        """.trimIndent())
+        assertEquals(0x01020304, mc.eval("js", "globalThis.__u32be").asInt())
+        assertEquals(-1234, mc.eval("js", "globalThis.__i16le").asInt())
+        assertEquals("1", mc.eval("js", "globalThis.__bigU64").asString())
+        assertEquals("-5", mc.eval("js", "globalThis.__bigI64").asString())
+    }
+
+    @Test fun bufferSwapAndLastIndexOfAndStatics() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Buffer } from 'buffer';
+
+            const swap16Buf = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+            swap16Buf.swap16();
+            globalThis.__swap16 = JSON.stringify(Array.from(swap16Buf));
+
+            const swap32Buf = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+            swap32Buf.swap32();
+            globalThis.__swap32 = JSON.stringify(Array.from(swap32Buf));
+
+            const lastIdxBuf = Buffer.from('abcabc');
+            globalThis.__lastIndexOf = lastIdxBuf.lastIndexOf('bc');
+
+            globalThis.__bufferOf = JSON.stringify(Array.from(Buffer.of(1, 2, 3)));
+
+            const typed = new Uint8Array([9, 8, 7, 6]);
+            globalThis.__copyBytesFrom = JSON.stringify(Array.from(Buffer.copyBytesFrom(typed, 1, 2)));
+
+            globalThis.__toJSON = JSON.stringify(Buffer.from([1, 2, 3]).toJSON());
+        """.trimIndent())
+        assertEquals("[2,1,4,3]", mc.eval("js", "globalThis.__swap16").asString())
+        assertEquals("[4,3,2,1]", mc.eval("js", "globalThis.__swap32").asString())
+        assertEquals(4, mc.eval("js", "globalThis.__lastIndexOf").asInt())
+        assertEquals("[1,2,3]", mc.eval("js", "globalThis.__bufferOf").asString())
+        assertEquals("[8,7]", mc.eval("js", "globalThis.__copyBytesFrom").asString())
+        assertEquals("{\"type\":\"Buffer\",\"data\":[1,2,3]}", mc.eval("js", "globalThis.__toJSON").asString())
+    }
+
     // --- Node stdlib `url` module ---
 
     @Test fun importUrlModule() {
@@ -1096,6 +1154,141 @@ class MyceliumIntegrationTest {
         assertEquals("function", mc.eval("js", "globalThis.__streamDuplexType").asString())
         assertEquals("function", mc.eval("js", "globalThis.__streamTransformType").asString())
         assertEquals("function", mc.eval("js", "globalThis.__streamPassThroughType").asString())
+    }
+
+    @Test fun streamReadableDestroyLifecycle() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Readable } from 'stream';
+
+            const readable = new Readable({ read() {} });
+            let sawError = null;
+            let sawClose = false;
+            readable.on('error', (err) => { sawError = err.message; });
+            readable.on('close', () => { sawClose = true; });
+
+            globalThis.__readableDestroyedBefore = readable.destroyed;
+            readable.destroy(new Error('boom'));
+            globalThis.__readableDestroyedAfter = () => readable.destroyed;
+            globalThis.__readableClosed = () => readable.closed;
+            globalThis.__readableErroredMessage = () => (readable.errored ? readable.errored.message : null);
+            globalThis.__readableSawError = () => sawError;
+            globalThis.__readableSawClose = () => sawClose;
+            globalThis.__readableGetter = () => readable.readable;
+        """.trimIndent())
+        assertFalse(mc.eval("js", "globalThis.__readableDestroyedBefore").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__readableDestroyedAfter()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__readableClosed()").asBoolean())
+        assertEquals("boom", mc.eval("js", "globalThis.__readableErroredMessage()").asString())
+        assertEquals("boom", mc.eval("js", "globalThis.__readableSawError()").asString())
+        assertTrue(mc.eval("js", "globalThis.__readableSawClose()").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__readableGetter()").asBoolean())
+    }
+
+    @Test fun streamReadableSetEncodingAndProperties() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Readable } from 'stream';
+
+            const chunks = [];
+            const readable = new Readable({ read() {} });
+            readable.setEncoding('utf8');
+            readable.on('data', (chunk) => { chunks.push(typeof chunk); });
+            readable.push(Buffer.from('hi'));
+            readable.push(null);
+
+            globalThis.__readableHighWaterMark = readable.readableHighWaterMark;
+            globalThis.__readableObjectMode = readable.readableObjectMode;
+            globalThis.__readableChunkTypes = () => JSON.stringify(chunks);
+            globalThis.__readableEnded = () => readable.readableEnded;
+        """.trimIndent())
+        assertEquals(16384, mc.eval("js", "globalThis.__readableHighWaterMark").asInt())
+        assertFalse(mc.eval("js", "globalThis.__readableObjectMode").asBoolean())
+        assertEquals("[\"string\"]", mc.eval("js", "globalThis.__readableChunkTypes()").asString())
+        assertTrue(mc.eval("js", "globalThis.__readableEnded()").asBoolean())
+    }
+
+    @Test fun streamWritableDestroyLifecycle() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Writable } from 'stream';
+
+            const writable = new Writable({ write(chunk, enc, cb) { cb(); } });
+            let sawClose = false;
+            writable.on('close', () => { sawClose = true; });
+
+            globalThis.__writableBefore = writable.writable;
+            writable.destroy();
+            globalThis.__writableAfter = () => writable.writable;
+            globalThis.__writableDestroyed = () => writable.destroyed;
+            globalThis.__writableClosed = () => writable.closed;
+            globalThis.__writableSawClose = () => sawClose;
+            globalThis.__writableHighWaterMark = writable.writableHighWaterMark;
+            globalThis.__writableCorked = () => { writable.cork(); return writable.writableCorked; };
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__writableBefore").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__writableAfter()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__writableDestroyed()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__writableClosed()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__writableSawClose()").asBoolean())
+        assertEquals(16384, mc.eval("js", "globalThis.__writableHighWaterMark").asInt())
+        assertEquals(1, mc.eval("js", "globalThis.__writableCorked()").asInt())
+    }
+
+    @Test fun streamDuplexInheritsBothSides() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Duplex } from 'stream';
+
+            const duplex = new Duplex({
+                read() {},
+                write(chunk, enc, cb) { cb(); },
+            });
+            globalThis.__duplexReadable = duplex.readable;
+            globalThis.__duplexWritable = duplex.writable;
+            globalThis.__duplexDestroyedBefore = duplex.destroyed;
+            duplex.destroy();
+            globalThis.__duplexDestroyedAfter = () => duplex.destroyed;
+            globalThis.__duplexClosed = () => duplex.closed;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__duplexReadable").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__duplexWritable").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__duplexDestroyedBefore").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__duplexDestroyedAfter()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__duplexClosed()").asBoolean())
+    }
+
+    @Test fun streamFinishedAndPipelineAndReadableFrom() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Readable, Writable, finished, pipeline } from 'stream';
+
+            const readable = Readable.from(['a', 'b', 'c']);
+            const collected = [];
+            const writable = new Writable({
+                write(chunk, enc, cb) { collected.push(chunk); cb(); }
+            });
+
+            let finishedCalled = false;
+            let pipelineCalled = false;
+            let pipelineErr = 'unset';
+
+            pipeline(readable, writable, (err) => {
+                pipelineCalled = true;
+                pipelineErr = err;
+            });
+            finished(writable, () => { finishedCalled = true; });
+
+            globalThis.__pipelineCollected = () => collected.join('');
+            globalThis.__pipelineCalled = () => pipelineCalled;
+            globalThis.__pipelineErr = () => pipelineErr;
+            globalThis.__finishedCalled = () => finishedCalled;
+        """.trimIndent())
+        // Allow microtasks queued by pipeline/finished during the previous eval to settle.
+        assertEquals("abc", mc.eval("js", "globalThis.__pipelineCollected()").asString())
+        assertTrue(mc.eval("js", "globalThis.__pipelineCalled()").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__pipelineErr() === undefined || globalThis.__pipelineErr() === null").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__finishedCalled()").asBoolean())
     }
 
     // --- Node stdlib `crypto` module ---

@@ -167,8 +167,8 @@ class Buffer extends Uint8Array {
         return this.length < other.length ? -1 : 1;
     }
 
-    indexOf(value, byteOffset) {
-        const needle = valueToBytes(value, this);
+    indexOf(value, byteOffset, encoding) {
+        const needle = valueToBytes(value, encoding);
         const start = byteOffset || 0;
         outer: for (let i = start; i <= this.length - needle.length; i++) {
             for (let j = 0; j < needle.length; j++) {
@@ -333,6 +333,93 @@ class Buffer extends Uint8Array {
     writeDoubleLE(value, offset) {
         return writeFloatGeneric(this, value, offset || 0, true, 8);
     }
+
+    readBigInt64BE(offset) {
+        return dataViewFor(this, offset || 0, 8).getBigInt64(0, false);
+    }
+    readBigInt64LE(offset) {
+        return dataViewFor(this, offset || 0, 8).getBigInt64(0, true);
+    }
+    readBigUInt64BE(offset) {
+        return dataViewFor(this, offset || 0, 8).getBigUint64(0, false);
+    }
+    readBigUInt64LE(offset) {
+        return dataViewFor(this, offset || 0, 8).getBigUint64(0, true);
+    }
+    writeBigInt64BE(value, offset) {
+        const o = offset || 0;
+        dataViewFor(this, o, 8).setBigInt64(0, BigInt(value), false);
+        return o + 8;
+    }
+    writeBigInt64LE(value, offset) {
+        const o = offset || 0;
+        dataViewFor(this, o, 8).setBigInt64(0, BigInt(value), true);
+        return o + 8;
+    }
+    writeBigUInt64BE(value, offset) {
+        const o = offset || 0;
+        dataViewFor(this, o, 8).setBigUint64(0, BigInt(value), false);
+        return o + 8;
+    }
+    writeBigUInt64LE(value, offset) {
+        const o = offset || 0;
+        dataViewFor(this, o, 8).setBigUint64(0, BigInt(value), true);
+        return o + 8;
+    }
+
+    swap16() {
+        if (this.length % 2 !== 0) throw new RangeError("Buffer size must be a multiple of 16-bits");
+        for (let i = 0; i < this.length; i += 2) {
+            const tmp = this[i];
+            this[i] = this[i + 1];
+            this[i + 1] = tmp;
+        }
+        return this;
+    }
+
+    swap32() {
+        if (this.length % 4 !== 0) throw new RangeError("Buffer size must be a multiple of 32-bits");
+        for (let i = 0; i < this.length; i += 4) {
+            let tmp = this[i];
+            this[i] = this[i + 3];
+            this[i + 3] = tmp;
+            tmp = this[i + 1];
+            this[i + 1] = this[i + 2];
+            this[i + 2] = tmp;
+        }
+        return this;
+    }
+
+    swap64() {
+        if (this.length % 8 !== 0) throw new RangeError("Buffer size must be a multiple of 64-bits");
+        for (let i = 0; i < this.length; i += 8) {
+            for (let j = 0; j < 4; j++) {
+                const tmp = this[i + j];
+                this[i + j] = this[i + 7 - j];
+                this[i + 7 - j] = tmp;
+            }
+        }
+        return this;
+    }
+
+    lastIndexOf(value, byteOffset, encoding) {
+        const needle = valueToBytes(value, encoding);
+        if (needle.length === 0) return this.length;
+        let start = byteOffset === undefined || byteOffset === null ? this.length - needle.length : byteOffset;
+        if (start < 0) start = this.length + start;
+        start = Math.min(start, this.length - needle.length);
+        outer: for (let i = start; i >= 0; i--) {
+            for (let j = 0; j < needle.length; j++) {
+                if (this[i + j] !== needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+}
+
+function dataViewFor(buf, offset, byteSize) {
+    return new DataView(buf.buffer, buf.byteOffset + offset, byteSize);
 }
 
 function readFloatGeneric(buf, offset, littleEndian, byteSize) {
@@ -356,8 +443,8 @@ function normalizeEnd(end, len) {
     return end < 0 ? Math.max(0, len + end) : Math.min(end, len);
 }
 
-function valueToBytes(value, referenceBuffer) {
-    if (typeof value === "string") return encodeStringToBytes(value, "utf8");
+function valueToBytes(value, encoding) {
+    if (typeof value === "string") return encodeStringToBytes(value, encoding || "utf8");
     if (typeof value === "number") return new Uint8Array([value & 0xff]);
     return value;
 }
@@ -413,6 +500,22 @@ Buffer.from = function (value, encodingOrOffset, length) {
 
 Buffer.isBuffer = function (obj) {
     return obj instanceof Buffer;
+};
+
+Buffer.of = function (...items) {
+    return Buffer.from(items);
+};
+
+Buffer.copyBytesFrom = function (source, sourceStart, sourceLength) {
+    const bytesPerElement = source.BYTES_PER_ELEMENT || 1;
+    const start = sourceStart || 0;
+    const length = sourceLength === undefined ? source.length - start : sourceLength;
+    const byteOffset = (source.byteOffset || 0) + start * bytesPerElement;
+    const byteLen = length * bytesPerElement;
+    const bytes = new Uint8Array(source.buffer, byteOffset, byteLen);
+    const buf = new Buffer(byteLen);
+    buf.set(bytes);
+    return buf;
 };
 
 Buffer.byteLength = function (string, encoding) {

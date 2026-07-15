@@ -123,13 +123,82 @@ class Readable extends Stream {
         super();
         options = options || {};
         this._readImpl = options.read;
+        this._destroyImpl = options.destroy;
         this._buffer = [];
         this._ended = false;
         this._reading = false;
         this._flowing = false;
         this._encoding = options.encoding || null;
+        this._highWaterMark = options.highWaterMark !== undefined ? options.highWaterMark : 16384;
+        this._objectMode = !!options.objectMode;
+        this._destroyed = false;
+        this._closed = false;
+        this._errored = null;
         this.readableEnded = false;
         this.readableFlowing = null;
+    }
+
+    get destroyed() {
+        return !!this._destroyed;
+    }
+
+    set destroyed(value) {
+        this._destroyed = value;
+    }
+
+    get closed() {
+        return !!this._closed;
+    }
+
+    get errored() {
+        return this._errored || null;
+    }
+
+    get readable() {
+        return !this.destroyed && !this._ended;
+    }
+
+    get readableHighWaterMark() {
+        return this._highWaterMark;
+    }
+
+    get readableLength() {
+        let len = 0;
+        for (const chunk of this._buffer) {
+            len += chunk && chunk.length !== undefined ? chunk.length : 1;
+        }
+        return len;
+    }
+
+    get readableObjectMode() {
+        return this._objectMode;
+    }
+
+    setEncoding(encoding) {
+        this._encoding = encoding;
+        return this;
+    }
+
+    destroy(err) {
+        if (this.destroyed) return this;
+        this._destroyed = true;
+        const afterDestroy = (destroyErr) => {
+            const finalErr = destroyErr || err;
+            if (finalErr) {
+                this._errored = finalErr;
+                this.emit("error", finalErr);
+            }
+            this._closed = true;
+            this.emit("close");
+        };
+        if (typeof this._destroy === "function") {
+            this._destroy(err || null, afterDestroy);
+        } else if (typeof this._destroyImpl === "function") {
+            this._destroyImpl.call(this, err || null, afterDestroy);
+        } else {
+            afterDestroy(null);
+        }
+        return this;
     }
 
     _read(size) {
@@ -147,6 +216,9 @@ class Readable extends Stream {
             this._ended = true;
             if (this._flowing) nextTick(() => this._flow());
             return false;
+        }
+        if (this._encoding && typeof chunk !== "string" && chunk && typeof chunk.toString === "function") {
+            chunk = chunk.toString(this._encoding);
         }
         this._buffer.push(chunk);
         if (this._flowing) nextTick(() => this._flow());
@@ -248,8 +320,32 @@ class Readable extends Stream {
         };
     }
 
-    static from(iterable) {
-        const readable = new Readable();
+    static from(iterable, options) {
+        const readable = new Readable(options);
+        if (iterable && typeof iterable[Symbol.asyncIterator] === "function") {
+            const iterator = iterable[Symbol.asyncIterator]();
+            readable._read = function () {
+                iterator.next().then(
+                    (res) => {
+                        if (res.done) this.push(null);
+                        else this.push(res.value);
+                    },
+                    (err) => {
+                        this.emit("error", err);
+                    },
+                );
+            };
+            return readable;
+        }
+        if (iterable && typeof iterable[Symbol.iterator] === "function" && !Array.isArray(iterable)) {
+            const iterator = iterable[Symbol.iterator]();
+            readable._read = function () {
+                const res = iterator.next();
+                if (res.done) this.push(null);
+                else this.push(res.value);
+            };
+            return readable;
+        }
         const items = Array.isArray(iterable) ? iterable.slice() : Array.from(iterable);
         readable._read = function () {
             if (items.length === 0) {
@@ -268,10 +364,75 @@ class Writable extends Stream {
         options = options || {};
         this._writeImpl = options.write;
         this._finalImpl = options.final;
+        this._destroyImpl = options.destroy;
         this.writableEnded = false;
         this.writableFinished = false;
         this._corked = 0;
         this._pending = [];
+        this._highWaterMark = options.highWaterMark !== undefined ? options.highWaterMark : 16384;
+        this._objectMode = !!options.objectMode;
+        this._writableLength = 0;
+        this._destroyed = false;
+        this._closed = false;
+        this._errored = null;
+    }
+
+    get destroyed() {
+        return !!this._destroyed;
+    }
+
+    set destroyed(value) {
+        this._destroyed = value;
+    }
+
+    get closed() {
+        return !!this._closed;
+    }
+
+    get errored() {
+        return this._errored || null;
+    }
+
+    get writable() {
+        return !this.destroyed && !this.writableEnded;
+    }
+
+    get writableHighWaterMark() {
+        return this._highWaterMark;
+    }
+
+    get writableLength() {
+        return this._writableLength;
+    }
+
+    get writableObjectMode() {
+        return this._objectMode;
+    }
+
+    get writableCorked() {
+        return this._corked;
+    }
+
+    destroy(err) {
+        if (this.destroyed) return this;
+        this._destroyed = true;
+        const afterDestroy = (destroyErr) => {
+            const finalErr = destroyErr || err;
+            if (finalErr) {
+                this._errored = finalErr;
+                this.emit("error", finalErr);
+            }
+            this._closed = true;
+            this.emit("close");
+        };
+        if (typeof this._destroy === "function") {
+            this._destroy(err || null, afterDestroy);
+        } else if (typeof this._destroyImpl === "function") {
+            this._destroyImpl.call(this, err || null, afterDestroy);
+        } else {
+            afterDestroy(null);
+        }
+        return this;
     }
 
     _write(chunk, encoding, callback) {
@@ -293,7 +454,10 @@ class Writable extends Stream {
             if (callback) callback(err);
             return false;
         }
+        const chunkLength = chunk && chunk.length !== undefined ? chunk.length : 1;
+        this._writableLength += chunkLength;
         this._write(chunk, encoding || "utf8", (err) => {
+            this._writableLength -= chunkLength;
             if (err) {
                 this.emit("error", err);
             }
@@ -346,12 +510,21 @@ class Duplex extends Readable {
         this._finalImpl = options.final;
         this.writableEnded = false;
         this.writableFinished = false;
+        this._corked = 0;
+        this._pending = [];
+        this._writableLength = 0;
     }
 }
 // Mix Writable's instance methods onto Duplex's prototype (rather than attempting real
-// multiple inheritance, which JS classes don't support).
+// multiple inheritance, which JS classes don't support). `destroy`/`destroyed`/`closed`/
+// `errored` are shared concepts already provided via the Readable prototype chain (both
+// classes use the same backing field names), so they're deliberately left out here.
 for (const name of ["_write", "write", "end", "cork", "uncork"]) {
     Duplex.prototype[name] = Writable.prototype[name];
+}
+// Mix in Writable-only getters (readable-side equivalents already come from Readable).
+for (const name of ["writable", "writableHighWaterMark", "writableLength", "writableObjectMode", "writableCorked"]) {
+    Object.defineProperty(Duplex.prototype, name, Object.getOwnPropertyDescriptor(Writable.prototype, name));
 }
 
 class Transform extends Duplex {
@@ -440,19 +613,57 @@ class PassThrough extends Transform {
     }
 }
 
-function finished(stream, callback) {
+// `finished(stream, [options], callback)` resolves once `stream` reaches a terminal
+// state — mirrors Node's `stream.finished`, including firing immediately (on a fresh
+// tick, to keep the callback always-async) when the stream has already finished/ended/
+// errored/closed by the time this is called, since callers frequently attach it after
+// the terminal event already fired synchronously elsewhere.
+function finished(stream, options, callback) {
+    if (typeof options === "function") {
+        callback = options;
+        options = undefined;
+    }
+    options = options || {};
     let called = false;
     const done = (err) => {
         if (called) return;
         called = true;
+        cleanup();
         callback(err);
     };
-    stream.once("end", () => done());
-    stream.once("finish", () => done());
-    stream.once("error", (err) => done(err));
-    stream.once("close", () => done());
+    const onEnd = () => done();
+    const onFinish = () => done();
+    const onError = (err) => done(err);
+    const onClose = () => done(stream.errored || undefined);
+    const cleanup = () => {
+        stream.removeListener("end", onEnd);
+        stream.removeListener("finish", onFinish);
+        stream.removeListener("error", onError);
+        stream.removeListener("close", onClose);
+    };
+    stream.once("end", onEnd);
+    stream.once("finish", onFinish);
+    stream.once("error", onError);
+    stream.once("close", onClose);
+
+    const alreadyDone =
+        (options.readable !== false && stream.readableEnded) ||
+        (options.writable !== false && stream.writableFinished) ||
+        stream.destroyed ||
+        stream.errored;
+    if (alreadyDone) {
+        nextTick(() => done(stream.errored || undefined));
+    }
+
+    return () => {
+        cleanup();
+    };
 }
 
+// `pipeline(source, ...transforms, dest, callback)` chains `.pipe()` calls and, when a
+// callback is given, both resolves it once the last stream finishes (via `finished`
+// above) and destroys every stream in the chain if any of them errors — mirrors Node's
+// automatic cleanup-on-error behavior for `stream.pipeline`.
 function pipeline(...args) {
     const callback = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
     const streams = args;
@@ -461,7 +672,24 @@ function pipeline(...args) {
         current = current.pipe(streams[i]);
     }
     if (callback) {
-        finished(streams[streams.length - 1], callback);
+        const last = streams[streams.length - 1];
+        let called = false;
+        const onDone = (err) => {
+            if (called) return;
+            called = true;
+            if (err) {
+                for (const s of streams) {
+                    if (typeof s.destroy === "function") s.destroy();
+                }
+            }
+            callback(err);
+        };
+        finished(last, onDone);
+        for (const s of streams) {
+            if (typeof s.on === "function") {
+                s.on("error", onDone);
+            }
+        }
     }
     return current;
 }

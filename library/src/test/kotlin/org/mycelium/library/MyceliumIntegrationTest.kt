@@ -613,6 +613,84 @@ class MyceliumIntegrationTest {
         assertEquals(9, result.asInt())
     }
 
+    // --- CJS -> ESM transpilation (via esbuild, see CjsCompiler) ---
+
+    @Test fun jsImportsCjsModule() {
+        val mc = vm
+        val path = testResourcePath("cjs-add.js")
+        runJsWithImports(mc, """
+            import cjsAdd from "$path";
+            globalThis.__cjsResult = cjsAdd.add(4, 5);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__cjsResult")
+        assertEquals(9, result.asInt())
+    }
+
+    @Test fun jsImportsCjsModuleWithExportsAssignments() {
+        val mc = vm
+        val path = testResourcePath("cjs-module.js")
+        runJsWithImports(mc, """
+            import cjsModule from "$path";
+            globalThis.__cjsAddResult = cjsModule.add(2, 3);
+            globalThis.__cjsGreeting = cjsModule.greeting;
+        """.trimIndent())
+        assertEquals(5, mc.eval("js", "globalThis.__cjsAddResult").asInt())
+        assertEquals("hello from CJS", mc.eval("js", "globalThis.__cjsGreeting").asString())
+    }
+
+    @Test fun cjsModuleCanRequireRelativeCjsModule() {
+        val mc = vm
+        val path = testResourcePath("cjs-requires-relative.js")
+        runJsWithImports(mc, """
+            import mod from "$path";
+            globalThis.__cjsRequireResult = mod.addTwice(3, 4);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__cjsRequireResult")
+        assertEquals(14, result.asInt())
+    }
+
+    // --- Node stdlib `path` module ---
+
+    @Test fun importPathModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import path from 'path';
+            globalThis.__pathJoinResult = path.join('/foo', 'bar', 'baz.js');
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__pathJoinResult")
+        assertEquals("/foo/bar/baz.js", result.asString())
+    }
+
+    @Test fun importNodePrefixedPath() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { dirname, basename, extname } from 'node:path';
+            globalThis.__pathPartsResult =
+                JSON.stringify([dirname('/foo/bar.js'), basename('/foo/bar.js'), extname('/foo/bar.js')]);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__pathPartsResult")
+        assertEquals("""["/foo","bar.js",".js"]""", result.asString())
+    }
+
+    @Test fun cjsModuleCanRequirePathCoreModule() {
+        val mc = vm
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-cjs-require-path-").toFile()
+        tmpDir.deleteOnExit()
+        val cjsFile = File(tmpDir, "uses-path.js")
+        cjsFile.writeText("""
+            const path = require('path');
+            module.exports = { joined: path.join('a', 'b', 'c.js') };
+        """.trimIndent())
+        cjsFile.deleteOnExit()
+
+        runJsWithImports(mc, """
+            import mod from "${cjsFile.absolutePath}";
+            globalThis.__cjsPathResult = mod.joined;
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__cjsPathResult")
+        assertEquals("a/b/c.js", result.asString())
+    }
+
     @Test fun nonexistentBareSpecifierGivesFriendlyError() {
         val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-missing-").toFile()
         tmpDir.deleteOnExit()

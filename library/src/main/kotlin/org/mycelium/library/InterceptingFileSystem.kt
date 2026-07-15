@@ -1,6 +1,7 @@
 package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
+import java.io.File
 import java.net.URI
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.DirectoryStream.Filter
@@ -55,7 +56,17 @@ class InterceptingFileSystem : FileSystem {
     // string's first character, distinguishes a real filesystem path (file:, or no
     // scheme at all) from our synthetic http(s)-as-import-URL convention.
     override fun parsePath(uri: URI): Path =
-        if (uri.scheme == null || uri.scheme == "file") Path.of(uri) else Path.of("/.mycelium/$uri")
+        when {
+            uri.scheme == null || uri.scheme == "file" -> Path.of(uri)
+            // GraalJS treats any import specifier containing a colon (e.g. "node:path") as
+            // an absolute URI rather than a bare specifier, routing it here instead of
+            // parsePath(String) — so the "node:"-prefixed core module form has to be
+            // handled in this overload too.
+            uri.scheme == "node" -> coreModules["node:${uri.schemeSpecificPart}"]
+                ?.let { syntheticCoreModulePath(it) }
+                ?: throw MyceliumException("mycelium: unknown core module 'node:${uri.schemeSpecificPart}'")
+            else -> Path.of("/.mycelium/$uri")
+        }
 
     override fun parsePath(path: String): Path {
         // Guest languages' own runtimes (e.g. LLVM loading its internal bitcode libraries)
@@ -71,6 +82,7 @@ class InterceptingFileSystem : FileSystem {
         // we're in an npm-style project (some ancestor has a `node_modules` dir) do we
         // treat a missing package as an error worth surfacing.
         if (isBareSpecifier(path)) {
+            coreModules[path]?.let { return syntheticCoreModulePath(it) }
             val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
             when (val resolution = resolveNodeModule(path, fromDir)) {
                 is NodeModuleResolution.Found -> return resolution.path
@@ -178,7 +190,156 @@ class InterceptingFileSystem : FileSystem {
         return packageDir.resolve(entry).normalize()
     }
 
+    // Node stdlib modules Mycelium ships as synthetic ESM resources rather than resolving
+    // through node_modules — see library/src/main/resources/node-stdlib/. Both the bare
+    // ("path") and "node:"-prefixed forms are accepted, per Node's own convention.
+    private val coreModules = mapOf(
+        "path" to "path.mjs",
+        "node:path" to "path.mjs",
+    )
+
+    private fun syntheticCoreModulePath(resourceFile: String): Path =
+        Path.of("$CORE_MODULE_PREFIX$resourceFile")
+
+    private fun readCoreModule(path: Path): SeekableByteChannel {
+        val resourceName = path.toString().removePrefix(CORE_MODULE_PREFIX)
+        val stream = javaClass.classLoader.getResourceAsStream("node-stdlib/$resourceName")
+            ?: throw MyceliumException("mycelium: unknown core module resource '$resourceName'")
+        val content = stream.use { it.readBytes() }.toString(StandardCharsets.UTF_8)
+        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
+    }
+
+    // Decides whether a `.js`/`.cjs` file should be treated as CommonJS (and therefore
+    // transpiled to ESM before GraalJS sees it). `.mjs` is always ESM, `.cjs` is always
+    // CommonJS; for plain `.js`, Node's own rule applies — walk up to the nearest ancestor
+    // `package.json` and check its `"type"` field, defaulting to CommonJS when absent
+    // (either because there's no package.json at all, or it doesn't say `"type": "module"`).
+    private fun isCjsFile(path: Path): Boolean {
+        when (path.extension) {
+            "mjs" -> return false
+            "cjs" -> return true
+            "js" -> {}
+            else -> return false
+        }
+        var dir = path.parent
+        while (dir != null) {
+            val packageJson = dir.resolve("package.json")
+            if (Files.exists(packageJson)) {
+                return try {
+                    val json = packageJson.readText()
+                    context!!.eval("js", PACKAGE_TYPE_RESOLVER).execute(json).asString() != "module"
+                } catch (e: Exception) {
+                    true
+                }
+            }
+            dir = dir.parent
+        }
+        return true
+    }
+
+    // Backs the `require` shim InterceptingFileSystem prepends to transpiled CJS output
+    // (see the CJS branch of newByteChannel) — wired up as the JS global
+    // `__mycelium_require__` in Mycelium.init. `fromDirStr` is the requiring file's own
+    // directory, captured at transpile time (not the source-directory stack, which has
+    // already been popped by the time the transpiled module's top-level code — including
+    // its `require(...)` calls — actually runs).
+    fun requireModule(specifier: String, fromDirStr: String): org.graalvm.polyglot.Value {
+        val fromDir = Path.of(fromDirStr)
+        val resolved = resolveRequireTarget(specifier, fromDir)
+        val content = readChannelToString(newByteChannel(resolved, setOf(StandardOpenOption.READ)))
+        // The content newByteChannel hands back here is always ESM (either genuinely
+        // authored as such, or CJS already transpiled to ESM by the branch above) — but
+        // `resolved`'s own extension may still say otherwise (e.g. a plain `.js` CJS
+        // file). Mirrors Mycelium.evalModule: writing to a real, `.mjs`-suffixed temp
+        // file (rather than an in-memory CharSequence Source) is what actually makes
+        // GraalJS both parse it as a module *and* hand context.eval() back the
+        // module's namespace object instead of `undefined` — a bare `.mimeType(...)`
+        // hint on a CharSequence Source was tried and evaluated fine but returned an
+        // empty namespace. The temp file is created alongside `resolved` (not in a
+        // generic system tmp dir) so any relative imports inside `content` keep
+        // resolving against the right base directory.
+        // Core modules live at a synthetic path with no real parent directory on disk (and
+        // have no relative imports of their own to resolve), so their temp file goes in
+        // the system temp dir instead of alongside a nonexistent "resolved.parent".
+        val tmpFileDir = if (resolved.startsWith(CORE_MODULE_PREFIX)) null else (resolved.parent ?: resolved).toFile()
+        val tmpFile = File.createTempFile("mycelium-require-", ".mjs", tmpFileDir)
+        val value = try {
+            tmpFile.writeText(content)
+            context!!.eval(Source.newBuilder("js", tmpFile).build())
+        } finally {
+            tmpFile.delete()
+        }
+        // Mirrors Node's CJS/ESM interop: a module with a default export (which is what
+        // our CJS transpile always produces — the original `module.exports` value) hands
+        // that back verbatim; a module with only named exports (e.g. a core module like
+        // `path`) hands back its whole namespace object instead.
+        return if (value.hasMember("default")) value.getMember("default") else value
+    }
+
+    // Escapes `s` as a JS double-quoted string literal, for splicing an arbitrary
+    // filesystem path into generated JS source text.
+    private fun jsonStringLiteral(s: String): String =
+        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+    private fun readChannelToString(channel: SeekableByteChannel): String {
+        // Both SeekableByteChannel implementations InterceptingFileSystem hands out
+        // (ReadOnlyBufferChannel, HttpChannel) fill the destination buffer's backing
+        // array directly without advancing its position — relying on `hasRemaining()`
+        // to drive the read loop (as ordinary SeekableByteChannel consumers do) would
+        // spin the buffer's position at 0 forever. Advance it manually from each call's
+        // return value instead.
+        val size = channel.size().toInt()
+        val buffer = java.nio.ByteBuffer.allocate(size)
+        channel.use {
+            var total = 0
+            while (total < size) {
+                val n = it.read(buffer)
+                if (n < 0) break
+                total += n
+                buffer.position(total)
+            }
+        }
+        buffer.flip()
+        return StandardCharsets.UTF_8.decode(buffer).toString()
+    }
+
+    // Resolves a `require()` specifier the same way Node would: relative/absolute paths
+    // resolve against the requiring file's directory (trying a few conventional
+    // extensions if the exact path doesn't exist), core modules resolve to their
+    // synthetic resource path, and everything else resolves via the same node_modules
+    // walk bare ESM imports use.
+    private fun resolveRequireTarget(specifier: String, fromDir: Path): Path {
+        if (specifier.startsWith(".") || specifier.startsWith("/")) {
+            val candidate = fromDir.resolve(specifier).normalize()
+            if (Files.exists(candidate) || candidate.extension.isNotEmpty()) return candidate
+            for (ext in listOf("js", "cjs", "mjs", "json")) {
+                val withExt = Path.of("$candidate.$ext")
+                if (Files.exists(withExt)) return withExt
+            }
+            val indexJs = candidate.resolve("index.js")
+            if (Files.exists(indexJs)) return indexJs
+            return candidate
+        }
+        coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
+        return when (val resolution = resolveNodeModule(specifier, fromDir)) {
+            is NodeModuleResolution.Found -> resolution.path
+            is NodeModuleResolution.PackageNotFound, NodeModuleResolution.NoNodeModulesTree ->
+                throw MyceliumException(
+                    "mycelium: cannot find module '$specifier' required from '$fromDir'"
+                )
+        }
+    }
+
     companion object {
+        private const val CORE_MODULE_PREFIX = "/.mycelium-core/"
+
+        private val PACKAGE_TYPE_RESOLVER = """
+            (function (json) {
+                try { return JSON.parse(json).type || "commonjs"; }
+                catch (e) { return "commonjs"; }
+            })
+        """.trimIndent()
+
         private val ENTRY_POINT_RESOLVER = """
             (function (json) {
                 var pkg = JSON.parse(json);
@@ -214,12 +375,17 @@ class InterceptingFileSystem : FileSystem {
         // Resolve relative paths against the currently-loading file's directory (if known)
         // rather than the process's working directory, before doing anything else.
         val path = if (rawPath.isAbsolute) rawPath else toAbsolutePath(rawPath)
-        val pushed = path.isAbsolute && !path.startsWith("/.mycelium/")
+        val pushed = path.isAbsolute && !path.startsWith("/.mycelium/") && !path.startsWith(CORE_MODULE_PREFIX)
         if (pushed) {
             val parent = path.parent ?: path
             sourceDirectoryStack.get().addFirst(parent)
         }
         try {
+            // Node stdlib modules (`path`, ...) are served from bundled resources rather
+            // than the real filesystem — see readCoreModule / the coreModules map above.
+            if (path.startsWith(CORE_MODULE_PREFIX)) {
+                return readCoreModule(path)
+            }
             // TypeScript is transpiled to plain JS via esbuild before GraalJS ever sees it —
             // GraalJS itself has no TypeScript support. This only strips types/syntax (no
             // bundling), so import specifiers inside the output are left for
@@ -231,6 +397,25 @@ class InterceptingFileSystem : FileSystem {
             ) {
                 val js = TsCompiler.transpile(path)
                 return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
+            }
+            // CommonJS (require()/module.exports) source is transpiled to ESM via esbuild
+            // before GraalJS ever sees it — see CjsCompiler for why `bundle = false` is
+            // used and what shape the output takes. The one thing that transpile leaves
+            // unresolved is the free `require` identifier itself, so a small shim
+            // (closing over this file's own directory, since the source-directory stack
+            // will have already unwound by the time this code actually runs) is prepended
+            // ahead of it, backed by the `__mycelium_require__` global Mycelium.init wires
+            // up to InterceptingFileSystem.requireModule.
+            if (!path.startsWith("/.mycelium/") &&
+                isCjsFile(path) &&
+                !options.contains(StandardOpenOption.WRITE) &&
+                !options.contains(StandardOpenOption.CREATE)
+            ) {
+                val js = CjsCompiler.transpile(path)
+                val dir = (path.parent ?: path).toString()
+                val requireShim = "function require(id) { " +
+                    "return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); }\n"
+                return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(requireShim + js))
             }
             val mc = mycelium!!
             val frames = mutableListOf<String>()

@@ -27,6 +27,16 @@ class Mycelium(
         Context.newBuilder()
             .allowAllAccess(true)
             .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
+            // Unrelated to js.commonjs-require above (which swaps the module *loader* and
+            // breaks cross-language imports). This only changes what Context#eval hands
+            // back for a Source that turns out to be an ES module: the module's namespace
+            // object (so host code can read named/default exports off the returned Value)
+            // instead of `undefined` (an ES module's top level has no completion value).
+            // Needed by InterceptingFileSystem.requireModule, which evaluates a resolved
+            // module directly from Kotlin (unlike ordinary `import`, which GraalJS's own
+            // module linker resolves internally without ever handing Java-side code a
+            // Value to inspect).
+            .option("js.esm-eval-returns-exports", "true")
             .build()
 
     private val extensionMap: Map<String, LanguageSupport> =
@@ -38,11 +48,18 @@ class Mycelium(
         evalModule(lang, code)
     }
 
+    // Backs the `require` shim InterceptingFileSystem prepends to every transpiled CJS
+    // module — see InterceptingFileSystem.requireModule / newByteChannel's CJS branch.
+    private val requireFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        filesystem.requireModule(args[0].asString(), args[1].asString())
+    }
+
     init {
         filesystem.init(context, this)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
+        context.getBindings("js").putMember("__mycelium_require__", requireFn)
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]

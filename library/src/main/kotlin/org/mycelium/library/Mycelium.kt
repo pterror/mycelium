@@ -87,6 +87,7 @@ class Mycelium(
         context.eval("js", TEXT_ENCODING_INIT_SCRIPT)
         context.eval("js", TIMERS_INIT_SCRIPT)
         context.eval("js", GLOBAL_BUFFER_INIT_SCRIPT)
+        context.eval("js", GLOBAL_URL_INIT_SCRIPT)
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
@@ -714,6 +715,29 @@ class Mycelium(
             (function () {
                 if (typeof globalThis.Buffer === 'undefined') {
                     globalThis.Buffer = globalThis.__mycelium_require__('buffer', '/').Buffer;
+                }
+            })();
+        """.trimIndent()
+
+        // Exposes `URL`/`URLSearchParams` as bare globals — GraalJS ships no such globals
+        // itself (only reachable via the `url` core module), unlike Node.js and browsers,
+        // which have exposed both as globals for years. Plenty of npm packages assume this
+        // unconditionally: e.g. minimatch/path-scurry (glob's dependencies) construct `new
+        // URL(...)` at module scope and throw `ReferenceError: URL is not defined` without
+        // this. Implemented by requiring the same `url` core module through the existing
+        // `__mycelium_require__` bridge (wired up just above) rather than duplicating
+        // url.mjs's implementation here, so there's exactly one `URL`/`URLSearchParams`
+        // class either way `require`/`import` reaches it.
+        private val GLOBAL_URL_INIT_SCRIPT = """
+            (function () {
+                if (typeof globalThis.URL === 'undefined' || typeof globalThis.URLSearchParams === 'undefined') {
+                    var urlModule = globalThis.__mycelium_require__('url', '/');
+                    if (typeof globalThis.URL === 'undefined') {
+                        globalThis.URL = urlModule.URL;
+                    }
+                    if (typeof globalThis.URLSearchParams === 'undefined') {
+                        globalThis.URLSearchParams = urlModule.URLSearchParams;
+                    }
                 }
             })();
         """.trimIndent()

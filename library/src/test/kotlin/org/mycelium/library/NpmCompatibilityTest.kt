@@ -87,19 +87,21 @@ import java.net.URI
 //     builtinModules } from 'node:module'`, and `module` is now a registered core module
 //     too — yargs now WORKS end-to-end (see yargsParsesArgv).
 //   - glob (v11): originally FAILED with "unknown core module 'node:fs/promises'" — fixed by
-//     registering a real `fs-promises.mjs` core module. Now progresses further but still
-//     fails: minimatch/path-scurry construct `new URL(...)` at module scope, and `URL` isn't
-//     exposed as a global in Mycelium's guest environment (only importable via the `url`
-//     core module) — see globFailsOnMissingUrlGlobal. Still fails the same way after adding
-//     `module`/readline/worker_threads/etc — this is an unrelated, still-open gap.
+//     registering a real `fs-promises.mjs` core module, then progressed to `URL` not being
+//     exposed as a global (minimatch/path-scurry construct `new URL(...)` at module scope).
+//     `URL`/`URLSearchParams` are now bare globals too (backed by the existing `url` core
+//     module) — glob now WORKS end-to-end, given an explicit `cwd` option (Mycelium's
+//     `process.cwd()` reflects the JVM's real working directory rather than the running
+//     script's directory, same caveat as dotenv above) — see globFindsFilesWithExplicitCwd.
 //   - pino: originally FAILED with "unknown core module 'node:diagnostics_channel'" — fixed
 //     by registering a real `diagnostics_channel.mjs` core module, then progressed to a
-//     missing `worker_threads` core module (pino's thread-transport machinery). Now that
-//     `worker_threads` is registered too, it progresses further still but fails on a
-//     *different* gap: `node-stdlib/buffer.mjs` doesn't export a `constants` object at all,
-//     so thread-stream's `buffer.constants.MAX_STRING_LENGTH` read throws "Cannot read
-//     property 'MAX_STRING_LENGTH' of undefined" — see
-//     pinoFailsOnMissingBufferConstants.
+//     missing `worker_threads` core module (pino's thread-transport machinery), then to
+//     `node-stdlib/buffer.mjs` not exporting a `constants` object (thread-stream reads
+//     `buffer.constants.MAX_STRING_LENGTH`). `buffer.mjs` now exports `constants` too — but
+//     pino still doesn't run end-to-end: thread-stream also references the bare Node global
+//     `global` (`global.WeakRef`/`global.FinalizationRegistry` fallback checks), and
+//     Mycelium exposes no `global` alias for `globalThis` — "ReferenceError: global is not
+//     defined". Open gap, not part of this sweep — see pinoFailsOnMissingBufferConstants.
 //   - inquirer: originally FAILED with "unknown core module 'node:async_hooks'" — fixed by
 //     registering a real `async_hooks.mjs` core module, then progressed to a missing
 //     `node:readline` core module. Now that `readline` is registered too, it progresses
@@ -611,41 +613,35 @@ class NpmCompatibilityTest {
     // `fs/promises`/`node:fs/promises` are now registered core modules (backed by
     // node-stdlib/fs-promises.mjs, re-exporting fs.mjs's existing `promises` namespace both
     // as named exports and as the default export, matching Node's `require('fs/promises')`
-    // shape) — but glob still doesn't run end-to-end: minimatch/path-scurry construct `new
-    // URL(...)` at module scope, and `URL` isn't exposed as a global in Mycelium's guest
-    // environment (only importable via the `url` core module, per the project's TODO —
-    // "GraalJS ships no URL/URLSearchParams globals"). Open gap, not part of this sweep.
+    // shape), which unblocked loading but exposed a second gap: minimatch/path-scurry
+    // construct `new URL(...)` at module scope, and `URL` wasn't exposed as a global in
+    // Mycelium's guest environment (only importable via the `url` core module, per the
+    // project's TODO — "GraalJS ships no URL/URLSearchParams globals").
     //
-    // Re-tested after registering readline/readline-promises/worker_threads/module/
-    // http.Agent/fs-promises-alias/util.stripVTControlCharacters/diagnostics_channel/
-    // async_hooks/array-conditional-exports: unchanged — still the exact same "URL is not
-    // defined" error, since none of those additions touch the missing-global-URL gap. ---
+    // `URL`/`URLSearchParams` are now bare globals too (implemented the same way as the
+    // existing `Buffer` global — requiring the real `url` core module through
+    // `__mycelium_require__` rather than duplicating its implementation) — glob now WORKS
+    // end-to-end, given an explicit `cwd` option: Mycelium's `process.cwd()` reflects the
+    // JVM's real working directory rather than the running script's directory (the same
+    // caveat noted on the dotenv test above), so glob's default `cwd: process.cwd()` doesn't
+    // land in the temp project dir without an override. ---
 
-    @Test fun globFailsOnMissingUrlGlobal() {
+    @Test fun globFindsFilesWithExplicitCwd() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-glob-")
         npmInstall(dir, "glob")
         File(dir, "dummy.json").writeText("{}")
 
-        val ex = assertThrows(PolyglotException::class.java) {
-            writeAndRun(
-                dir,
-                """
-                import { globSync } from 'glob';
-                const files = globSync('*.json');
-                globalThis.__globHasMatches = files.length > 0;
-                """.trimIndent()
-            )
-        }
-        assertFalse(
-            ex.message!!.contains("fs/promises"),
-            "fs/promises should now resolve — unexpected error: ${ex.message}"
+        val mc = writeAndRun(
+            dir,
+            """
+            import { globSync } from 'glob';
+            const files = globSync('*.json', { cwd: ${'"'}${dir.absolutePath}${'"'} });
+            globalThis.__globHasMatches = files.length > 0;
+            """.trimIndent()
         )
-        assertTrue(
-            ex.message!!.contains("URL is not defined"),
-            "unexpected error: ${ex.message}"
-        )
+        assertTrue(mc.eval("js", "globalThis.__globHasMatches").asBoolean())
     }
 
     // --- 17. pino — fast logger, uses stream/os/events/sonic-boom. Originally FAILED:
@@ -662,12 +658,17 @@ class NpmCompatibilityTest {
     // thread-transport machinery does `require('worker_threads')`, which wasn't registered
     // as a core module either.
     //
-    // `worker_threads` is now a registered core module too — but pino still doesn't run
-    // end-to-end: thread-stream (pino's worker-thread transport helper) does `const buffer
-    // = require('buffer'); ... buffer.constants.MAX_STRING_LENGTH`, and
-    // node-stdlib/buffer.mjs doesn't export a `constants` object at all (only the `Buffer`
-    // class), so the read throws "Cannot read property 'MAX_STRING_LENGTH' of undefined".
-    // Open gap, not part of this sweep. ---
+    // `worker_threads` is now a registered core module too, which unblocked loading but
+    // exposed a third gap: thread-stream (pino's worker-thread transport helper) does `const
+    // buffer = require('buffer'); ... buffer.constants.MAX_STRING_LENGTH`, and
+    // node-stdlib/buffer.mjs didn't export a `constants` object at all (only the `Buffer`
+    // class), so the read threw "Cannot read property 'MAX_STRING_LENGTH' of undefined".
+    //
+    // `buffer.mjs` now exports a `constants` object too (`MAX_LENGTH`/`MAX_STRING_LENGTH`,
+    // also attached as `Buffer.constants`) — but pino still doesn't run end-to-end:
+    // thread-stream also references the bare Node global `global` directly (not
+    // `globalThis`), and Mycelium's guest environment exposes no `global` alias. Open gap,
+    // not part of this sweep. ---
 
     @Test fun pinoFailsOnMissingBufferConstants() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
@@ -687,15 +688,11 @@ class NpmCompatibilityTest {
             )
         }
         assertFalse(
-            ex.message!!.contains("diagnostics_channel"),
-            "diagnostics_channel should now resolve — unexpected error: ${ex.message}"
-        )
-        assertFalse(
-            ex.message!!.contains("worker_threads"),
-            "worker_threads should now resolve — unexpected error: ${ex.message}"
+            ex.message!!.contains("MAX_STRING_LENGTH"),
+            "buffer.constants.MAX_STRING_LENGTH should now resolve — unexpected error: ${ex.message}"
         )
         assertTrue(
-            ex.message!!.contains("MAX_STRING_LENGTH"),
+            ex.message!!.contains("global is not defined"),
             "unexpected error: ${ex.message}"
         )
     }

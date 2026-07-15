@@ -549,6 +549,13 @@ Buffer.compare = function (a, b) {
     return Buffer.prototype.compare.call(a, b);
 };
 
+export const constants = {
+    MAX_LENGTH: 2147483647, // 2^31 - 1 (V8 limit, use same for compat)
+    MAX_STRING_LENGTH: 536870888, // V8's max string length
+};
+
+Buffer.constants = constants;
+
 export { Buffer };
 
-export default { Buffer };
+export default { Buffer, constants };

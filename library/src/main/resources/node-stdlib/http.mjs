@@ -120,6 +120,16 @@ function nextTick(fn) {
     Promise.resolve().then(fn);
 }
 
+// Mirrors Node's `http.METHODS` — the sorted list of HTTP methods the parser supports —
+// needed by packages that build their own method-name tables off it rather than
+// hardcoding one (e.g. express's lib/utils.js: `METHODS.map((m) => m.toLowerCase())`).
+const METHODS = [
+    "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
+    "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS",
+    "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "REBIND", "REPORT", "SEARCH",
+    "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
+];
+
 const STATUS_CODES = {
     200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently",
     302: "Found", 304: "Not Modified", 400: "Bad Request", 401: "Unauthorized",
@@ -468,6 +478,11 @@ class Server extends EventEmitter {
                 self.emit("request", req, res);
                 req._deliver();
             } catch (e) {
+                // Surfaced to stderr rather than swallowed silently — a bare 500 with no
+                // trace of what threw is nearly impossible to debug from the client side
+                // (this mirrors Node itself, which prints an uncaught exception from a
+                // request handler to stderr when nothing else handles it).
+                console.error("mycelium: http server request handler threw:", e && e.stack ? e.stack : e);
                 try {
                     exchange.sendResponseHeaders(500, 0);
                     exchange.close();
@@ -503,6 +518,9 @@ export function createServer(requestListener) {
     return new Server(requestListener);
 }
 
-export { STATUS_CODES, IncomingMessage, ClientRequest, ServerResponse, Server };
+export { STATUS_CODES, METHODS, IncomingMessage, ClientRequest, ServerResponse, Server };
 
-export default { request, get, createServer, STATUS_CODES, IncomingMessage, ClientRequest, ServerResponse, Server };
+export default {
+    request, get, createServer, STATUS_CODES, METHODS, IncomingMessage, ClientRequest,
+    ServerResponse, Server,
+};

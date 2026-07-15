@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URI
 
 // Runs *real* npm packages (fetched from the registry via a real `npm install`) end-to-end
 // through Mycelium, to find out what's actually missing from Node.js compatibility rather
@@ -333,5 +335,95 @@ class NpmCompatibilityTest {
             """.trimIndent()
         )
         assertEquals("function", mc.eval("js", "globalThis.__expressType").asString())
+    }
+
+    // --- 11. express, end-to-end: a real HTTP round trip through an express server running
+    // under Mycelium, including express's built-in 404 handler — which goes through
+    // `http-errors`' `createError()`, which unconditionally calls
+    // `Error.captureStackTrace(err, createError)` (see http-errors/index.js and the
+    // Error.captureStackTrace polyfill in Mycelium.kt). This is the concrete path that
+    // motivated the polyfill: without it, `express()` fails the very first time any request
+    // reaches the 404 fallback (or any handler that constructs an http-errors instance),
+    // even though `expressLoadsSuccessfully` above (which never issues a real request)
+    // already passes with a bare GraalJS `Error.captureStackTrace` gap. ---
+
+    @Test fun expressServerHandlesRequestsAndFourOhFours() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-express-server-")
+        npmInstall(dir, "express")
+
+        // Dedicated Mycelium instance, not the shared `vm` — see the equivalent comment on
+        // MyceliumIntegrationTest's http.createServer test for why: once a real HTTP request
+        // reaches the JS request handler, the HTTP server's own dispatch thread takes
+        // ownership of the polyglot Context, and GraalVM doesn't hand that back to the
+        // thread that called `listen()`.
+        val mc = Mycelium()
+        val mainFile = File(dir, "test.mjs")
+        mainFile.writeText(
+            """
+            import express from 'express';
+            const app = express();
+            app.get('/hello', (req, res) => {
+                res.status(200).json({ message: 'hello from express' });
+            });
+            const server = app.listen(0, '127.0.0.1', () => {
+                globalThis.__expressServerReady = true;
+                globalThis.__expressServerPort = server.address().port;
+            });
+            """.trimIndent()
+        )
+        mc.runFile(mainFile.absolutePath)
+
+        assertTrue(mc.eval("js", "globalThis.__expressServerReady").asBoolean())
+        val port = mc.eval("js", "globalThis.__expressServerPort").asInt()
+
+        val helloConn = URI("http://127.0.0.1:$port/hello").toURL().openConnection() as HttpURLConnection
+        helloConn.connectTimeout = 5000
+        helloConn.readTimeout = 5000
+        try {
+            assertEquals(200, helloConn.responseCode)
+            val body = helloConn.inputStream.readBytes().toString(Charsets.UTF_8)
+            assertTrue(body.contains("hello from express"), "unexpected body: $body")
+        } finally {
+            helloConn.disconnect()
+        }
+
+        // Hits express's built-in 404 fallback, which constructs an http-errors instance —
+        // exercising Error.captureStackTrace for real (see class-level test doc above).
+        val notFoundConn = URI("http://127.0.0.1:$port/does-not-exist").toURL().openConnection() as HttpURLConnection
+        try {
+            assertEquals(404, notFoundConn.responseCode)
+        } finally {
+            notFoundConn.disconnect()
+        }
+    }
+
+    // --- 12. http2 core module — client side, backed by java.net.http.HttpClient. Not one
+    // of the ten original packages above, but exercised here the same way: a real npm
+    // package (axios) whose optional http2 transport (lib/adapters/http.js's
+    // `http2Transport`, lib/helpers/Http2Sessions.js) imports Mycelium's `node-stdlib/
+    // http2.mjs` at module scope via `import http2 from 'http2'`. This only checks that the
+    // module loads with the right shape (http2.connect/constants), not a live HTTP/2
+    // round trip against a real server. ---
+
+    @Test fun http2ModuleLoadsWithExpectedShape() {
+        val mc = Mycelium()
+        val tmpFile = File.createTempFile("mycelium-http2-test-", ".mjs")
+        tmpFile.deleteOnExit()
+        tmpFile.writeText(
+            """
+            import http2 from 'node:http2';
+            globalThis.__http2ConnectType = typeof http2.connect;
+            globalThis.__http2Method = http2.constants.HTTP2_HEADER_METHOD;
+            globalThis.__http2Status = http2.constants.HTTP2_HEADER_STATUS;
+            globalThis.__http2DefaultSettingsType = typeof http2.getDefaultSettings();
+            """.trimIndent()
+        )
+        mc.runFile(tmpFile.absolutePath)
+        assertEquals("function", mc.eval("js", "globalThis.__http2ConnectType").asString())
+        assertEquals(":method", mc.eval("js", "globalThis.__http2Method").asString())
+        assertEquals(":status", mc.eval("js", "globalThis.__http2Status").asString())
+        assertEquals("object", mc.eval("js", "globalThis.__http2DefaultSettingsType").asString())
     }
 }

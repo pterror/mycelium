@@ -452,6 +452,21 @@ function pipeline(...args) {
     return current;
 }
 
+// Mirrors Node's actual `stream` module shape: `module.exports` is the `Stream`
+// constructor itself, with `Readable`/`Writable`/etc. attached as static properties —
+// `require('stream')` returns something callers both `new` directly (rare) and read
+// `.Readable`/`.Stream` etc. off of (common: e.g. `send`'s `var Stream = require('stream')`
+// followed by `util.inherits(SendStream, Stream)`, which needs `Stream` itself, not a
+// `{ Stream, Readable, ... }` wrapper object without a `.prototype` of its own).
+Stream.Stream = Stream;
+Stream.Readable = Readable;
+Stream.Writable = Writable;
+Stream.Duplex = Duplex;
+Stream.Transform = Transform;
+Stream.PassThrough = PassThrough;
+Stream.finished = finished;
+Stream.pipeline = pipeline;
+
 export { Stream, Readable, Writable, Duplex, Transform, PassThrough, finished, pipeline, EventEmitter };
 
-export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, finished, pipeline };
+export default Stream;

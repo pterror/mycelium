@@ -83,6 +83,10 @@ class Mycelium(
         context.getBindings("js").putMember("__mycelium_require__", requireFn)
         context.eval("js", PROCESS_INIT_SCRIPT)
         context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
+        context.eval("js", ERROR_CAPTURE_STACK_TRACE_INIT_SCRIPT)
+        context.eval("js", TEXT_ENCODING_INIT_SCRIPT)
+        context.eval("js", TIMERS_INIT_SCRIPT)
+        context.eval("js", GLOBAL_BUFFER_INIT_SCRIPT)
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
@@ -362,6 +366,355 @@ class Mycelium(
                     },
                     subtle: {},
                 };
+            })();
+        """.trimIndent()
+
+        // Polyfills V8's `Error.captureStackTrace(targetObject, constructorOpt)` /
+        // `Error.stackTraceLimit` / `Error.prepareStackTrace`, none of which GraalJS exposes
+        // (confirmed by probing `typeof Error.captureStackTrace` under this build — it's
+        // `undefined`, not gated behind some other option flag). This is needed by express
+        // (via http-errors/depd, both of which call `Error.captureStackTrace(this, <ctor>)`
+        // unconditionally in their custom-Error constructors and would otherwise throw
+        // "Error.captureStackTrace is not a function").
+        //
+        // Approach: `new Error()` inside `captureStackTrace` itself already gives GraalJS's
+        // own (V8-formatted) `.stack` string for the current call site — this just trims
+        // that string to imitate V8's semantics around it rather than reimplementing stack
+        // capture from scratch:
+        //   1. The frame for `captureStackTrace`'s own `new Error()` call is always dropped
+        //      first — probing confirms it's reliably the top frame of the resulting stack,
+        //      regardless of how deeply nested the real call site is.
+        //   2. If `constructorOpt` is a named function, frames are dropped up to and
+        //      including the first one that mentions its name (covers both a plain function
+        //      frame "at Ctor (...)" and a `new`-call frame "at new Ctor (...)") — matching
+        //      V8's "the stack no longer shows the constructor frame or anything above it"
+        //      behavior, without an exact CallSite/function-identity comparison (which
+        //      GraalJS's plain string-formatted `.stack` doesn't expose).
+        //   3. The remaining frames are capped at `Error.stackTraceLimit` (default 10).
+        // `.stack` is installed as a getter/setter pair (not a plain value) so that
+        // `Error.prepareStackTrace`, if a guest later assigns one (some frameworks/test
+        // runners do, e.g. to hook in source-map remapping), is consulted lazily on first
+        // read — matching V8's own lazy-stack-formatting behavior — while a plain assignment
+        // (`err.stack = "..."`, which some libraries do) still works by replacing the
+        // accessor with an ordinary data property.
+        private val ERROR_CAPTURE_STACK_TRACE_INIT_SCRIPT = """
+            (function () {
+                if (typeof Error.captureStackTrace === 'function') return;
+
+                Error.stackTraceLimit = 10;
+
+                function parseFrames(rawStack) {
+                    var lines = String(rawStack || '').split('\n');
+                    // lines[0] is the "Name: message" (or bare "Name") header line GraalJS
+                    // itself produced for the throwaway Error — everything after is a
+                    // "    at ..." frame line.
+                    return lines.slice(1);
+                }
+
+                function makeCallSite(line) {
+                    var trimmed = String(line).replace(/^\s*at\s+/, '');
+                    var functionName = null;
+                    var fileName = null;
+                    var lineNumber = null;
+                    var columnNumber = null;
+                    var m = /^(.*?)\s+\((.*):(\d+):(\d+)\)$/.exec(trimmed);
+                    if (m) {
+                        functionName = m[1];
+                        fileName = m[2];
+                        lineNumber = Number(m[3]);
+                        columnNumber = Number(m[4]);
+                    } else {
+                        var m2 = /^(.*):(\d+):(\d+)$/.exec(trimmed);
+                        if (m2) {
+                            fileName = m2[1];
+                            lineNumber = Number(m2[2]);
+                            columnNumber = Number(m2[3]);
+                        } else {
+                            functionName = trimmed || null;
+                        }
+                    }
+                    var isNew = false;
+                    if (functionName && functionName.indexOf('new ') === 0) {
+                        isNew = true;
+                        functionName = functionName.slice(4);
+                    }
+                    return {
+                        getThis: function () { return undefined; },
+                        getTypeName: function () { return null; },
+                        getFunction: function () { return undefined; },
+                        getFunctionName: function () { return functionName; },
+                        getMethodName: function () { return null; },
+                        getFileName: function () { return fileName; },
+                        getLineNumber: function () { return lineNumber; },
+                        getColumnNumber: function () { return columnNumber; },
+                        getEvalOrigin: function () { return undefined; },
+                        isToplevel: function () { return !functionName; },
+                        isEval: function () { return false; },
+                        isNative: function () { return false; },
+                        isConstructor: function () { return isNew; },
+                        isAsync: function () { return false; },
+                        isPromiseAll: function () { return false; },
+                        getPromiseIndex: function () { return null; },
+                        toString: function () {
+                            return functionName
+                                ? (isNew ? 'new ' : '') + functionName + ' (' + fileName + ':' + lineNumber + ':' + columnNumber + ')'
+                                : fileName + ':' + lineNumber + ':' + columnNumber;
+                        },
+                    };
+                }
+
+                Error.captureStackTrace = function captureStackTrace(targetObject, constructorOpt) {
+                    var probe = new Error();
+                    var frames = parseFrames(probe.stack);
+                    // Drop the frame for this captureStackTrace call's own `new Error()`.
+                    frames = frames.slice(1);
+                    if (typeof constructorOpt === 'function' && constructorOpt.name) {
+                        var idx = -1;
+                        for (var i = 0; i < frames.length; i++) {
+                            if (frames[i].indexOf(constructorOpt.name) !== -1) { idx = i; break; }
+                        }
+                        if (idx !== -1) frames = frames.slice(idx + 1);
+                    }
+                    var limit = typeof Error.stackTraceLimit === 'number' ? Error.stackTraceLimit : 10;
+                    if (limit >= 0) frames = frames.slice(0, limit);
+
+                    Object.defineProperty(targetObject, 'stack', {
+                        configurable: true,
+                        enumerable: false,
+                        get: function () {
+                            if (typeof Error.prepareStackTrace === 'function') {
+                                var callSites = frames.map(makeCallSite);
+                                return Error.prepareStackTrace(targetObject, callSites);
+                            }
+                            var name = (targetObject && targetObject.name) || 'Error';
+                            var message = targetObject && targetObject.message;
+                            var header = message ? name + ': ' + message : name;
+                            return [header].concat(frames).join('\n');
+                        },
+                        set: function (value) {
+                            Object.defineProperty(targetObject, 'stack', {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: value,
+                            });
+                        },
+                    });
+                };
+            })();
+        """.trimIndent()
+
+        // Exposes the standard `TextEncoder`/`TextDecoder` globals (WHATWG Encoding API) —
+        // GraalJS doesn't provide these itself, but plenty of npm packages (e.g. express's
+        // dependency `content-disposition`, which RFC-5987-encodes filenames) reference them
+        // as bare globals the way browsers/Node have exposed them for years, rather than
+        // importing anything. Backed by `java.nio.charset` for the actual byte<->string
+        // conversion, mirroring buffer.mjs's approach.
+        private val TEXT_ENCODING_INIT_SCRIPT = """
+            (function () {
+                var JCharset = Java.type('java.nio.charset.StandardCharsets');
+                var JString = Java.type('java.lang.String');
+                var JByteArray = Java.type('byte[]');
+
+                if (typeof globalThis.TextEncoder === 'undefined') {
+                    function TextEncoder() {
+                        this.encoding = 'utf-8';
+                    }
+                    TextEncoder.prototype.encode = function (input) {
+                        input = input === undefined ? '' : String(input);
+                        var buf = JCharset.UTF_8.encode(input);
+                        var len = buf.remaining();
+                        var arr = new Uint8Array(len);
+                        for (var i = 0; i < len; i++) arr[i] = buf.get() & 0xFF;
+                        return arr;
+                    };
+                    TextEncoder.prototype.encodeInto = function (input, dest) {
+                        var encoded = this.encode(input);
+                        var written = Math.min(encoded.length, dest.length);
+                        for (var i = 0; i < written; i++) dest[i] = encoded[i];
+                        return { read: input.length, written: written };
+                    };
+                    globalThis.TextEncoder = TextEncoder;
+                }
+
+                if (typeof globalThis.TextDecoder === 'undefined') {
+                    function resolveCharset(label) {
+                        var l = String(label || 'utf-8').toLowerCase();
+                        if (l === 'utf-8' || l === 'utf8' || l === 'unicode-1-1-utf-8') return JCharset.UTF_8;
+                        if (l === 'utf-16le' || l === 'utf16le') return JCharset.UTF_16LE;
+                        if (l === 'utf-16be' || l === 'utf16be') return JCharset.UTF_16BE;
+                        if (l === 'latin1' || l === 'iso-8859-1' || l === 'windows-1252') return JCharset.ISO_8859_1;
+                        if (l === 'ascii' || l === 'us-ascii') return JCharset.US_ASCII;
+                        return JCharset.UTF_8;
+                    }
+                    function TextDecoder(label, options) {
+                        this.encoding = String(label || 'utf-8').toLowerCase();
+                        this._charset = resolveCharset(label);
+                        this.fatal = !!(options && options.fatal);
+                        this.ignoreBOM = !!(options && options.ignoreBOM);
+                    }
+                    TextDecoder.prototype.decode = function (input) {
+                        if (input === undefined) return '';
+                        var len = input.length;
+                        var bytes = new JByteArray(len);
+                        for (var i = 0; i < len; i++) {
+                            var v = input[i];
+                            bytes[i] = v > 127 ? v - 256 : v;
+                        }
+                        return String(new JString(bytes, this._charset));
+                    };
+                    globalThis.TextDecoder = TextDecoder;
+                }
+            })();
+        """.trimIndent()
+
+        // Polyfills the `setTimeout`/`setInterval`/`setImmediate` global timer functions
+        // (and their `clear*` counterparts) — GraalJS provides none of these itself (they're
+        // a browser/Node runtime feature, not part of the ECMAScript spec), yet they're
+        // used pervasively, including by core Express machinery (the `router` package calls
+        // `setImmediate()` to defer to the next tick when unwinding a middleware chain, and
+        // the deferred continuation is what actually invokes the route handler that finishes
+        // the HTTP response).
+        //
+        // Two things were tried and rejected before landing on the split below:
+        //
+        //  1. Resolve every timer on the JS microtask queue (`Promise.resolve().then(...)`,
+        //     mirroring http.mjs's nextTick), on the theory that Mycelium has no real event
+        //     loop anyway. This hangs on any "poll until some background thread's I/O
+        //     finishes" retry loop (`function poll() { if (!ready) setTimeout(poll, 10); }
+        //     poll();` — a common pattern): it becomes unbounded synchronous microtask
+        //     recursion, and GraalJS drains the microtask queue to completion before
+        //     `Context#eval` returns control to the caller — starving out the other thread
+        //     (e.g. an http.mjs HttpServer dispatch thread) the poll loop is actually
+        //     waiting on. Livelock, not just slow.
+        //  2. Real delays via a shared `java.util.concurrent.ScheduledExecutorService`.
+        //     GraalJS can't unambiguously hand a plain JS function to
+        //     `ScheduledExecutorService#schedule`, which is overloaded on `Runnable` vs
+        //     `Callable` — a JS function satisfies both functional-interface shapes, so the
+        //     call fails with "Multiple applicable overloads found for method name schedule".
+        //     A dedicated `java.lang.Thread` per timer sidesteps the overload ambiguity, but
+        //     introduces a *second* failure mode specific to zero-delay `setImmediate`:
+        //     starting a brand-new OS thread takes real (if small) time, during which the
+        //     original caller's synchronous call stack — e.g. http.mjs's HttpServer request
+        //     handler — has often already returned and left the polyglot Context, but the
+        //     new timer thread's very first `Context`-touching call can still race that
+        //     departure and never observably "win" the handoff, so the deferred callback
+        //     (and, transitively, the `res.end()` inside it that actually completes the HTTP
+        //     response) silently never runs — a real deadlock, reproduced by
+        //     `expressServerHandlesRequestsAndFourOhFours` hanging indefinitely.
+        //
+        // The fix: split by intent rather than using one mechanism for both. `setImmediate`
+        // and a zero/near-zero-delay `setTimeout` are used, in practice, to *defer* — yield
+        // once before continuing, not to wait for real wall-clock time to pass — so they
+        // resolve on the microtask queue like nextTick, which is synchronous-safe (bounded:
+        // a single deferred continuation, not an unbounded retry loop) and never needs a
+        // second thread to touch the Context. Only a *genuine* delay (`ms` clearly > 0, the
+        // shape a retry/poll loop actually uses) gets the dedicated-background-thread
+        // treatment from rejected approach #2 above — spending real wall-clock time before
+        // re-entering the Context is exactly what avoids the livelock in approach #1, and a
+        // many--millisecond gap is enough for a same-thread `new Thread(...).start()` to
+        // reliably outlive whatever call stack scheduled it.
+        private val TIMERS_INIT_SCRIPT = """
+            (function () {
+                var JThread = Java.type('java.lang.Thread');
+
+                var nextId = 1;
+                var cancelled = Object.create(null);
+
+                function nextTick(fn) {
+                    Promise.resolve().then(fn);
+                }
+
+                // A dedicated daemon `Thread` per scheduled timer — see the "one thread per
+                // timer" rationale in the doc comment above. Only used for a genuine
+                // (`ms` > 0) delay; zero-delay scheduling goes through `nextTick` instead
+                // (see `schedule` below).
+                function runDelayed(fn, args, delayMs, id, repeating) {
+                    var thread = new JThread(function () {
+                        try {
+                            do {
+                                JThread.sleep(delayMs);
+                                if (cancelled[id]) return;
+                                if (typeof fn === 'function') fn.apply(null, args);
+                            } while (repeating && !cancelled[id]);
+                        } catch (e) {
+                            // InterruptedException (or any other) from a cancelled/racing
+                            // timer — nothing more to do.
+                        } finally {
+                            delete cancelled[id];
+                        }
+                    });
+                    thread.setDaemon(true);
+                    thread.setName('mycelium-timer-' + id);
+                    thread.start();
+                }
+
+                function schedule(fn, ms, args, repeating) {
+                    var id = nextId++;
+                    var delay = typeof ms === 'number' && ms > 0 ? Math.floor(ms) : 0;
+                    if (delay > 0) {
+                        runDelayed(fn, args, delay, id, repeating);
+                    } else if (repeating) {
+                        // A zero-delay *repeating* interval has no safe microtask
+                        // implementation (see rejected approach #1) — fall back to the
+                        // background-thread path with a minimal 1ms tick instead of
+                        // spinning the guest thread forever.
+                        runDelayed(fn, args, 1, id, true);
+                    } else {
+                        nextTick(function () {
+                            if (cancelled[id]) { delete cancelled[id]; return; }
+                            if (typeof fn === 'function') fn.apply(null, args);
+                        });
+                    }
+                    return id;
+                }
+
+                function clear(id) {
+                    cancelled[id] = true;
+                }
+
+                if (typeof globalThis.setTimeout === 'undefined') {
+                    globalThis.setTimeout = function (fn, ms) {
+                        return schedule(fn, ms, Array.prototype.slice.call(arguments, 2), false);
+                    };
+                }
+                if (typeof globalThis.clearTimeout === 'undefined') {
+                    globalThis.clearTimeout = clear;
+                }
+                if (typeof globalThis.setInterval === 'undefined') {
+                    globalThis.setInterval = function (fn, ms) {
+                        return schedule(fn, ms, Array.prototype.slice.call(arguments, 2), true);
+                    };
+                }
+                if (typeof globalThis.clearInterval === 'undefined') {
+                    globalThis.clearInterval = clear;
+                }
+                if (typeof globalThis.setImmediate === 'undefined') {
+                    globalThis.setImmediate = function (fn) {
+                        return schedule(fn, 0, Array.prototype.slice.call(arguments, 1), false);
+                    };
+                }
+                if (typeof globalThis.clearImmediate === 'undefined') {
+                    globalThis.clearImmediate = clear;
+                }
+            })();
+        """.trimIndent()
+
+        // Exposes `Buffer` as a bare global — distinct from (and in addition to) the
+        // importable `buffer` core module (see coreModules / buffer.mjs), matching real
+        // Node.js, which has exposed `Buffer` as a global since forever (no import needed).
+        // Plenty of npm packages assume this unconditionally: e.g. express's dependency
+        // `etag` references the bare global `Buffer.isBuffer`/`Buffer.byteLength` directly
+        // rather than importing the `buffer` module, and throws `ReferenceError: Buffer is
+        // not defined` on every request without this. Implemented by requiring the same
+        // `buffer` core module through the existing `__mycelium_require__` bridge (wired up
+        // just above) rather than duplicating buffer.mjs's implementation here, so there's
+        // exactly one `Buffer` class either way `require`/`import` reaches it.
+        private val GLOBAL_BUFFER_INIT_SCRIPT = """
+            (function () {
+                if (typeof globalThis.Buffer === 'undefined') {
+                    globalThis.Buffer = globalThis.__mycelium_require__('buffer', '/').Buffer;
+                }
             })();
         """.trimIndent()
     }

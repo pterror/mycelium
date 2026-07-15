@@ -1019,6 +1019,51 @@ class MyceliumIntegrationTest {
         assertTrue(uuid.asString().matches(Regex("[0-9a-f-]{36}")))
     }
 
+    // --- `Error.captureStackTrace` polyfill (GraalJS exposes no V8-style stack-trace API
+    // of its own — needed by express, via http-errors/depd) ---
+
+    @Test fun errorCaptureStackTraceTrimsConstructorFrame() {
+        val mc = vm
+        val stack = mc.eval(
+            "js",
+            """
+            function MyError(msg) {
+                Error.call(this, msg);
+                this.message = msg;
+                this.name = 'MyError';
+                Error.captureStackTrace(this, MyError);
+            }
+            MyError.prototype = Object.create(Error.prototype);
+
+            function makeError() {
+                return new MyError('boom');
+            }
+            makeError().stack;
+            """.trimIndent()
+        ).asString()
+        assertTrue(stack.startsWith("MyError: boom"), "expected header, got: $stack")
+        assertFalse(stack.contains("MyError ("), "constructor frame should be trimmed: $stack")
+        assertTrue(stack.contains("makeError"), "caller frame should remain: $stack")
+    }
+
+    @Test fun errorCaptureStackTraceDefaultsStackTraceLimitToTen() {
+        val mc = vm
+        assertEquals(10, mc.eval("js", "Error.stackTraceLimit").asInt())
+    }
+
+    @Test fun errorCaptureStackTraceWithoutConstructorOptStillProducesStack() {
+        val mc = vm
+        val stack = mc.eval(
+            "js",
+            """
+            var obj = {};
+            Error.captureStackTrace(obj);
+            obj.stack;
+            """.trimIndent()
+        ).asString()
+        assertTrue(stack.startsWith("Error"), "expected a bare Error header, got: $stack")
+    }
+
     // --- Python site-packages / Ruby gem bare-specifier resolution ---
     //
     // resolvePythonPackage/resolveRubyGem both accept an explicit `searchPaths` override
@@ -1402,6 +1447,65 @@ class MyceliumIntegrationTest {
             assertEquals("hello from mycelium http server", responseBody)
         } finally {
             conn.disconnect()
+        }
+    }
+
+    // --- Node stdlib `http2` module (client side) ---
+    //
+    // Verified against a plain `com.sun.net.httpserver.HttpServer` (HTTP/1.1-only) rather
+    // than a real HTTP/2 server — same "never touches the polyglot Context from another
+    // thread" rationale as importHttpModule's client-path test above. `java.net.http.
+    // HttpClient` built with `Version.HTTP_2` transparently falls back to HTTP/1.1 against
+    // a server that doesn't speak HTTP/2 (per the JDK's own HttpClient docs), so this still
+    // exercises http2.mjs's real request/response plumbing (session, stream, pseudo-header
+    // handling, response body delivery) end-to-end, just not real HTTP/2 wire framing.
+
+    @Test fun importHttp2ModuleClientRoundTrip() {
+        val plainServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        plainServer.createContext("/h2ping") { exchange ->
+            val body = "h2 pong".toByteArray()
+            exchange.responseHeaders.add("Content-Type", "text/plain")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        plainServer.executor = null
+        plainServer.start()
+        try {
+            val plainPort = plainServer.address.port
+            val mc = Mycelium()
+            val tmpFile = File.createTempFile("mycelium-http2-client-test-", ".mjs")
+            tmpFile.deleteOnExit()
+            tmpFile.writeText(
+                """
+                import http2 from 'node:http2';
+                const session = http2.connect(`http://127.0.0.1:$plainPort`);
+                const req = session.request({
+                    [http2.constants.HTTP2_HEADER_METHOD]: 'GET',
+                    [http2.constants.HTTP2_HEADER_PATH]: '/h2ping',
+                });
+                let chunks = [];
+                req.on('response', (headers) => {
+                    globalThis.__http2Status = headers[http2.constants.HTTP2_HEADER_STATUS];
+                });
+                req.on('data', (chunk) => chunks.push(chunk));
+                req.on('end', () => {
+                    let str = '';
+                    for (const chunk of chunks) {
+                        for (let i = 0; i < chunk.length; i++) str += String.fromCharCode(chunk[i]);
+                    }
+                    globalThis.__http2Body = str;
+                    globalThis.__http2Done = true;
+                    session.close();
+                });
+                req.end();
+                """.trimIndent()
+            )
+            mc.runFile(tmpFile.absolutePath)
+            assertTrue(mc.eval("js", "globalThis.__http2Done").asBoolean())
+            assertEquals(200, mc.eval("js", "globalThis.__http2Status").asInt())
+            assertEquals("h2 pong", mc.eval("js", "globalThis.__http2Body").asString())
+        } finally {
+            plainServer.stop(0)
         }
     }
 }

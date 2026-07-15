@@ -13,6 +13,21 @@ export class EventEmitter {
 
     static defaultMaxListeners = 10;
 
+    // Node's real EventEmitter lazily initializes `_events` (via `EventEmitter.init()`,
+    // called from every prototype method that touches it) rather than only in the
+    // constructor — that's what lets a plain object become "EventEmitter-like" purely by
+    // having `EventEmitter.prototype`'s methods copied onto it (e.g. express's `mixin(app,
+    // EventEmitter.prototype, false)` in lib/express.js, which merges the prototype's own
+    // methods onto a plain function object without ever calling `new EventEmitter()`).
+    // Every method below that reads/writes `this._events` calls this first instead of
+    // assuming the constructor already ran.
+    _ensureEvents() {
+        if (this._events === undefined) {
+            this._events = Object.create(null);
+        }
+        return this._events;
+    }
+
     _getMaxListeners() {
         return this[kMaxListeners] === undefined
             ? EventEmitter.defaultMaxListeners
@@ -39,6 +54,7 @@ export class EventEmitter {
                 `The "listener" argument must be of type Function. Received ${typeof listener}`
             );
         }
+        this._ensureEvents();
         this.emit("newListener", event, listener.listener || listener);
 
         let existing = this._events[event];
@@ -99,7 +115,7 @@ export class EventEmitter {
     }
 
     removeListener(event, listener) {
-        const existing = this._events[event];
+        const existing = this._ensureEvents()[event];
         if (existing === undefined) return this;
 
         if (existing === listener || existing.listener === listener) {
@@ -126,6 +142,7 @@ export class EventEmitter {
     }
 
     removeAllListeners(event) {
+        this._ensureEvents();
         if (event === undefined) {
             this._events = Object.create(null);
         } else {
@@ -135,7 +152,7 @@ export class EventEmitter {
     }
 
     emit(event, ...args) {
-        const handler = this._events[event];
+        const handler = this._ensureEvents()[event];
         if (handler === undefined) {
             if (event === "error") {
                 const err = args[0];
@@ -156,29 +173,38 @@ export class EventEmitter {
     }
 
     listenerCount(event) {
-        const handler = this._events[event];
+        const handler = this._ensureEvents()[event];
         if (handler === undefined) return 0;
         if (typeof handler === "function") return 1;
         return handler.length;
     }
 
     listeners(event) {
-        const handler = this._events[event];
+        const handler = this._ensureEvents()[event];
         if (handler === undefined) return [];
         if (typeof handler === "function") return [handler.listener || handler];
         return handler.map((l) => l.listener || l);
     }
 
     rawListeners(event) {
-        const handler = this._events[event];
+        const handler = this._ensureEvents()[event];
         if (handler === undefined) return [];
         if (typeof handler === "function") return [handler];
         return handler.slice();
     }
 
     eventNames() {
-        return Object.keys(this._events);
+        return Object.keys(this._ensureEvents());
     }
 }
+
+// Mirrors Node's actual `events` module shape: `module.exports` is the `EventEmitter`
+// constructor itself, with `EventEmitter` also attached as a self-referencing static
+// property (`require('events').EventEmitter === require('events')`) — packages commonly
+// destructure `const { EventEmitter } = require('events')` rather than using the module's
+// default export directly (e.g. agent-base: `class Agent extends
+// require('events').EventEmitter`), which would otherwise resolve to `undefined` against a
+// bare class default export.
+EventEmitter.EventEmitter = EventEmitter;
 
 export default EventEmitter;

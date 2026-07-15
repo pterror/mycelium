@@ -21,6 +21,46 @@ class InterceptingFileSystem : FileSystem {
     private val delegate = FileSystem.newDefaultFileSystem()
     private val sourceDirectoryStack = ThreadLocal.withInitial { ArrayDeque<Path>() }
 
+    // The directory of the most recently read real project file, kept around *after*
+    // newByteChannel's own push/pop of sourceDirectoryStack has already unwound.
+    //
+    // GraalJS's ESM loader (DefaultESModuleLoader, at least as of the GraalVM 24.2/25.0
+    // series) does not fetch a module's bytes and resolve that module's own import
+    // specifiers as one nested operation — it fully fetches the module (a self-contained
+    // newByteChannel call whose push/pop of sourceDirectoryStack completes before
+    // returning) and only *afterwards*, in a separate top-level call, asks this FileSystem
+    // to resolve each of that module's import specifiers (parsePath). By the time that
+    // second call happens, sourceDirectoryStack has already been popped back to whatever
+    // was active before the module was fetched (typically the entry file's directory, via
+    // withSourceDirectory) — not the module's own directory. A `#`-prefixed subpath import
+    // (Node's package-private "imports" field) resolves against the *nearest* ancestor
+    // package.json and stops there, so being handed the wrong (too-shallow) starting
+    // directory makes it stop at the wrong package.json entirely — e.g. resolving chalk's
+    // `#ansi-styles` against the *importing project's* package.json instead of chalk's own,
+    // which has no matching "imports" entry.
+    //
+    // This field plugs that gap: it's updated (never popped) on every newByteChannel read
+    // of a real project file, so parsePath can prefer "the directory of whatever was read
+    // most recently" over the (by-then-stale) sourceDirectoryStack when resolving that
+    // file's own specifiers. It's only updated while sourceDirectoryStack is already
+    // non-empty (i.e. while a runFile/withSourceDirectory context is active) so that
+    // unrelated engine bootstrap reads — e.g. GraalVM loading the Ruby/Python language
+    // home's own files before any user code runs, which happen with an empty stack — don't
+    // clobber it.
+    private val lastReadModuleDir = ThreadLocal<Path?>()
+
+    // The directory to resolve a module's own specifiers (bare, subpath-import, or
+    // otherwise) against: the most recently read real file's directory if we're in the
+    // middle of resolving that file's own imports (the common case once any file has been
+    // read at all), falling back to the outermost entry point's directory — and finally the
+    // process's cwd — when nothing has been read yet (resolving the entry file's own
+    // top-level imports). See lastReadModuleDir's own comment for why the latter two,
+    // sourceDirectoryStack-derived, options are not always accurate on their own.
+    private fun currentResolutionDir(): Path =
+        lastReadModuleDir.get()
+            ?: sourceDirectoryStack.get().firstOrNull()
+            ?: Path.of("").toAbsolutePath()
+
     // `require()`d CommonJS modules, keyed by resolved absolute path (as a string). Each
     // cached Value is the module's Node-style module object — `{ exports, id, filename,
     // loaded }` — not just its exports, and is inserted into the cache *before* the
@@ -43,10 +83,17 @@ class InterceptingFileSystem : FileSystem {
     // rather than the process's working directory.
     fun <T> withSourceDirectory(dir: Path, block: () -> T): T {
         sourceDirectoryStack.get().addFirst(dir)
+        // Only meaningful within a single runFile's module graph — reset on entry/exit so a
+        // stale value can't leak from a previous, unrelated runFile call on a reused thread
+        // (e.g. across tests sharing a JVM), and so it doesn't survive past this call for
+        // the *next* runFile to (incorrectly) inherit as its own "most recently read" file.
+        val previousLastReadModuleDir = lastReadModuleDir.get()
+        lastReadModuleDir.set(null)
         try {
             return block()
         } finally {
             sourceDirectoryStack.get().removeFirst()
+            lastReadModuleDir.set(previousLastReadModuleDir)
         }
     }
 
@@ -94,7 +141,7 @@ class InterceptingFileSystem : FileSystem {
         // we're in an npm-style project (some ancestor has a `node_modules` dir) do we
         // treat a missing package as an error worth surfacing.
         if (path.startsWith("#")) {
-            val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
+            val fromDir = currentResolutionDir()
             resolveSubpathImport(path, fromDir)?.let { return it }
             throw MyceliumException(
                 "mycelium: cannot find module '$path' — no matching \"imports\" entry found in any " +
@@ -103,7 +150,7 @@ class InterceptingFileSystem : FileSystem {
         }
         if (isBareSpecifier(path)) {
             coreModules[path]?.let { return syntheticCoreModulePath(it) }
-            val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
+            val fromDir = currentResolutionDir()
             val hostLang = detectHostLanguageFromCallStack()
 
             // "Try all, ordered by host language": a bare specifier encountered while the
@@ -209,9 +256,11 @@ class InterceptingFileSystem : FileSystem {
                 val packageDir = nodeModules.resolve(packageName)
                 if (Files.isDirectory(packageDir)) {
                     val resolved = if (subPath != null) {
-                        val candidate = packageDir.resolve(subPath)
-                        if (!Files.exists(candidate)) return NodeModuleResolution.PackageNotFound
-                        candidate
+                        resolveSubpathExport(packageDir, subPath)
+                            ?: resolveExtensionlessPath(packageDir.resolve(subPath)).let { candidate ->
+                                if (!Files.exists(candidate)) return NodeModuleResolution.PackageNotFound
+                                candidate
+                            }
                     } else {
                         resolvePackageEntryPoint(packageDir)
                     }
@@ -371,6 +420,30 @@ class InterceptingFileSystem : FileSystem {
         return resolveExtensionlessPath(packageDir.resolve(entry).normalize())
     }
 
+    // Resolves a package-relative subpath specifier (e.g. `es-errors/eval` -> subPath
+    // `eval`) against that package's own `package.json` `"exports"` map, per Node's subpath
+    // exports resolution — distinct from (and consulted before falling back to) a literal
+    // `packageDir.resolve(subPath)` file check, since modern packages increasingly ship an
+    // `"exports"` map whose subpath keys don't correspond 1:1 with files on disk (e.g.
+    // `es-errors`'s `"./eval": "./eval.js"`, where the exports *key* omits the extension
+    // the file actually has). Supports both exact subpath keys and single-`*`-wildcard
+    // pattern keys (e.g. `"./features/*": "./src/features/*.js"`), matching Node's own
+    // subpath pattern matching. Returns null (falling back to the caller's literal-path
+    // check) when there's no `"exports"` field, no `package.json`, or no matching entry.
+    private fun resolveSubpathExport(packageDir: Path, subPath: String): Path? {
+        val packageJson = packageDir.resolve("package.json")
+        if (!Files.exists(packageJson)) return null
+        val json = packageJson.readText()
+        val resolved = try {
+            context!!.eval("js", SUBPATH_EXPORT_RESOLVER).execute(json, subPath).let {
+                if (it.isString) it.asString() else null
+            }
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        return resolveExtensionlessPath(packageDir.resolve(resolved).normalize())
+    }
+
     // Mirrors Node's extension/directory-index probing for a path that doesn't resolve to
     // an existing file as-is — e.g. a package.json `"main": "./index"` field with no file
     // extension, or a `require`/`import` specifier written without one. If `path` itself
@@ -464,6 +537,12 @@ class InterceptingFileSystem : FileSystem {
         "node:https" to "https.mjs",
         "tty" to "tty.mjs",
         "node:tty" to "tty.mjs",
+        "http2" to "http2.mjs",
+        "node:http2" to "http2.mjs",
+        "net" to "net.mjs",
+        "node:net" to "net.mjs",
+        "tls" to "tls.mjs",
+        "node:tls" to "tls.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =
@@ -667,7 +746,18 @@ class InterceptingFileSystem : FileSystem {
     private fun resolveRequireTarget(specifier: String, fromDir: Path): Path {
         if (specifier.startsWith(".") || specifier.startsWith("/")) {
             val candidate = fromDir.resolve(specifier).normalize()
-            if (Files.exists(candidate) || candidate.extension.isNotEmpty()) return candidate
+            // Previously short-circuited on `candidate.extension.isNotEmpty()` to skip
+            // extension-probing an already-extensioned candidate — but `Path.extension`
+            // just looks for the last `.` in the filename, which false-positives on
+            // filenames that contain a `.` without it being a real extension separator
+            // (e.g. `require('./Reflect.getPrototypeOf')` resolving to the file
+            // `Reflect.getPrototypeOf.js`: `.getPrototypeOf` reads as a nonempty
+            // "extension" even though the specifier has no real extension at all). Always
+            // falling through to resolveExtensionlessPath when the literal path doesn't
+            // exist is safe either way — it returns `candidate` unchanged if none of the
+            // probed variants exist either, so genuinely-missing modules still error out
+            // exactly as before.
+            if (Files.exists(candidate)) return candidate
             return resolveExtensionlessPath(candidate)
         }
         coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
@@ -762,6 +852,47 @@ class InterceptingFileSystem : FileSystem {
                 }
             })
         """.trimIndent()
+
+        // Resolves a package-relative subpath specifier (the part of `pkg/foo/bar` after
+        // the package name — see resolveSubpathExport) against that package's own
+        // `package.json` `"exports"` map. Tries an exact `"./<subPath>"` key first, then
+        // falls back to a single-`*`-wildcard pattern key (Node requires the wildcard match
+        // to be the *highest-specificity* one, but in practice packages don't define
+        // overlapping patterns, so first-match-in-declaration-order is sufficient here).
+        // Returns null (not a string) when there's no `"exports"` field, `exports` is a bare
+        // string (meaning the package has no subpath exports at all, only a root export),
+        // or no key/pattern matches — which the Kotlin caller distinguishes from a real
+        // string result via `isString`, falling back to a literal on-disk path check.
+        private val SUBPATH_EXPORT_RESOLVER = """
+            (function (json, subPath) {
+                $RESOLVE_CONDITIONS_FN
+                try {
+                    var pkg = JSON.parse(json);
+                    var exp = pkg.exports;
+                    if (!exp || typeof exp !== "object") return null;
+                    var key = "./" + subPath;
+                    if (Object.prototype.hasOwnProperty.call(exp, key)) {
+                        return resolveConditions(exp[key], ["node", "import", "default"]);
+                    }
+                    var keys = Object.keys(exp);
+                    for (var i = 0; i < keys.length; i++) {
+                        var k = keys[i];
+                        var starIdx = k.indexOf("*");
+                        if (starIdx === -1) continue;
+                        var prefix = k.slice(0, starIdx);
+                        var suffix = k.slice(starIdx + 1);
+                        if (key.indexOf(prefix) === 0 && key.slice(key.length - suffix.length) === suffix) {
+                            var matched = key.slice(prefix.length, key.length - suffix.length);
+                            var target = resolveConditions(exp[k], ["node", "import", "default"]);
+                            if (typeof target === "string") return target.split("*").join(matched);
+                        }
+                    }
+                    return null;
+                } catch (e) {
+                    return null;
+                }
+            })
+        """.trimIndent()
     }
 
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) {
@@ -809,6 +940,15 @@ class InterceptingFileSystem : FileSystem {
         if (pushed) {
             val parent = path.parent ?: path
             sourceDirectoryStack.get().addFirst(parent)
+            // Record this as the "most recently read module's directory" — see
+            // lastReadModuleDir's own comment — but only once a runFile/withSourceDirectory
+            // context is actually active (i.e. sourceDirectoryStack already had something
+            // on it before the push above), so engine-bootstrap reads that happen before any
+            // user code runs (e.g. GraalVM loading a guest language's own home files, which
+            // do so with an empty stack) don't get mistaken for project-file reads.
+            if (sourceDirectoryStack.get().size > 1) {
+                lastReadModuleDir.set(parent)
+            }
         }
         try {
             // Node stdlib modules (`path`, ...) are served from bundled resources rather

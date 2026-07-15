@@ -665,6 +665,27 @@ class MyceliumIntegrationTest {
         assertEquals(14, result.asInt())
     }
 
+    // --- CJS module cache (see InterceptingFileSystem.cjsModuleCache) ---
+
+    @Test fun cjsModuleCacheReturnsSameObject() {
+        val mc = vm
+        val path = testResourcePath("cjs-add.js")
+        val dir = File(path).parentFile.absolutePath
+        mc.eval("js", "globalThis.__cjsA = globalThis.__mycelium_require__(\"$path\", \"$dir\")")
+        mc.eval("js", "globalThis.__cjsB = globalThis.__mycelium_require__(\"$path\", \"$dir\")")
+        val same = mc.eval("js", "globalThis.__cjsA === globalThis.__cjsB")
+        assertEquals(true, same.asBoolean())
+    }
+
+    @Test fun cjsCircularRequire() {
+        val mc = vm
+        val path = testResourcePath("circular-a.js")
+        val dir = File(path).parentFile.absolutePath
+        mc.eval("js", "globalThis.__circResult = globalThis.__mycelium_require__(\"$path\", \"$dir\")")
+        val result = mc.eval("js", "JSON.stringify(globalThis.__circResult)")
+        assertEquals("""{"loaded":true,"bSeenAtLoadTime":true}""", result.asString())
+    }
+
     // --- Node stdlib `path` module ---
 
     @Test fun importPathModule() {

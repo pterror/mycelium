@@ -21,6 +21,16 @@ class InterceptingFileSystem : FileSystem {
     private val delegate = FileSystem.newDefaultFileSystem()
     private val sourceDirectoryStack = ThreadLocal.withInitial { ArrayDeque<Path>() }
 
+    // `require()`d CommonJS modules, keyed by resolved absolute path (as a string). Each
+    // cached Value is the module's Node-style module object — `{ exports, id, filename,
+    // loaded }` — not just its exports, and is inserted into the cache *before* the
+    // module body runs (see requireCjsModule). That's what makes a circular require (A
+    // requires B while B is still in the middle of requiring A) return the same,
+    // possibly-still-partial `module.exports` object reference instead of recursively
+    // re-evaluating A and stack-overflowing — and what makes `require(x) === require(x)`
+    // true and top-level module side effects run exactly once.
+    private val cjsModuleCache = mutableMapOf<String, org.graalvm.polyglot.Value>()
+
     fun init(context: Context, mycelium: Mycelium, yolo: Boolean = false) {
         this.context = context
         this.mycelium = mycelium
@@ -425,34 +435,122 @@ class InterceptingFileSystem : FileSystem {
     fun requireModule(specifier: String, fromDirStr: String): org.graalvm.polyglot.Value {
         val fromDir = Path.of(fromDirStr)
         val resolved = resolveRequireTarget(specifier, fromDir)
-        val content = readChannelToString(newByteChannel(resolved, setOf(StandardOpenOption.READ)))
-        // The content newByteChannel hands back here is always ESM (either genuinely
-        // authored as such, or CJS already transpiled to ESM by the branch above) — but
-        // `resolved`'s own extension may still say otherwise (e.g. a plain `.js` CJS
-        // file). Mirrors Mycelium.evalModule: writing to a real, `.mjs`-suffixed temp
-        // file (rather than an in-memory CharSequence Source) is what actually makes
-        // GraalJS both parse it as a module *and* hand context.eval() back the
-        // module's namespace object instead of `undefined` — a bare `.mimeType(...)`
-        // hint on a CharSequence Source was tried and evaluated fine but returned an
-        // empty namespace. The temp file is created alongside `resolved` (not in a
-        // generic system tmp dir) so any relative imports inside `content` keep
-        // resolving against the right base directory.
+        val cacheKey = resolved.toString()
+
+        cjsModuleCache[cacheKey]?.let { return it.getMember("exports") }
+
+        return if (resolved.startsWith(CORE_MODULE_PREFIX)) {
+            requireCoreModule(resolved, cacheKey)
+        } else {
+            requireCjsModule(resolved, cacheKey)
+        }
+    }
+
+    // Node's stdlib shims (path, events, ...) are shipped as genuine ESM sources rather
+    // than CommonJS (see node-stdlib/ resources), so they're evaluated as an ES module
+    // directly instead of being run through the Node-style CJS wrapper requireCjsModule
+    // uses. Still cached under the same `{ exports, loaded }` shape as CJS modules so the
+    // cache-lookup fast path in requireModule works uniformly regardless of which kind of
+    // module was loaded.
+    private fun requireCoreModule(resolved: Path, cacheKey: String): org.graalvm.polyglot.Value {
+        val content = readChannelToString(readCoreModule(resolved))
         // Core modules live at a synthetic path with no real parent directory on disk (and
         // have no relative imports of their own to resolve), so their temp file goes in
-        // the system temp dir instead of alongside a nonexistent "resolved.parent".
-        val tmpFileDir = if (resolved.startsWith(CORE_MODULE_PREFIX)) null else (resolved.parent ?: resolved).toFile()
-        val tmpFile = File.createTempFile("mycelium-require-", ".mjs", tmpFileDir)
-        val value = try {
+        // the system temp dir rather than alongside a nonexistent "resolved.parent".
+        return requireEsmModule(content, cacheKey, tmpFileDir = null)
+    }
+
+    // Evaluates `content` as a genuine ES module (rather than through the Node-style CJS
+    // wrapper requireCjsModule uses) and caches the result the same way, for callers that
+    // determined the target isn't actually CommonJS — core stdlib modules, and `.js` files
+    // that are nominally CommonJS by Node's package.json rule but contain genuine ESM
+    // syntax anyway (see looksLikeEsm).
+    private fun requireEsmModule(content: String, cacheKey: String, tmpFileDir: File?): org.graalvm.polyglot.Value {
+        // Mirrors Mycelium.evalModule: writing to a real, `.mjs`-suffixed temp file
+        // (rather than an in-memory CharSequence Source) is what actually makes GraalJS
+        // both parse it as a module *and* hand context.eval() back the module's namespace
+        // object instead of `undefined` — a bare `.mimeType(...)` hint on a CharSequence
+        // Source was tried and evaluated fine but returned an empty namespace. The temp
+        // file is created alongside the source's own directory (when known) so any
+        // relative imports inside `content` keep resolving against the right base
+        // directory.
+        val tmpFile = File.createTempFile("mycelium-require-esm-", ".mjs", tmpFileDir)
+        val moduleValue = try {
             tmpFile.writeText(content)
             context!!.eval(Source.newBuilder("js", tmpFile).build())
         } finally {
             tmpFile.delete()
         }
-        // Mirrors Node's CJS/ESM interop: a module with a default export (which is what
-        // our CJS transpile always produces — the original `module.exports` value) hands
-        // that back verbatim; a module with only named exports (e.g. a core module like
-        // `path`) hands back its whole namespace object instead.
-        return if (value.hasMember("default")) value.getMember("default") else value
+        // Mirrors Node's CJS/ESM interop: a module with a default export hands that back
+        // verbatim; a module with only named exports hands back its whole namespace
+        // object instead.
+        val exports = if (moduleValue.hasMember("default")) moduleValue.getMember("default") else moduleValue
+        val moduleObj = context!!.eval("js", "({ exports: undefined, loaded: true })")
+        moduleObj.putMember("exports", exports)
+        cjsModuleCache[cacheKey] = moduleObj
+        return exports
+    }
+
+    // Runs `resolved`'s source through Node's own CJS module-wrapping convention —
+    // wrapping it in `(function(exports, require, module, __filename, __dirname) { ... })`
+    // and invoking that function with a fresh `module`/`exports` object — rather than
+    // transpiling to ESM (the previous CjsCompiler/esbuild approach). This is what makes
+    // `module`, `exports`, `require`, `__filename` and `__dirname` all behave exactly as
+    // they do in Node without any static rewriting, and (combined with inserting the
+    // module object into the cache *before* calling the wrapper below) is what makes
+    // circular requires return partial exports instead of stack-overflowing.
+    private fun requireCjsModule(resolved: Path, cacheKey: String): org.graalvm.polyglot.Value {
+        val filename = resolved.toString()
+        val dir = (resolved.parent ?: resolved).toString()
+        val content = resolved.readText()
+
+        // See looksLikeEsm: a file can be *treated* as CommonJS by Node's own
+        // package.json-driven rule while still containing genuine ESM syntax — evaluate
+        // such content as a real ES module instead of wrapping it as CJS (which would be
+        // a syntax error, since `export`/top-level `import` aren't legal inside a
+        // function body).
+        if (looksLikeEsm(content)) {
+            return requireEsmModule(content, cacheKey, tmpFileDir = (resolved.parent ?: resolved).toFile())
+        }
+
+        val moduleObj = context!!.eval(
+            "js",
+            "({ exports: {}, id: ${jsonStringLiteral(filename)}, " +
+                "filename: ${jsonStringLiteral(filename)}, loaded: false })"
+        )
+        // Inserted into the cache *before* the module body runs below — this is what
+        // makes a circular require (A requires B while B is still in the middle of
+        // requiring A) return the same, possibly-still-partial `module.exports` object
+        // reference instead of recursively re-evaluating A and stack-overflowing.
+        cjsModuleCache[cacheKey] = moduleObj
+
+        // A `require("./data.json")` should hand back the parsed JSON value itself (as in
+        // Node), not run JSON source text through the function wrapper below (which would
+        // parse as a syntactically-invalid function body for anything but a bare object
+        // literal statement).
+        if (resolved.extension == "json") {
+            val parsed = context!!.eval("js", "(function(json) { return JSON.parse(json); })").execute(content)
+            moduleObj.putMember("exports", parsed)
+            moduleObj.putMember("loaded", true)
+            return parsed
+        }
+
+        // Each module gets its own `require` function, closing over *that* module's own
+        // directory — not the entry file's — so a relative `require("./x")` inside a
+        // nested module resolves against the directory it actually lives in.
+        val requireForModule = context!!.eval(
+            "js",
+            "(function(id) { return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); })"
+        )
+
+        val wrapperSource = "(function(exports, require, module, __filename, __dirname) {\n" +
+            content +
+            "\n})"
+        val wrapperFn = context!!.eval(Source.newBuilder("js", wrapperSource, filename).build())
+
+        wrapperFn.execute(moduleObj.getMember("exports"), requireForModule, moduleObj, filename, dir)
+        moduleObj.putMember("loaded", true)
+        return moduleObj.getMember("exports")
     }
 
     // Escapes `s` as a JS double-quoted string literal, for splicing an arbitrary
@@ -508,6 +606,19 @@ class InterceptingFileSystem : FileSystem {
                 )
         }
     }
+
+    // Whether `content`'s top level actually uses ESM `import`/`export` syntax, regardless
+    // of what isCjsFile concluded from the file's extension/package.json — a `.js` file
+    // under a package.json lacking `"type": "module"` is *treated* as CommonJS by Node's
+    // own rule, but some fixtures/packages in the wild (and in this codebase's own tests,
+    // e.g. writeFakePackage) ship genuine ESM source under that configuration anyway.
+    // Wrapping such a file in the CJS `(function(exports, require, module, ...) { ... })`
+    // wrapper would be a syntax error (`export`/top-level `import` aren't legal inside a
+    // function body), so both requireCjsModule and the ESM-import branch of newByteChannel
+    // check this first and fall back to evaluating the content as a genuine ES module.
+    private val esmSyntaxPattern = Regex("(?m)^\\s*(import\\s|import\\{|export\\s|export\\{|export\\*)")
+
+    private fun looksLikeEsm(content: String): Boolean = esmSyntaxPattern.containsMatchIn(content)
 
     companion object {
         private const val CORE_MODULE_PREFIX = "/.mycelium-core/"
@@ -577,24 +688,33 @@ class InterceptingFileSystem : FileSystem {
                 val js = TsCompiler.transpile(path)
                 return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
             }
-            // CommonJS (require()/module.exports) source is transpiled to ESM via esbuild
-            // before GraalJS ever sees it — see CjsCompiler for why `bundle = false` is
-            // used and what shape the output takes. The one thing that transpile leaves
-            // unresolved is the free `require` identifier itself, so a small shim
-            // (closing over this file's own directory, since the source-directory stack
-            // will have already unwound by the time this code actually runs) is prepended
-            // ahead of it, backed by the `__mycelium_require__` global Mycelium.init wires
-            // up to InterceptingFileSystem.requireModule.
+            // CommonJS (require()/module.exports) source is never transpiled or evaluated
+            // through GraalJS's ordinary ESM pipeline at all — instead, whenever GraalJS's
+            // `import` machinery asks for the byte content of a CJS file (e.g. a plain
+            // `import x from "./foo.js"` where foo.js is CommonJS), a one-line ESM shim
+            // is handed back that defers to the exact same Node-style module loader
+            // `require()` itself uses — InterceptingFileSystem.requireModule, via the
+            // `__mycelium_require__` global Mycelium.init wires up. Routing both `import`
+            // and `require()` of a CJS file through requireModule means both share its
+            // module cache: `import`ing the same CJS file twice, or `require`ing it from
+            // two different modules, evaluates its top-level code exactly once and hands
+            // back the same `module.exports` object each time (see cjsModuleCache).
             if (!path.startsWith("/.mycelium/") &&
                 isCjsFile(path) &&
                 !options.contains(StandardOpenOption.WRITE) &&
                 !options.contains(StandardOpenOption.CREATE)
             ) {
-                val js = CjsCompiler.transpile(path)
+                val content = path.readText()
+                // See looksLikeEsm: a `.js` file can be *treated* as CommonJS by Node's
+                // own package.json-driven rule while still containing genuine ESM syntax
+                // — pass such content through unchanged rather than wrapping it as CJS.
+                if (looksLikeEsm(content)) {
+                    return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
+                }
                 val dir = (path.parent ?: path).toString()
-                val requireShim = "function require(id) { " +
-                    "return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); }\n"
-                return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(requireShim + js))
+                val esmShim = "export default globalThis.__mycelium_require__(" +
+                    "${jsonStringLiteral(path.toString())}, ${jsonStringLiteral(dir)});\n"
+                return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(esmShim))
             }
             val mc = mycelium!!
             val frames = mutableListOf<String>()

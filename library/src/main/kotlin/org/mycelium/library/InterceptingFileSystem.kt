@@ -426,6 +426,20 @@ class InterceptingFileSystem : FileSystem {
         "node:crypto" to "crypto.mjs",
         "process" to "process.mjs",
         "node:process" to "process.mjs",
+        "assert" to "assert.mjs",
+        "node:assert" to "assert.mjs",
+        "assert/strict" to "assert.mjs",
+        "node:assert/strict" to "assert.mjs",
+        "querystring" to "querystring.mjs",
+        "node:querystring" to "querystring.mjs",
+        "string_decoder" to "string_decoder.mjs",
+        "node:string_decoder" to "string_decoder.mjs",
+        "zlib" to "zlib.mjs",
+        "node:zlib" to "zlib.mjs",
+        "http" to "http.mjs",
+        "node:http" to "http.mjs",
+        "https" to "https.mjs",
+        "node:https" to "https.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

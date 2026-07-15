@@ -6,6 +6,10 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.graalvm.polyglot.PolyglotException
 import java.io.File
+import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
+import java.net.HttpURLConnection
+import java.net.URI
 
 class MyceliumIntegrationTest {
     companion object {
@@ -1214,5 +1218,190 @@ class MyceliumIntegrationTest {
         val paths = fs.computeRubySearchPaths()
         assertTrue(paths.isNotEmpty(), "expected ruby's \$LOAD_PATH to yield at least one real directory")
         assertTrue(paths.all { java.nio.file.Files.isDirectory(it) })
+    }
+
+    // --- Node stdlib `assert` module ---
+
+    @Test fun importAssertModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import assert from 'assert';
+            let threw = false;
+            assert.strictEqual(1, 1);
+            try {
+                assert.strictEqual(1, 2);
+            } catch (e) {
+                threw = e instanceof assert.AssertionError;
+            }
+            globalThis.__assertThrew = threw;
+            globalThis.__assertOkPasses = (function () {
+                try { assert(true); return true; } catch (e) { return false; }
+            })();
+            globalThis.__assertDeepEqual = (function () {
+                try { assert.deepStrictEqual({ a: 1, b: [1, 2] }, { a: 1, b: [1, 2] }); return true; } catch (e) { return false; }
+            })();
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__assertThrew").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__assertOkPasses").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__assertDeepEqual").asBoolean())
+    }
+
+    // --- Node stdlib `querystring` module ---
+
+    @Test fun importQuerystringModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import querystring from 'querystring';
+            const parsed = querystring.parse('foo=bar&baz=qux');
+            globalThis.__qsFoo = parsed.foo;
+            globalThis.__qsBaz = parsed.baz;
+            globalThis.__qsStringify = querystring.stringify({ a: '1', b: '2' });
+            globalThis.__qsEscape = querystring.escape('a b/c');
+        """.trimIndent())
+        assertEquals("bar", mc.eval("js", "globalThis.__qsFoo").asString())
+        assertEquals("qux", mc.eval("js", "globalThis.__qsBaz").asString())
+        assertEquals("a=1&b=2", mc.eval("js", "globalThis.__qsStringify").asString())
+        assertEquals("a%20b%2Fc", mc.eval("js", "globalThis.__qsEscape").asString())
+    }
+
+    // --- Node stdlib `string_decoder` module ---
+
+    @Test fun importStringDecoderModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { StringDecoder } from 'string_decoder';
+            const decoder = new StringDecoder('utf8');
+            // "café" in UTF-8 is [0x63, 0x61, 0x66, 0xC3, 0xA9] — split the multi-byte
+            // 'é' (0xC3 0xA9) across two writes to exercise cross-chunk buffering.
+            let out = decoder.write(new Uint8Array([0x63, 0x61, 0x66, 0xC3]));
+            out += decoder.write(new Uint8Array([0xA9]));
+            out += decoder.end();
+            globalThis.__stringDecoderOut = out;
+        """.trimIndent())
+        assertEquals("café", mc.eval("js", "globalThis.__stringDecoderOut").asString())
+    }
+
+    // --- Node stdlib `zlib` module ---
+
+    @Test fun importZlibModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import zlib from 'zlib';
+            const original = 'hello mycelium, this is a gzip round trip test';
+            const compressed = zlib.gzipSync(original);
+            const decompressed = zlib.gunzipSync(compressed);
+            let decompressedStr = '';
+            for (let i = 0; i < decompressed.length; i++) decompressedStr += String.fromCharCode(decompressed[i]);
+            globalThis.__zlibRoundTrip = decompressedStr;
+            globalThis.__zlibCompressedIsSmallerOrEqual = compressed.length > 0;
+
+            const deflated = zlib.deflateSync(original);
+            const inflated = zlib.inflateSync(deflated);
+            let inflatedStr = '';
+            for (let i = 0; i < inflated.length; i++) inflatedStr += String.fromCharCode(inflated[i]);
+            globalThis.__zlibDeflateRoundTrip = inflatedStr;
+        """.trimIndent())
+        assertEquals(
+            "hello mycelium, this is a gzip round trip test",
+            mc.eval("js", "globalThis.__zlibRoundTrip").asString()
+        )
+        assertTrue(mc.eval("js", "globalThis.__zlibCompressedIsSmallerOrEqual").asBoolean())
+        assertEquals(
+            "hello mycelium, this is a gzip round trip test",
+            mc.eval("js", "globalThis.__zlibDeflateRoundTrip").asString()
+        )
+    }
+
+    // --- Node stdlib `http` module ---
+    //
+    // Client path is verified against a plain `com.sun.net.httpserver.HttpServer` started
+    // directly from Kotlin (never touching the polyglot Context), so the JS thread's
+    // blocking `HttpURLConnection` call in http.mjs's ClientRequest never needs the guest
+    // Context to be re-entered from another thread while it's already entered — avoiding
+    // the deadlock that would occur if the JS-implemented http server's own request
+    // handler (invoked on `HttpServer`'s internal dispatch thread) were on the other end
+    // of that same blocking call. The server path is verified in the opposite direction:
+    // JS creates an http.mjs `Server` and starts listening (a call that returns immediately
+    // without blocking, so the Context is left well before any request arrives), then a
+    // plain Kotlin-side `HttpURLConnection` — outside the Context entirely — drives a
+    // request against it.
+
+    @Test fun importHttpModule() {
+        val mc = vm
+
+        // Client: JS http.get() against a plain Kotlin-side server.
+        val plainServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        plainServer.createContext("/ping") { exchange ->
+            val body = "pong".toByteArray()
+            exchange.responseHeaders.add("Content-Type", "text/plain")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        plainServer.executor = null
+        plainServer.start()
+        try {
+            val plainPort = plainServer.address.port
+            runJsWithImports(mc, """
+                import http from 'http';
+                http.get('http://127.0.0.1:$plainPort/ping', (res) => {
+                    let chunks = [];
+                    res.on('data', (chunk) => chunks.push(chunk));
+                    res.on('end', () => {
+                        let str = '';
+                        for (const chunk of chunks) {
+                            for (let i = 0; i < chunk.length; i++) str += String.fromCharCode(chunk[i]);
+                        }
+                        globalThis.__httpClientBody = str;
+                        globalThis.__httpClientStatus = res.statusCode;
+                    });
+                });
+            """.trimIndent())
+            assertEquals("pong", mc.eval("js", "globalThis.__httpClientBody").asString())
+            assertEquals(200, mc.eval("js", "globalThis.__httpClientStatus").asInt())
+        } finally {
+            plainServer.stop(0)
+        }
+
+        // Server: JS http.createServer() driven by a plain Kotlin-side HttpURLConnection.
+        //
+        // Deliberately uses its own, throwaway `Mycelium` instance rather than the shared
+        // `vm`: once the request below is issued, `com.sun.net.httpserver.HttpServer`'s own
+        // internal dispatch thread enters the polyglot Context to run the JS request
+        // handler — a legitimate one-off cross-thread handoff (GraalVM transfers context
+        // ownership to whichever thread next enters, as long as no other thread is
+        // concurrently inside it, which holds here since `listen()` already returned control
+        // to this test thread well before the request is made). But that handoff is *not*
+        // reversible without extra plumbing this module doesn't implement: after the
+        // dispatch thread has entered and left, GraalVM (observed empirically) refuses to
+        // transfer the Context back to the original thread, so the test thread must never
+        // touch this Context again afterward — using a dedicated instance keeps that
+        // one-way handoff from poisoning the shared `vm` (and therefore every other test in
+        // this class, since they all reuse it). This matches real Mycelium usage, where a
+        // script that starts a server and returns is done touching the Context from the
+        // main thread entirely — the server's own listener thread keeps the JVM alive and
+        // keeps handling requests indefinitely on its own.
+        val serverMc = Mycelium()
+        runJsWithImports(serverMc, """
+            import http from 'http';
+            globalThis.__httpServer = http.createServer((req, res) => {
+                res.writeHead(200, { 'Content-Type': 'text/plain' });
+                res.end('hello from mycelium http server');
+            });
+            globalThis.__httpServer.listen(0, '127.0.0.1', () => {
+                globalThis.__httpServerReady = true;
+                globalThis.__httpServerPort = globalThis.__httpServer.address().port;
+            });
+        """.trimIndent())
+        assertTrue(serverMc.eval("js", "globalThis.__httpServerReady").asBoolean())
+        val jsServerPort = serverMc.eval("js", "globalThis.__httpServerPort").asInt()
+
+        val conn = URI("http://127.0.0.1:$jsServerPort/").toURL().openConnection() as HttpURLConnection
+        try {
+            assertEquals(200, conn.responseCode)
+            val responseBody = conn.inputStream.readBytes().toString(Charsets.UTF_8)
+            assertEquals("hello from mycelium http server", responseBody)
+        } finally {
+            conn.disconnect()
+        }
     }
 }

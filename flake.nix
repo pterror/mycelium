@@ -23,6 +23,7 @@
               java = jdk21;
             })
             llvmPackages.clang
+            rustc
           ];
           # graalvm-ce's setup hook exports JAVA_HOME, which would otherwise
           # win over the JDK 21 baked into the wrapped `gradle` above (Gradle

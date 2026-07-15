@@ -1315,6 +1315,128 @@ class MyceliumIntegrationTest {
         assertTrue(mc.eval("js", "globalThis.__cryptoTimingSafeEqual").asBoolean())
     }
 
+    @Test fun cryptoPbkdf2SyncDerivesKey() {
+        val mc = vm
+        // RFC 6070 test vector 1: PBKDF2-HMAC-SHA1("password", "salt", 1, 20).
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            globalThis.__pbkdf2 = crypto.pbkdf2Sync('password', 'salt', 1, 20, 'sha1').toString('hex');
+        """.trimIndent())
+        assertEquals(
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6",
+            mc.eval("js", "globalThis.__pbkdf2").asString()
+        )
+    }
+
+    @Test fun cryptoSignAndVerifyRsa() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+            const data = 'the quick brown fox';
+            const signer = crypto.createSign('sha256');
+            signer.update(data);
+            const signature = signer.sign(privateKey);
+            const verifier = crypto.createVerify('sha256');
+            verifier.update(data);
+            globalThis.__rsaVerifyOk = verifier.verify(publicKey, signature);
+
+            const tamperedVerifier = crypto.createVerify('sha256');
+            tamperedVerifier.update(data + '!');
+            globalThis.__rsaVerifyTampered = tamperedVerifier.verify(publicKey, signature);
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__rsaVerifyOk").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__rsaVerifyTampered").asBoolean())
+    }
+
+    @Test fun cryptoSignAndVerifyEc() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+            const data = 'ec signed message';
+            const signature = crypto.sign('sha256', Buffer.from(data), privateKey);
+            globalThis.__ecVerifyOk = crypto.verify('sha256', Buffer.from(data), publicKey, signature);
+            globalThis.__ecVerifyTampered = crypto.verify('sha256', Buffer.from(data + 'x'), publicKey, signature);
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__ecVerifyOk").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__ecVerifyTampered").asBoolean())
+    }
+
+    @Test fun cryptoGenerateKeyPairSync() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+                modulusLength: 2048,
+                publicKeyEncoding: { type: 'spki', format: 'pem' },
+                privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+            });
+            globalThis.__pubIsPem = typeof publicKey === 'string' && publicKey.includes('BEGIN PUBLIC KEY');
+            globalThis.__privIsPem = typeof privateKey === 'string' && privateKey.includes('BEGIN PRIVATE KEY');
+
+            const keyObjectPair = crypto.generateKeyPairSync('ec', { namedCurve: 'secp384r1' });
+            globalThis.__pubKeyObjType = keyObjectPair.publicKey.type;
+            globalThis.__privKeyObjType = keyObjectPair.privateKey.type;
+            globalThis.__ecAsymmetricType = keyObjectPair.publicKey.asymmetricKeyType;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__pubIsPem").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__privIsPem").asBoolean())
+        assertEquals("public", mc.eval("js", "globalThis.__pubKeyObjType").asString())
+        assertEquals("private", mc.eval("js", "globalThis.__privKeyObjType").asString())
+        assertEquals("ec", mc.eval("js", "globalThis.__ecAsymmetricType").asString())
+    }
+
+    @Test fun cryptoHkdfSyncMatchesRfc5869Vector() {
+        val mc = vm
+        // RFC 5869 §A.1 test case 1 (HKDF-SHA256).
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            const ikm = Buffer.from('0b'.repeat(22), 'hex');
+            const salt = Buffer.from('000102030405060708090a0b0c', 'hex');
+            const info = Buffer.from('f0f1f2f3f4f5f6f7f8f9', 'hex');
+            globalThis.__hkdf = crypto.hkdfSync('sha256', ikm, salt, info, 42).toString('hex');
+        """.trimIndent())
+        assertEquals(
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+            mc.eval("js", "globalThis.__hkdf").asString()
+        )
+    }
+
+    @Test fun cryptoScryptSyncMatchesRfc7914Vector() {
+        val mc = vm
+        // RFC 7914 §12 test vector 1: scrypt("", "", N=16, r=1, p=1, dkLen=64).
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            globalThis.__scrypt = crypto.scryptSync('', '', 64, { N: 16, r: 1, p: 1 }).toString('hex');
+        """.trimIndent())
+        assertEquals(
+            "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442" +
+                "fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906",
+            mc.eval("js", "globalThis.__scrypt").asString()
+        )
+    }
+
+    @Test fun cryptoRandomFillSync() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            const buf = Buffer.alloc(32);
+            crypto.randomFillSync(buf);
+            globalThis.__randomFillNonZero = buf.some((b) => b !== 0);
+            globalThis.__randomFillLen = buf.length;
+
+            const buf2 = Buffer.alloc(16, 0xff);
+            crypto.randomFillSync(buf2, 4, 8);
+            globalThis.__randomFillPartialUntouchedStart = buf2[0] === 0xff && buf2[3] === 0xff;
+            globalThis.__randomFillPartialUntouchedEnd = buf2[12] === 0xff && buf2[15] === 0xff;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__randomFillNonZero").asBoolean())
+        assertEquals(32, mc.eval("js", "globalThis.__randomFillLen").asInt())
+        assertTrue(mc.eval("js", "globalThis.__randomFillPartialUntouchedStart").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__randomFillPartialUntouchedEnd").asBoolean())
+    }
+
     // --- `globalThis.crypto` (Web Crypto API) ---
 
     @Test fun globalCryptoExists() {

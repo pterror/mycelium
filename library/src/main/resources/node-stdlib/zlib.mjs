@@ -32,11 +32,21 @@ function toJByteArray(data) {
     return bytes;
 }
 
+// Real Node's zlib `*Sync` functions (and the streaming API's `data` events) hand back an
+// actual `Buffer` — not a plain `Uint8Array` — and callers rely on that: e.g.
+// `@mongodb-js/saslprep`'s `dist/code-points-data.js` does
+// `zlib.gunzipSync(Buffer.from(...))` and then immediately calls `.readUInt32BE(...)` on
+// the result, a `Buffer`-only method a bare `Uint8Array` doesn't have. `globalThis.Buffer`
+// is set up during context init (see PROCESS_INIT_SCRIPT/GLOBAL_CRYPTO_INIT_SCRIPT-style
+// globals in Mycelium.kt) before any guest code (including this module) runs, so it's
+// available here as a bare global rather than imported — a direct `import ... from
+// "buffer"` isn't reliable from within another core module (see http.mjs's own comment on
+// why core modules are standalone synthetic resources).
 function fromJByteArray(jBytes, length) {
     const len = length === undefined ? jBytes.length : length;
-    const arr = new Uint8Array(len);
-    for (let i = 0; i < len; i++) arr[i] = jBytes[i] & 0xff;
-    return arr;
+    const buf = globalThis.Buffer.alloc(len);
+    for (let i = 0; i < len; i++) buf[i] = jBytes[i] & 0xff;
+    return buf;
 }
 
 // Like toJByteArray, but produces a plain JS array of unsigned byte values (0-255)

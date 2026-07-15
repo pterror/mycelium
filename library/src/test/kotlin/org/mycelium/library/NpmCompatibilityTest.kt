@@ -120,9 +120,9 @@ import java.net.URI
 //     counterpart) exist, inquirer WORKS end-to-end — see inquirerLoadsWithNamedCjsExports.
 //
 // Fourth round — heavier, more complex real-world packages (fastify, jsonwebtoken, bcryptjs,
-// moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — now 9/10 pass; only mongoose
-// remains `@Disabled`, on a distinct gap unrelated to the ones fixed below (see its own
-// entry further down):
+// moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — now 8/10 pass; `fastify` and
+// `sharp` remain `@Disabled`, each on its own distinct gap unrelated to the ones fixed
+// below (see their own entries further down):
 //
 //   - bcryptjs (password hashing, pure JS): WORKS. No native bindings involved (that's the
 //     real `bcrypt` package, not tested here) — hashSync/compareSync round-trip cleanly.
@@ -987,8 +987,14 @@ class NpmCompatibilityTest {
     // dependency) `require("./transports")` — where `./transports` is a directory whose
     // real entry point is `./transports/index.js` — short-circuited on the bare directory
     // path instead of falling through to `<dir>/index.*` probing (see class doc above for
-    // the full root-cause writeup). Also needed `timers`/`timers/promises` registered as
-    // core modules, transitively required once resolution got past the directory bug. ---
+    // the full root-cause writeup). Getting past that surfaced three further gaps, now all
+    // fixed: `timers`/`timers/promises` registered as core modules (transitively required
+    // by engine.io); `resolveNodeModule`'s `exports`-condition priority always favoring
+    // `"import"` over `"require"` even for a CJS `require()` (`ws`'s exports has sibling
+    // `import`/`require` conditions — see mongoose's entry below for the same class of
+    // fix); and Mycelium's own `http.mjs` `Server` class's self-contained minimal
+    // `EventEmitter` missing `listeners()`/`removeAllListeners()`, both called by
+    // engine.io's `attach()` on the `http.Server` passed to `new socketio.Server(...)`. ---
 
     @Test
     fun socketIoServerLoads() {
@@ -1011,27 +1017,30 @@ class NpmCompatibilityTest {
         assertEquals("function", mc.eval("js", "globalThis.__socketIoOnType").asString())
     }
 
-    // --- 27. mongoose — MongoDB ODM, huge dependency tree. Still FAILS, but no longer on
-    // the directory bug that used to throw an unqualified `Is a directory` exception (see
-    // class doc above — fixed the same way as socket.io, and also unblocked by registering
-    // `timers`/`timers/promises`). Now fails on a distinct, legitimate gap instead: a CJS
-    // `require()` of a dual-mode package (`@mongodb-js/saslprep`, transitive via bson/the
-    // mongodb driver) resolves through the *import*-biased `exports` condition priority
-    // (`resolvePackageEntryPoint`'s `["node", "import", "default"]`) instead of preferring
-    // the `"require"` condition, landing on the package's ESM wrapper instead of its CJS
-    // entry point — see class doc above for the full writeup. ---
+    // --- 27. mongoose — MongoDB ODM, huge dependency tree. WORKS: was FAILing on the same
+    // directory bug as socket.io (see class doc above — fixed the same way, and also
+    // unblocked by registering `timers`/`timers/promises`), which then exposed two further
+    // gaps before it loaded end-to-end:
+    //
+    //   1. `resolvePackageEntryPoint`/`resolveSubpathExport` always resolved a package's
+    //      `exports` map with import-biased condition priority (`["node", "import",
+    //      "default"]`), even when the package was being `require()`d — a dual-mode
+    //      package's `exports` can declare sibling `"import"`/`"require"` conditions with
+    //      no enclosing `"default"` (`ws`'s `{".": {"import": ..., "require": ...}}`,
+    //      `@mongodb-js/saslprep`'s similarly-shaped top-level `exports`), and always
+    //      preferring `"import"` hands a `require()` caller the wrong module. Both
+    //      `resolveNodeModule` and its two callers now take a `preferRequire` flag —
+    //      `true` from `resolveRequireTarget` (CJS), `false` from `parsePath` (ESM) — that
+    //      picks `["node", "require", "default"]` vs. `["node", "import", "default"]`.
+    //   2. Once saslprep's CJS entry (`dist/node.js`) resolved correctly, it exposed a
+    //      real bug: `zlib.gunzipSync(Buffer.from(...))` followed by `.readUInt32BE(...)`
+    //      on the result — `node-stdlib/zlib.mjs`'s `fromJByteArray` helper (backing
+    //      `gzipSync`/`gunzipSync`/`deflateSync`/etc) constructed a plain `Uint8Array`
+    //      rather than Mycelium's `Buffer` subclass, so `Buffer`-only methods like
+    //      `readUInt32BE` were missing on its return value. `fromJByteArray` now allocates
+    //      a real `Buffer` (via the `globalThis.Buffer` global) instead. ---
 
     @Test
-    @Disabled(
-        "FAILS: TypeError: data.readUInt32BE is not a function " +
-            "(node_modules/@mongodb-js/saslprep/dist/memory-code-points.js) — " +
-            "resolvePackageEntryPoint resolves exports with import-biased condition " +
-            "priority even when the package is being require()'d, so saslprep's " +
-            "require('@mongodb-js/saslprep') incorrectly resolves to its ESM wrapper " +
-            "(./dist/.esm-wrapper.mjs) instead of its CJS entry (./dist/node.js); the " +
-            "wrapper's re-exported binary data isn't backed by Mycelium's Buffer subclass " +
-            "the way the CJS entry's is."
-    )
     fun mongooseLoads() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 

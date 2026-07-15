@@ -3,21 +3,22 @@ package org.mycelium.app
 import org.mycelium.library.Mycelium
 import org.mycelium.library.MyceliumException
 
-// Parsed command line: the `--yolo` flag can appear anywhere (`mycelium --yolo file.mjs`
-// or `mycelium run --yolo file.mjs`), so it's stripped out of `rest` before the
-// remaining positional arguments are dispatched on below. Exposed (internal, not
-// private) so it can be exercised directly by a parse-only test without spinning up a
-// Mycelium/GraalVM Context.
-internal data class ParsedArgs(val yolo: Boolean, val rest: List<String>)
+// Parsed command line: the `--yolo`/`--no-install` flags can appear anywhere
+// (`mycelium --yolo file.mjs` or `mycelium run --yolo file.mjs`), so they're stripped out
+// of `rest` before the remaining positional arguments are dispatched on below. Exposed
+// (internal, not private) so it can be exercised directly by a parse-only test without
+// spinning up a Mycelium/GraalVM Context.
+internal data class ParsedArgs(val yolo: Boolean, val noInstall: Boolean, val rest: List<String>)
 
 internal fun parseArgs(args: Array<String>): ParsedArgs {
     val yolo = args.contains("--yolo")
-    val rest = args.filterNot { it == "--yolo" }
-    return ParsedArgs(yolo, rest)
+    val noInstall = args.contains("--no-install")
+    val rest = args.filterNot { it == "--yolo" || it == "--no-install" }
+    return ParsedArgs(yolo, noInstall, rest)
 }
 
 fun main(args: Array<String>) {
-    val (yolo, rest) = parseArgs(args)
+    val (yolo, noInstall, rest) = parseArgs(args)
 
     if (rest.isEmpty()) {
         printUsage()
@@ -32,14 +33,14 @@ fun main(args: Array<String>) {
                 System.exit(1)
                 return
             }
-            runFile(rest[1], yolo)
+            runFile(rest[1], yolo, noInstall)
         }
         "version" -> println("mycelium 0.1.0-dev")
         "help", "--help", "-h" -> printUsage()
         else -> {
             // If it looks like a file path, treat it as implicit `run`
             if (rest[0].contains('.')) {
-                runFile(rest[0], yolo)
+                runFile(rest[0], yolo, noInstall)
             } else {
                 System.err.println("mycelium: unknown command '${rest[0]}'")
                 printUsage()
@@ -49,9 +50,9 @@ fun main(args: Array<String>) {
     }
 }
 
-private fun runFile(path: String, yolo: Boolean) {
+private fun runFile(path: String, yolo: Boolean, noInstall: Boolean) {
     try {
-        val vm = Mycelium(yolo = yolo)
+        val vm = Mycelium(yolo = yolo, autoInstall = !noInstall)
         vm.runFile(path)
     } catch (e: MyceliumException) {
         System.err.println(e.message)
@@ -71,5 +72,6 @@ private fun printUsage() {
 
         flags:
           --yolo                 Auto-install missing npm packages on import
+          --no-install           Skip auto-installing dependencies declared in package.json
     """.trimIndent())
 }

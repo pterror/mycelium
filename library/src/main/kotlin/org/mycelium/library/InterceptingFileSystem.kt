@@ -385,6 +385,8 @@ class InterceptingFileSystem : FileSystem {
         "node:stream" to "stream.mjs",
         "crypto" to "crypto.mjs",
         "node:crypto" to "crypto.mjs",
+        "process" to "process.mjs",
+        "node:process" to "process.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

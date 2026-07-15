@@ -1039,6 +1039,95 @@ class MyceliumIntegrationTest {
         assertNull(fs.resolveRubyGem("does-not-exist", listOf(loadDir.toPath())))
     }
 
+    // --- `process` global ---
+
+    @Test fun processGlobalExists() {
+        val mc = vm
+        val result = mc.eval("js", "typeof process")
+        assertEquals("object", result.asString())
+    }
+
+    @Test fun processEnvReadsSystemEnv() {
+        val mc = vm
+        val result = mc.eval("js", "process.env.HOME || process.env.PATH || ''")
+        assertTrue(result.asString().isNotEmpty())
+    }
+
+    @Test fun processCwdWorks() {
+        val mc = vm
+        val result = mc.eval("js", "process.cwd()")
+        assertTrue(result.isString)
+        assertTrue(result.asString().isNotEmpty())
+    }
+
+    @Test fun processPlatformIsLinux() {
+        val mc = vm
+        val result = mc.eval("js", "process.platform")
+        assertEquals("linux", result.asString())
+    }
+
+    @Test fun processCoreModuleImportWorks() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import process, { platform, env } from 'process';
+            globalThis.__processDefaultIsGlobal = process === globalThis.process;
+            globalThis.__processPlatform = platform;
+            globalThis.__processHasEnv = typeof env === 'object';
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__processDefaultIsGlobal").asBoolean())
+        assertEquals("linux", mc.eval("js", "globalThis.__processPlatform").asString())
+        assertTrue(mc.eval("js", "globalThis.__processHasEnv").asBoolean())
+    }
+
+    // --- Manifest-based (package.json) auto-install ---
+
+    @Test fun manifestInstallRunsNpmInstall() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping manifest-install test")
+
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-manifest-install-").toFile()
+        tmpDir.deleteOnExit()
+        File(tmpDir, "package.json").apply {
+            writeText(
+                """{"name": "manifest-install-test", "version": "1.0.0", "dependencies": {"is-odd": "^3.0.1"}}"""
+            )
+            deleteOnExit()
+        }
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText(
+            """
+            import isOdd from "is-odd";
+            globalThis.__manifestInstallResult = isOdd(3);
+            """.trimIndent()
+        )
+        mainFile.deleteOnExit()
+
+        val mc = Mycelium()
+        mc.runFile(mainFile.absolutePath)
+        assertTrue(File(tmpDir, "node_modules").isDirectory)
+        assertTrue(File(tmpDir, "node_modules/is-odd").isDirectory)
+        val result = mc.eval("js", "globalThis.__manifestInstallResult")
+        assertTrue(result.asBoolean())
+    }
+
+    @Test fun noInstallFlagSkipsInstall() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-manifest-noinstall-").toFile()
+        tmpDir.deleteOnExit()
+        File(tmpDir, "package.json").apply {
+            writeText(
+                """{"name": "manifest-noinstall-test", "version": "1.0.0", "dependencies": {"is-odd": "^3.0.1"}}"""
+            )
+            deleteOnExit()
+        }
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText("""globalThis.__noInstallRan = true;""")
+        mainFile.deleteOnExit()
+
+        val mc = Mycelium(autoInstall = false)
+        mc.runFile(mainFile.absolutePath)
+        assertTrue(mc.eval("js", "globalThis.__noInstallRan").asBoolean())
+        assertFalse(File(tmpDir, "node_modules").exists())
+    }
+
     // Real python3/ruby-subprocess-dependent: verifies the "run once at startup, cache the
     // result" discovery mechanism itself actually produces a usable, non-empty list of
     // real directories on a machine where the respective runtime is installed. Skipped

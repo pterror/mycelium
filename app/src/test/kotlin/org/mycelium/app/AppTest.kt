@@ -34,6 +34,31 @@ class AppTest {
     @Test fun emptyArgsHasNoYoloAndEmptyRest() {
         val parsed = parseArgs(arrayOf())
         assertFalse(parsed.yolo)
+        assertFalse(parsed.noInstall)
         assertTrue(parsed.rest.isEmpty())
+    }
+
+    @Test fun noInstallFlagBeforeCommand() {
+        val parsed = parseArgs(arrayOf("--no-install", "run", "file.mjs"))
+        assertTrue(parsed.noInstall)
+        assertEquals(listOf("run", "file.mjs"), parsed.rest)
+    }
+
+    @Test fun noInstallFlagAfterRunCommand() {
+        val parsed = parseArgs(arrayOf("run", "--no-install", "file.mjs"))
+        assertTrue(parsed.noInstall)
+        assertEquals(listOf("run", "file.mjs"), parsed.rest)
+    }
+
+    @Test fun noInstallFlagDefaultsToFalse() {
+        val parsed = parseArgs(arrayOf("run", "file.mjs"))
+        assertFalse(parsed.noInstall)
+    }
+
+    @Test fun yoloAndNoInstallFlagsCanCombine() {
+        val parsed = parseArgs(arrayOf("--yolo", "--no-install", "file.mjs"))
+        assertTrue(parsed.yolo)
+        assertTrue(parsed.noInstall)
+        assertEquals(listOf("file.mjs"), parsed.rest)
     }
 }

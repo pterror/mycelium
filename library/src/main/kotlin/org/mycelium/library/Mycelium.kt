@@ -13,7 +13,15 @@ class Mycelium(
     // node_modules tree triggers an automatic `npm install`/`pnpm install` of the
     // missing package (see InterceptingFileSystem.yoloInstall) rather than immediately
     // failing with "cannot find module".
-    val yolo: Boolean = false
+    val yolo: Boolean = false,
+    // When true (the default), `runFile` checks for a `package.json` with declared
+    // dependencies alongside (or above) the entry file and, if `node_modules` is missing
+    // or empty, runs `npm install`/`pnpm install` there before executing — see
+    // maybeInstallDependencies. This is the declarative counterpart to `--yolo`: it runs
+    // unconditionally (not gated on yolo) since installing exactly what a manifest already
+    // declares is a much safer default than yolo's "install whatever a bare import
+    // resolves to". Set to false (the app's `--no-install` flag) to skip it entirely.
+    val autoInstall: Boolean = true
 ) {
     private val filesystem = InterceptingFileSystem()
 
@@ -73,6 +81,7 @@ class Mycelium(
             lang.injectEvalModule(context, evalModuleFn)
         }
         context.getBindings("js").putMember("__mycelium_require__", requireFn)
+        context.eval("js", PROCESS_INIT_SCRIPT)
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
@@ -100,6 +109,9 @@ class Mycelium(
                 "mycelium: don't know how to run '${file.name}' — supported extensions: " +
                     supportedExtensions.joinToString(", ")
             )
+        if (autoInstall) {
+            maybeInstallDependencies(file.absoluteFile.parentFile)
+        }
         val code = file.readText()
         val source = Source.newBuilder(language, code, path).build()
         val dir = file.absoluteFile.parentFile.toPath()
@@ -135,4 +147,178 @@ class Mycelium(
                     ?.let { ".$it" }
                     ?: ".tmp"
         }
+
+    // Walks up from `startDir` (inclusive) looking for the nearest ancestor directory
+    // containing a `package.json` — mirrors Node's own package-scope lookup, and matches
+    // isCjsFile's ancestor walk in InterceptingFileSystem. Returns the directory (not the
+    // file itself), since that's also where `node_modules` and the install command belong.
+    private fun findPackageJsonDir(startDir: File): File? {
+        var dir: File? = startDir.absoluteFile
+        while (dir != null) {
+            if (File(dir, "package.json").isFile) return dir
+            dir = dir.parentFile
+        }
+        return null
+    }
+
+    // The declarative counterpart to `--yolo`: before running a file, check whether the
+    // nearest ancestor `package.json` declares any dependencies and, if so, whether
+    // `node_modules` is missing or empty there. If both hold, run `npm install` (falling
+    // back to `pnpm install`) in that directory so the declared dependencies are present
+    // before the entry file's own imports get a chance to fail. Runs unconditionally
+    // (irrespective of `--yolo`) unless `autoInstall` is false (the app's `--no-install`
+    // flag) — installing exactly what a manifest already declares doesn't carry the same
+    // "install whatever a bare import happens to resolve to" risk `--yolo` does.
+    private fun maybeInstallDependencies(startDir: File) {
+        val pkgDir = findPackageJsonDir(startDir) ?: return
+        val pkgJsonFile = File(pkgDir, "package.json")
+        val pkgJsonText = try {
+            pkgJsonFile.readText()
+        } catch (e: java.io.IOException) {
+            return
+        }
+        if (!packageJsonDeclaresDependencies(pkgJsonText)) return
+
+        val nodeModules = File(pkgDir, "node_modules")
+        val nodeModulesIsEmpty = !nodeModules.exists() ||
+            (nodeModules.isDirectory && (nodeModules.list()?.isEmpty() ?: true))
+        if (!nodeModulesIsEmpty) return
+
+        System.err.println("mycelium: installing dependencies from package.json...")
+        val exitCode = runInstallCommand(listOf("npm", "install"), pkgDir)
+            ?: runInstallCommand(listOf("pnpm", "install"), pkgDir)
+            ?: throw MyceliumException(
+                "mycelium: manifest-based install requires npm or pnpm to be installed"
+            )
+        if (exitCode != 0) {
+            throw MyceliumException(
+                "mycelium: manifest-based install failed (exit code $exitCode)"
+            )
+        }
+    }
+
+    // Runs an install command, returning its exit code, or `null` if the command itself
+    // couldn't be launched (e.g. the binary isn't on PATH) so the caller can fall back to
+    // a different package manager — same approach as InterceptingFileSystem's
+    // runInstallCommand (used by `--yolo`), duplicated here since this class has no
+    // dependency on InterceptingFileSystem's internals. IO is inherited so the user sees
+    // npm/pnpm's own install progress rather than it being silently swallowed.
+    private fun runInstallCommand(command: List<String>, dir: File): Int? =
+        try {
+            ProcessBuilder(command).directory(dir).inheritIO().start().waitFor()
+        } catch (e: java.io.IOException) {
+            null
+        }
+
+    // Parses `package.json` text and reports whether it declares any non-empty
+    // `dependencies` or `devDependencies`. Delegates to the shared JS Context (rather than
+    // a JVM JSON library) purely to reuse GraalJS's JSON.parse, mirroring
+    // InterceptingFileSystem's ENTRY_POINT_RESOLVER/PACKAGE_TYPE_RESOLVER pattern.
+    // Malformed JSON is treated as "nothing to install" rather than propagating a parse
+    // error out of what's otherwise a best-effort pre-flight check.
+    private fun packageJsonDeclaresDependencies(json: String): Boolean =
+        context.eval("js", PACKAGE_DEPS_CHECK).execute(json).asBoolean()
+
+    companion object {
+        private val PACKAGE_DEPS_CHECK = """
+            (function (json) {
+                try {
+                    var pkg = JSON.parse(json);
+                    var deps = pkg.dependencies;
+                    var devDeps = pkg.devDependencies;
+                    var hasDeps = !!deps && Object.keys(deps).length > 0;
+                    var hasDevDeps = !!devDeps && Object.keys(devDeps).length > 0;
+                    return hasDeps || hasDevDeps;
+                } catch (e) {
+                    return false;
+                }
+            })
+        """.trimIndent()
+
+        // Injects a Node-compatible `process` global onto `globalThis` before any guest
+        // code runs (see the `init` block above) — many npm packages assume `process`
+        // exists unconditionally, even outside actual Node. `Java.type(...)` (GraalJS's
+        // Java interop) is used throughout rather than any Mycelium-side plumbing, since
+        // this only needs to read a handful of JVM system properties/env vars.
+        private val PROCESS_INIT_SCRIPT = """
+            (function () {
+                var JSystem = Java.type('java.lang.System');
+                var JProcessHandle = Java.type('java.lang.ProcessHandle');
+
+                function getenvMap() {
+                    return JSystem.getenv();
+                }
+
+                var envProxy = new Proxy({}, {
+                    get: function (target, key) {
+                        if (typeof key !== 'string') return undefined;
+                        var v = getenvMap().get(key);
+                        return v === null || v === undefined ? undefined : String(v);
+                    },
+                    has: function (target, key) {
+                        if (typeof key !== 'string') return false;
+                        return !!getenvMap().containsKey(key);
+                    },
+                    ownKeys: function () {
+                        var keys = [];
+                        var it = getenvMap().keySet().iterator();
+                        while (it.hasNext()) keys.push(String(it.next()));
+                        return keys;
+                    },
+                    getOwnPropertyDescriptor: function (target, key) {
+                        if (!getenvMap().containsKey(key)) return undefined;
+                        return { enumerable: true, configurable: true, value: String(getenvMap().get(key)) };
+                    }
+                });
+
+                var current = JProcessHandle.current();
+                var parentPid = current.parent().isPresent() ? Number(current.parent().get().pid()) : 0;
+
+                globalThis.process = {
+                    env: envProxy,
+                    argv: [],
+                    cwd: function () { return String(JSystem.getProperty('user.dir')); },
+                    chdir: function (dir) { /* not really possible in JVM */ },
+                    exit: function (code) { JSystem.exit(code || 0); },
+                    platform: (function () {
+                        var os = String(JSystem.getProperty('os.name')).toLowerCase();
+                        if (os.includes('linux')) return 'linux';
+                        if (os.includes('mac') || os.includes('darwin')) return 'darwin';
+                        if (os.includes('win')) return 'win32';
+                        return os;
+                    })(),
+                    arch: (function () {
+                        var arch = String(JSystem.getProperty('os.arch'));
+                        if (arch === 'amd64' || arch === 'x86_64') return 'x64';
+                        if (arch === 'aarch64') return 'arm64';
+                        return arch;
+                    })(),
+                    version: 'v20.0.0',
+                    versions: { node: '20.0.0', mycelium: '0.1.0' },
+                    pid: Number(current.pid()),
+                    ppid: parentPid,
+                    stdout: {
+                        write: function (s) { JSystem.out.print(s); return true; },
+                        isTTY: false,
+                    },
+                    stderr: {
+                        write: function (s) { JSystem.err.print(s); return true; },
+                        isTTY: false,
+                    },
+                    stdin: { isTTY: false },
+                    hrtime: {
+                        bigint: function () { return BigInt(JSystem.nanoTime()); },
+                    },
+                    nextTick: function (fn) {
+                        var args = Array.prototype.slice.call(arguments, 1);
+                        Promise.resolve().then(function () { fn.apply(null, args); });
+                    },
+                    emitWarning: function (msg) { JSystem.err.println('Warning: ' + msg); },
+                    on: function () { return globalThis.process; },
+                    once: function () { return globalThis.process; },
+                    removeListener: function () { return globalThis.process; },
+                };
+            })();
+        """.trimIndent()
+    }
 }

@@ -146,6 +146,25 @@ export function mkdirSync(path, options) {
     }
 }
 
+// Node's fs.mkdtempSync(prefix) creates a new directory in prefix's parent whose name is
+// `prefix` (which itself may embed a path, e.g. path.join(os.tmpdir(), "foo-")) followed
+// by random characters, and returns the full path to the created directory —
+// java.nio.file.Files.createTempDirectory(parentDir, prefixName) implements exactly that
+// (appending its own random suffix), so this just needs to split `prefix` into its parent
+// directory and basename first.
+export function mkdtempSync(prefix, options) {
+    const prefixStr = String(prefix);
+    const slashIdx = Math.max(prefixStr.lastIndexOf("/"), prefixStr.lastIndexOf("\\"));
+    const dir = slashIdx >= 0 ? prefixStr.slice(0, slashIdx + 1) : "./";
+    const base = slashIdx >= 0 ? prefixStr.slice(slashIdx + 1) : prefixStr;
+    const parent = p(dir);
+    if (!JFiles.exists(parent)) {
+        JFiles.createDirectories(parent);
+    }
+    const created = JFiles.createTempDirectory(parent, base);
+    return String(created.toString());
+}
+
 export function readdirSync(path, options) {
     const target = p(path);
     const withFileTypes = options && typeof options === "object" && options.withFileTypes;
@@ -688,6 +707,7 @@ export const readFile = wrapAsync(readFileSync);
 export const writeFile = wrapAsync(writeFileSync);
 export const appendFile = wrapAsync(appendFileSync);
 export const mkdir = wrapAsync(mkdirSync);
+export const mkdtemp = wrapAsync(mkdtempSync);
 export const readdir = wrapAsync(readdirSync);
 export const stat = wrapAsync(statSync);
 export const lstat = wrapAsync(lstatSync);
@@ -754,6 +774,7 @@ export const promises = {
     writeFile: (path, data, options) => writeFile(path, data, options),
     appendFile: (path, data, options) => appendFile(path, data, options),
     mkdir: (path, options) => mkdir(path, options),
+    mkdtemp: (prefix, options) => mkdtemp(prefix, options),
     readdir: (path, options) => readdir(path, options),
     stat: (path) => stat(path),
     lstat: (path) => lstat(path),
@@ -777,6 +798,7 @@ export default {
     writeFileSync,
     appendFileSync,
     mkdirSync,
+    mkdtempSync,
     readdirSync,
     statSync,
     lstatSync,
@@ -802,6 +824,7 @@ export default {
     writeFile,
     appendFile,
     mkdir,
+    mkdtemp,
     readdir,
     stat,
     lstat,

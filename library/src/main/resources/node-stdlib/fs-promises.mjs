@@ -11,6 +11,7 @@ import { constants, promises } from "fs";
 export const access = promises.access;
 export const copyFile = promises.copyFile;
 export const mkdir = promises.mkdir;
+export const mkdtemp = promises.mkdtemp;
 export const readdir = promises.readdir;
 export const readlink = promises.readlink;
 export const symlink = promises.symlink;

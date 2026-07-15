@@ -317,6 +317,56 @@ export function createServer() {
     );
 }
 
-export { STATUS_CODES, IncomingMessage, ClientRequest };
+// ---- Agent ----
+//
+// See http.mjs's Agent for the full rationale: our client requests are each backed by
+// their own `HttpsURLConnection`, which pools/reuses connections internally at the JVM
+// level, so this class doesn't need to do any real pooling — it exists so packages that
+// construct `new https.Agent({ ... })` (very common for e.g. passing `rejectUnauthorized:
+// false`) don't crash.
+class Agent {
+    constructor(options = {}) {
+        this.keepAlive = options.keepAlive || false;
+        this.keepAliveMsecs = options.keepAliveMsecs !== undefined ? options.keepAliveMsecs : 1000;
+        this.maxSockets = options.maxSockets !== undefined ? options.maxSockets : Infinity;
+        this.maxFreeSockets = options.maxFreeSockets !== undefined ? options.maxFreeSockets : 256;
+        this.maxTotalSockets = options.maxTotalSockets !== undefined ? options.maxTotalSockets : Infinity;
+        this.timeout = options.timeout;
+        this.scheduling = options.scheduling || "lifo";
+        this.options = options;
+        this.protocol = "https:";
+        this.sockets = {};
+        this.freeSockets = {};
+        this.requests = {};
+    }
 
-export default { request, get, createServer, STATUS_CODES, IncomingMessage, ClientRequest };
+    createConnection(options, callback) {
+        const err = new Error("mycelium: Agent.createConnection is not implemented (connections are managed internally)");
+        if (typeof callback === "function") {
+            nextTick(() => callback(err));
+            return undefined;
+        }
+        throw err;
+    }
+
+    getName(options = {}) {
+        const host = options.host || options.hostname || "localhost";
+        const port = options.port || 443;
+        const localAddress = options.localAddress ? `:${options.localAddress}` : "";
+        return `${host}:${port}${localAddress}`;
+    }
+
+    destroy() {
+        this.sockets = {};
+        this.freeSockets = {};
+        this.requests = {};
+    }
+}
+
+const globalAgent = new Agent({ keepAlive: false });
+
+export { STATUS_CODES, IncomingMessage, ClientRequest, Agent, globalAgent };
+
+export default {
+    request, get, createServer, STATUS_CODES, IncomingMessage, ClientRequest, Agent, globalAgent,
+};

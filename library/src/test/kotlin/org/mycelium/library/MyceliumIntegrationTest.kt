@@ -1949,6 +1949,44 @@ class MyceliumIntegrationTest {
         }
     }
 
+    // --- Node stdlib `http`/`https` `Agent` ---
+    //
+    // Our client requests are each backed by their own HttpURLConnection/HttpsURLConnection
+    // (which do their own connection pooling internally at the JVM level — see http.mjs's
+    // Agent doc comment), so there's no real pooling behavior to exercise here; this just
+    // checks the shape (constructor options, globalAgent, methods) that consumers poke at.
+
+    @Test fun importHttpAgentModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import http from 'http';
+            const agent = new http.Agent({ keepAlive: true, maxSockets: 5 });
+            globalThis.__httpAgentKeepAlive = agent.keepAlive;
+            globalThis.__httpAgentMaxSockets = agent.maxSockets;
+            globalThis.__httpAgentGetName = agent.getName({ host: 'example.com', port: 8080 });
+            globalThis.__httpGlobalAgentType = typeof http.globalAgent;
+            globalThis.__httpGlobalAgentKeepAlive = http.globalAgent.keepAlive;
+            agent.destroy();
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__httpAgentKeepAlive").asBoolean())
+        assertEquals(5, mc.eval("js", "globalThis.__httpAgentMaxSockets").asInt())
+        assertEquals("example.com:8080", mc.eval("js", "globalThis.__httpAgentGetName").asString())
+        assertEquals("object", mc.eval("js", "globalThis.__httpGlobalAgentType").asString())
+        assertEquals(false, mc.eval("js", "globalThis.__httpGlobalAgentKeepAlive").asBoolean())
+    }
+
+    @Test fun importHttpsAgentModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import https from 'https';
+            const agent = new https.Agent({ keepAlive: true });
+            globalThis.__httpsAgentKeepAlive = agent.keepAlive;
+            globalThis.__httpsGlobalAgentType = typeof https.globalAgent;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__httpsAgentKeepAlive").asBoolean())
+        assertEquals("object", mc.eval("js", "globalThis.__httpsGlobalAgentType").asString())
+    }
+
     // --- Node stdlib `http2` module (client side) ---
     //
     // Verified against a plain `com.sun.net.httpserver.HttpServer` (HTTP/1.1-only) rather
@@ -2303,5 +2341,140 @@ class MyceliumIntegrationTest {
         mc.runFile(mainFile.absolutePath)
         val result = mc.eval("js", "globalThis.__subpathExportsResult")
         assertEquals("hello from subpath export", result.asString())
+    }
+
+    // --- Node stdlib `readline` / `readline/promises` modules ---
+    //
+    // Backed by a real `java.io.BufferedReader` running on a dedicated daemon thread (see
+    // readline.mjs's `_readLineAsync`) — the same "background thread calls back into the
+    // context" pattern child_process.mjs's spawn()/exec() use (see childProcessSpawnRunsCommand
+    // above), so these use a throwaway `Mycelium` instance and poll for completion rather
+    // than touching the shared `vm`. The `input` option is a plain JS object exposing
+    // `_javaInputStream` (a `ByteArrayInputStream` built from a Java string), letting the
+    // test feed synthetic stdin without needing a real terminal.
+
+    @Test fun importReadlineModuleQuestionAndLineEvent() {
+        val mc = Mycelium()
+        runJsWithImports(mc, """
+            import readline from 'readline';
+            const JByteArrayInputStream = Java.type('java.io.ByteArrayInputStream');
+            const JByteArray = Java.type('byte[]');
+            const JCharset = Java.type('java.nio.charset.StandardCharsets');
+            const buf = JCharset.UTF_8.encode('hello mycelium\n');
+            const bytes = new JByteArray(buf.remaining());
+            buf.get(bytes);
+            const stream = new JByteArrayInputStream(bytes);
+            globalThis.__rlOutput = '';
+            const rl = readline.createInterface({
+                input: { _javaInputStream: stream },
+                output: { write: (s) => { globalThis.__rlOutput += s; } },
+            });
+            globalThis.__rlDone = false;
+            rl.on('line', (line) => {
+                globalThis.__rlLine = line;
+                globalThis.__rlDone = true;
+                rl.close();
+            });
+        """.trimIndent())
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__rlDone"),
+            "readline Interface did not emit 'line' within the timeout"
+        )
+        assertEquals("hello mycelium", mc.eval("js", "globalThis.__rlLine").asString())
+    }
+
+    @Test fun importReadlinePromisesModuleQuestionResolves() {
+        val mc = Mycelium()
+        runJsWithImports(mc, """
+            import { createInterface } from 'readline/promises';
+            const JByteArrayInputStream = Java.type('java.io.ByteArrayInputStream');
+            const JByteArray = Java.type('byte[]');
+            const JCharset = Java.type('java.nio.charset.StandardCharsets');
+            const buf = JCharset.UTF_8.encode('42\n');
+            const bytes = new JByteArray(buf.remaining());
+            buf.get(bytes);
+            const stream = new JByteArrayInputStream(bytes);
+            const rl = createInterface({
+                input: { _javaInputStream: stream },
+                output: { write: () => {} },
+            });
+            globalThis.__rlpDone = false;
+            rl.question('What is the answer? ').then((answer) => {
+                globalThis.__rlpAnswer = answer;
+                globalThis.__rlpDone = true;
+                rl.close();
+            });
+        """.trimIndent())
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__rlpDone"),
+            "readline/promises question() did not resolve within the timeout"
+        )
+        assertEquals("42", mc.eval("js", "globalThis.__rlpAnswer").asString())
+    }
+
+    // --- Node stdlib `worker_threads` module (stub) ---
+
+    @Test fun importWorkerThreadsModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { isMainThread, parentPort, workerData, threadId, Worker, MessageChannel } from 'worker_threads';
+            globalThis.__wtIsMainThread = isMainThread;
+            globalThis.__wtParentPort = parentPort;
+            globalThis.__wtWorkerData = workerData;
+            globalThis.__wtThreadId = threadId;
+            let threw = false;
+            try {
+                new Worker('./whatever.js');
+            } catch (e) {
+                threw = true;
+                globalThis.__wtWorkerErrorMessage = e.message;
+            }
+            globalThis.__wtWorkerThrew = threw;
+
+            const channel = new MessageChannel();
+            globalThis.__wtChannelDone = false;
+            channel.port2.on('message', (msg) => {
+                globalThis.__wtChannelMessage = msg;
+                globalThis.__wtChannelDone = true;
+            });
+            channel.port1.postMessage('ping');
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__wtIsMainThread").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__wtParentPort === null").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__wtWorkerData === null").asBoolean())
+        assertEquals(0, mc.eval("js", "globalThis.__wtThreadId").asInt())
+        assertTrue(mc.eval("js", "globalThis.__wtWorkerThrew").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__wtWorkerErrorMessage").asString().contains("not yet supported"))
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__wtChannelDone"),
+            "MessageChannel port2 did not receive the posted message within the timeout"
+        )
+        assertEquals("ping", mc.eval("js", "globalThis.__wtChannelMessage").asString())
+    }
+
+    // --- Node stdlib `module` module (stub) ---
+
+    @Test fun importModuleModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { builtinModules, isBuiltin, createRequire, Module } from 'module';
+            globalThis.__modBuiltinHasHttp = builtinModules.includes('http');
+            globalThis.__modBuiltinHasReadline = builtinModules.includes('readline');
+            globalThis.__modIsBuiltinPath = isBuiltin('path');
+            globalThis.__modIsBuiltinNodePath = isBuiltin('node:path');
+            globalThis.__modIsBuiltinFake = isBuiltin('totally-not-a-builtin');
+            globalThis.__modModuleType = typeof Module;
+
+            const require = createRequire(import.meta.url);
+            const events = require('events');
+            globalThis.__modRequireEventsType = typeof events.EventEmitter;
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__modBuiltinHasHttp").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__modBuiltinHasReadline").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__modIsBuiltinPath").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__modIsBuiltinNodePath").asBoolean())
+        assertEquals(false, mc.eval("js", "globalThis.__modIsBuiltinFake").asBoolean())
+        assertEquals("function", mc.eval("js", "globalThis.__modModuleType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__modRequireEventsType").asString())
     }
 }

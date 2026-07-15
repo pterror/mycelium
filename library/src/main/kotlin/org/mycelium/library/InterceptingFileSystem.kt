@@ -551,6 +551,14 @@ class InterceptingFileSystem : FileSystem {
         "node:diagnostics_channel" to "diagnostics_channel.mjs",
         "async_hooks" to "async_hooks.mjs",
         "node:async_hooks" to "async_hooks.mjs",
+        "readline" to "readline.mjs",
+        "node:readline" to "readline.mjs",
+        "readline/promises" to "readline-promises.mjs",
+        "node:readline/promises" to "readline-promises.mjs",
+        "worker_threads" to "worker_threads.mjs",
+        "node:worker_threads" to "worker_threads.mjs",
+        "module" to "module.mjs",
+        "node:module" to "module.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

@@ -518,9 +518,62 @@ export function createServer(requestListener) {
     return new Server(requestListener);
 }
 
-export { STATUS_CODES, METHODS, IncomingMessage, ClientRequest, ServerResponse, Server };
+// ---- Agent ----
+//
+// Real Node `Agent`s pool/reuse TCP sockets across requests. Our client requests are each
+// backed by their own `java.net.HttpURLConnection` (see ClientRequest._send above), which
+// does its own connection pooling/keep-alive internally at the JVM level — so there's no
+// actual pooling work for this class to do. It exists purely so packages that construct
+// `new http.Agent({ ... })` and poke at its options/methods (e.g. to pass it as
+// `options.agent` on a request, or call `agent.destroy()` during cleanup) don't crash.
+class Agent {
+    constructor(options = {}) {
+        this.keepAlive = options.keepAlive || false;
+        this.keepAliveMsecs = options.keepAliveMsecs !== undefined ? options.keepAliveMsecs : 1000;
+        this.maxSockets = options.maxSockets !== undefined ? options.maxSockets : Infinity;
+        this.maxFreeSockets = options.maxFreeSockets !== undefined ? options.maxFreeSockets : 256;
+        this.maxTotalSockets = options.maxTotalSockets !== undefined ? options.maxTotalSockets : Infinity;
+        this.timeout = options.timeout;
+        this.scheduling = options.scheduling || "lifo";
+        this.options = options;
+        this.protocol = "http:";
+        this.sockets = {};
+        this.freeSockets = {};
+        this.requests = {};
+    }
+
+    createConnection(options, callback) {
+        // No real socket to hand back — HttpURLConnection manages its own connection
+        // per-request under the hood, so this is a best-effort shape match for packages
+        // that call `agent.createConnection(...)` directly rather than going through
+        // `http.request`.
+        const err = new Error("mycelium: Agent.createConnection is not implemented (connections are managed internally)");
+        if (typeof callback === "function") {
+            nextTick(() => callback(err));
+            return undefined;
+        }
+        throw err;
+    }
+
+    getName(options = {}) {
+        const host = options.host || options.hostname || "localhost";
+        const port = options.port || 80;
+        const localAddress = options.localAddress ? `:${options.localAddress}` : "";
+        return `${host}:${port}${localAddress}`;
+    }
+
+    destroy() {
+        this.sockets = {};
+        this.freeSockets = {};
+        this.requests = {};
+    }
+}
+
+const globalAgent = new Agent({ keepAlive: false });
+
+export { STATUS_CODES, METHODS, IncomingMessage, ClientRequest, ServerResponse, Server, Agent, globalAgent };
 
 export default {
     request, get, createServer, STATUS_CODES, METHODS, IncomingMessage, ClientRequest,
-    ServerResponse, Server,
+    ServerResponse, Server, Agent, globalAgent,
 };

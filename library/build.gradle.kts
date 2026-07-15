@@ -1,6 +1,6 @@
 plugins { id("buildlogic.kotlin-library-conventions") }
 
-val graalVersion = "24.1.1"
+val graalVersion = "24.2.1"
 
 dependencies {
   implementation("org.graalvm.truffle:truffle-api:$graalVersion")

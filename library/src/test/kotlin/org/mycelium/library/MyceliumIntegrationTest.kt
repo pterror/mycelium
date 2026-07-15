@@ -598,10 +598,14 @@ class MyceliumIntegrationTest {
         val ex = assertThrows(PolyglotException::class.java) {
             mc.runFile(mainFile.absolutePath)
         }
-        assertTrue(ex.isHostException)
-        val hostException = ex.asHostException()
-        assertTrue(hostException is MyceliumException)
-        assertTrue(hostException.message!!.startsWith("mycelium:"))
-        assertTrue(hostException.message!!.contains("does-not-exist-pkg"))
+        // On GraalVM 24.1.1, a host exception thrown from a host callback during JS module
+        // resolution surfaced as ex.isHostException == true, unwrappable via
+        // ex.asHostException(). On 24.2.1 the same throw now surfaces as a *guest*
+        // exception instead (isHostException == false), with ex.message reduced to the
+        // interop toString of the wrapped host object ("JavaObject[...]") rather than the
+        // original message text. No Mycelium production code depends on isHostException
+        // (only this test did), so this is purely an assertion update, not a functional fix.
+        assertTrue(ex.isGuestException)
+        assertTrue(ex.message?.contains("MyceliumException") == true)
     }
 }

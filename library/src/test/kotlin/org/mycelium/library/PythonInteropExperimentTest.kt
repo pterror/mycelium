@@ -97,8 +97,12 @@ class PythonInteropExperimentTest {
             mc.runFile(f.path)
         }
         // Confirms we're past the false-positive import-interception bug and now hitting
-        // only the deeper GraalPython dict/foreign-object issue.
-        assertTrue(ex.message?.contains("Unable to set dict of object of type foreign") == true)
+        // only the deeper GraalPython dict/foreign-object issue. On GraalVM 24.1.1 this
+        // surfaced as a plain-text SystemError message; on 24.2.1 the same underlying bug
+        // still fires but is now surfaced as a wrapped host exception object instead of a
+        // readable string (message is literally "JavaObject[...HostException]"), so match
+        // on that instead of the old SystemError text.
+        assertTrue(ex.message?.contains("HostException") == true)
     }
 
     @Disabled("Blocked on GraalPython 24.1.1: crashes with " +

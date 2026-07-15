@@ -75,12 +75,24 @@ class Mycelium(
         filesystem.requireModule(args[0].asString(), args[1].asString())
     }
 
+    // Backs `require.resolve(specifier)` / `require.resolve.paths(specifier)` — see the
+    // `requireForModule` shim InterceptingFileSystem builds for each CJS module.
+    private val requireResolveFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        filesystem.resolveRequireSpecifier(args[0].asString(), args[1].asString())
+    }
+
+    private val requireResolvePathsFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        filesystem.resolveRequireSpecifierPaths(args[0].asString(), args[1].asString())
+    }
+
     init {
         filesystem.init(context, this, yolo)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
         context.getBindings("js").putMember("__mycelium_require__", requireFn)
+        context.getBindings("js").putMember("__mycelium_require_resolve__", requireResolveFn)
+        context.getBindings("js").putMember("__mycelium_require_resolve_paths__", requireResolvePathsFn)
         context.eval("js", GLOBAL_ALIAS_INIT_SCRIPT)
         context.eval("js", PROCESS_INIT_SCRIPT)
         context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)

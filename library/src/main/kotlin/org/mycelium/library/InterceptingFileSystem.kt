@@ -245,7 +245,14 @@ class InterceptingFileSystem : FileSystem {
     // ancestors in turn (not just the nearest `node_modules` directory — a package may
     // live in a higher-level `node_modules` even if a closer one exists without it),
     // stopping at the first match.
-    private fun resolveNodeModule(specifier: String, fromDir: Path): NodeModuleResolution {
+    // `preferRequire` distinguishes a CJS `require()` resolution from an ESM `import`
+    // resolution — both funnel through this same node_modules walk, but a dual-mode
+    // package's `exports` map can declare sibling `"import"`/`"require"` conditions with no
+    // enclosing `"default"` (e.g. `ws`'s `{".": {"import": "./wrapper.mjs", "require":
+    // "./index.js"}}`), and picking the wrong one hands back a module built for the wrong
+    // module system. See resolvePackageEntryPoint/resolveSubpathExport, which thread this
+    // through to the condition-priority list.
+    private fun resolveNodeModule(specifier: String, fromDir: Path, preferRequire: Boolean = false): NodeModuleResolution {
         val (packageName, subPath) = splitSpecifier(specifier)
         var dir: Path? = fromDir.toAbsolutePath().normalize()
         var sawNodeModulesTree = false
@@ -256,13 +263,21 @@ class InterceptingFileSystem : FileSystem {
                 val packageDir = nodeModules.resolve(packageName)
                 if (Files.isDirectory(packageDir)) {
                     val resolved = if (subPath != null) {
-                        resolveSubpathExport(packageDir, subPath)
+                        resolveSubpathExport(packageDir, subPath, preferRequire)
                             ?: resolveExtensionlessPath(packageDir.resolve(subPath)).let { candidate ->
-                                if (!Files.exists(candidate)) return NodeModuleResolution.PackageNotFound
+                                // isRegularFile, not exists: a subpath that names an existing
+                                // directory with no usable index.* falls through
+                                // resolveExtensionlessPath unresolved (it returns the
+                                // directory itself) — Files.exists would still be true for
+                                // that directory and wrongly report it as "found", handing
+                                // the caller a directory path that later chokes with an
+                                // unqualified "Is a directory" IOException (same class of bug
+                                // fixed in resolveExtensionlessPath/resolveRequireTarget).
+                                if (!Files.isRegularFile(candidate)) return NodeModuleResolution.PackageNotFound
                                 candidate
                             }
                     } else {
-                        resolvePackageEntryPoint(packageDir)
+                        resolvePackageEntryPoint(packageDir, preferRequire)
                     }
                     return NodeModuleResolution.Found(resolved)
                 }
@@ -401,14 +416,17 @@ class InterceptingFileSystem : FileSystem {
     }
 
     // Reads `package.json` and resolves it to a concrete entry-point file, preferring the
-    // ESM-oriented `exports` field (`exports["."].import` or `.default`) and falling back to
-    // `main`, then finally to the conventional `index.js`.
-    private fun resolvePackageEntryPoint(packageDir: Path): Path {
+    // `exports` field (`exports["."].import`/`.require` per `preferRequire`, or `.default`)
+    // and falling back to `main`, then finally to the conventional `index.js`. `preferRequire`
+    // is `true` when this resolution is for a CJS `require()` (see resolveRequireTarget) and
+    // `false` for an ESM `import` (see parsePath) — see resolveNodeModule's own comment for
+    // why the distinction matters.
+    private fun resolvePackageEntryPoint(packageDir: Path, preferRequire: Boolean = false): Path {
         val packageJson = packageDir.resolve("package.json")
         val entry = if (Files.exists(packageJson)) {
             val json = packageJson.readText()
             try {
-                context!!.eval("js", ENTRY_POINT_RESOLVER).execute(json).asString()
+                context!!.eval("js", ENTRY_POINT_RESOLVER).execute(json, preferRequire).asString()
             } catch (e: Exception) {
                 throw MyceliumException(
                     "mycelium: failed to parse '$packageJson' — ${e.message}", e
@@ -430,12 +448,14 @@ class InterceptingFileSystem : FileSystem {
     // pattern keys (e.g. `"./features/*": "./src/features/*.js"`), matching Node's own
     // subpath pattern matching. Returns null (falling back to the caller's literal-path
     // check) when there's no `"exports"` field, no `package.json`, or no matching entry.
-    private fun resolveSubpathExport(packageDir: Path, subPath: String): Path? {
+    // `preferRequire` has the same meaning as on resolvePackageEntryPoint/resolveNodeModule
+    // — `true` for a CJS `require()` resolution, `false` for an ESM `import`.
+    private fun resolveSubpathExport(packageDir: Path, subPath: String, preferRequire: Boolean = false): Path? {
         val packageJson = packageDir.resolve("package.json")
         if (!Files.exists(packageJson)) return null
         val json = packageJson.readText()
         val resolved = try {
-            context!!.eval("js", SUBPATH_EXPORT_RESOLVER).execute(json, subPath).let {
+            context!!.eval("js", SUBPATH_EXPORT_RESOLVER).execute(json, subPath, preferRequire).let {
                 if (it.isString) it.asString() else null
             }
         } catch (e: Exception) {
@@ -445,23 +465,36 @@ class InterceptingFileSystem : FileSystem {
     }
 
     // Mirrors Node's extension/directory-index probing for a path that doesn't resolve to
-    // an existing file as-is — e.g. a package.json `"main": "./index"` field with no file
-    // extension, or a `require`/`import` specifier written without one. If `path` itself
-    // exists (or names an existing directory without a usable index file), it's returned
-    // unchanged; otherwise this tries, in order, `<path>.js`, `<path>.mjs`, `<path>.cjs`,
-    // `<path>.json`, then the same four extensions under `<path>/index.*`. Returns `path`
-    // itself if none of the probed candidates exist, leaving the caller to surface Node's
-    // usual "cannot find module" error against the original specifier.
+    // an existing *file* as-is — e.g. a package.json `"main": "./index"` field with no file
+    // extension, a `require`/`import` specifier written without one, or (the directory case)
+    // a specifier like `require("./transports")` that names a directory containing its own
+    // `index.js`. If `path` names an existing regular file, it's returned unchanged;
+    // otherwise this tries, in order, `<path>.js`, `<path>.mjs`, `<path>.cjs`, `<path>.json`,
+    // then the same four extensions under `<path>/index.*`. Returns `path` itself if none of
+    // the probed candidates exist, leaving the caller to surface Node's usual "cannot find
+    // module" error against the original specifier.
+    //
+    // Deliberately checks `Files.isRegularFile` rather than `Files.exists` for the
+    // fast-path/unchanged-return case: `Files.exists` is also true for directories, so a
+    // specifier that happens to name an existing directory (e.g. engine.io's
+    // `require("./transports")`, where `./transports` is a directory whose real entry point
+    // is `./transports/index.js`) used to be returned as-is instead of falling through to the
+    // `<path>/index.*` probing below — the directory path was then handed straight to
+    // `Files.newByteChannel`/`Path.readText()`, which throw an unqualified "Is a directory"
+    // IOException with no guest-code stack frame (see NpmCompatibilityTest's socket.io/
+    // mongoose findings). A package.json `"exports"`/`"main"` field or wildcard subpath export
+    // that maps directly to a directory (rather than a file) hits this same fixed path, since
+    // every caller of this function funnels through here.
     private fun resolveExtensionlessPath(path: Path): Path {
-        if (Files.exists(path)) return path
+        if (Files.isRegularFile(path)) return path
         val extensions = listOf("js", "mjs", "cjs", "json")
         for (ext in extensions) {
             val withExt = Path.of("$path.$ext")
-            if (Files.exists(withExt)) return withExt
+            if (Files.isRegularFile(withExt)) return withExt
         }
         for (ext in extensions) {
             val indexWithExt = path.resolve("index.$ext")
-            if (Files.exists(indexWithExt)) return indexWithExt
+            if (Files.isRegularFile(indexWithExt)) return indexWithExt
         }
         return path
     }
@@ -507,6 +540,8 @@ class InterceptingFileSystem : FileSystem {
         "node:events" to "events.mjs",
         "util" to "util.mjs",
         "node:util" to "util.mjs",
+        "util/types" to "util-types.mjs",
+        "node:util/types" to "util-types.mjs",
         "os" to "os.mjs",
         "node:os" to "os.mjs",
         "fs" to "fs.mjs",
@@ -559,6 +594,14 @@ class InterceptingFileSystem : FileSystem {
         "node:worker_threads" to "worker_threads.mjs",
         "module" to "module.mjs",
         "node:module" to "module.mjs",
+        "dns" to "dns.mjs",
+        "node:dns" to "dns.mjs",
+        "dns/promises" to "dns-promises.mjs",
+        "node:dns/promises" to "dns-promises.mjs",
+        "timers" to "timers.mjs",
+        "node:timers" to "timers.mjs",
+        "timers/promises" to "timers-promises.mjs",
+        "node:timers/promises" to "timers-promises.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =
@@ -618,6 +661,41 @@ class InterceptingFileSystem : FileSystem {
         } else {
             requireCjsModule(resolved, cacheKey)
         }
+    }
+
+    // Backs `require.resolve(specifier)` — wired up as the JS global
+    // `__mycelium_require_resolve__` in Mycelium.init. Runs the exact same resolution
+    // logic `require()` itself uses (relative paths, core modules, node_modules walk) but
+    // hands back the resolved path/specifier without ever loading the module. Core modules
+    // resolve back to their bare specifier (e.g. "fs"), matching Node's own
+    // `require.resolve('fs') === 'fs'` behavior, rather than exposing Mycelium's internal
+    // synthetic resource path.
+    fun resolveRequireSpecifier(specifier: String, fromDirStr: String): String {
+        val fromDir = Path.of(fromDirStr)
+        if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
+            coreModules[specifier]?.let { return specifier }
+        }
+        val resolved = resolveRequireTarget(specifier, fromDir)
+        if (resolved.startsWith(CORE_MODULE_PREFIX)) return specifier
+        return resolved.toString()
+    }
+
+    // Backs `require.resolve.paths(specifier)` — the list of `node_modules` directories
+    // that would be searched for `specifier` starting from `fromDirStr`, in search order.
+    // Returns an empty array for relative/absolute specifiers and core modules (Node
+    // returns `null` for core modules; an empty array is close enough for the common
+    // "does resolution work" use case and avoids modeling a nullable return through the
+    // polyglot boundary).
+    fun resolveRequireSpecifierPaths(specifier: String, fromDirStr: String): Array<String> {
+        if (specifier.startsWith(".") || specifier.startsWith("/")) return emptyArray()
+        if (coreModules.containsKey(specifier)) return emptyArray()
+        val result = mutableListOf<String>()
+        var dir: Path? = Path.of(fromDirStr).toAbsolutePath().normalize()
+        while (dir != null) {
+            result.add(dir.resolve("node_modules").toString())
+            dir = dir.parent
+        }
+        return result.toTypedArray()
     }
 
     // Node's stdlib shims (path, events, ...) are shipped as genuine ESM sources rather
@@ -714,7 +792,12 @@ class InterceptingFileSystem : FileSystem {
         // nested module resolves against the directory it actually lives in.
         val requireForModule = context!!.eval(
             "js",
-            "(function(id) { return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); })"
+            "(function() {\n" +
+                "    const req = function(id) { return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); };\n" +
+                "    req.resolve = function(id) { return globalThis.__mycelium_require_resolve__(id, ${jsonStringLiteral(dir)}); };\n" +
+                "    req.resolve.paths = function(id) { return Array.from(globalThis.__mycelium_require_resolve_paths__(id, ${jsonStringLiteral(dir)})); };\n" +
+                "    return req;\n" +
+                "})()"
         )
 
         val wrapperSource = "(function(exports, require, module, __filename, __dirname) {\n" +
@@ -806,14 +889,24 @@ class InterceptingFileSystem : FileSystem {
             // `Reflect.getPrototypeOf.js`: `.getPrototypeOf` reads as a nonempty
             // "extension" even though the specifier has no real extension at all). Always
             // falling through to resolveExtensionlessPath when the literal path doesn't
-            // exist is safe either way — it returns `candidate` unchanged if none of the
-            // probed variants exist either, so genuinely-missing modules still error out
-            // exactly as before.
-            if (Files.exists(candidate)) return candidate
+            // resolve to a regular file is safe either way — it returns `candidate`
+            // unchanged if none of the probed variants exist either, so genuinely-missing
+            // modules still error out exactly as before.
+            //
+            // Checks `isRegularFile`, not `exists` — `exists` is also true for directories,
+            // and a bare `require("./transports")` naming a directory (whose real entry
+            // point is `./transports/index.js`) used to short-circuit here and return the
+            // directory itself, which `requireCjsModule`'s later `resolved.readText()` then
+            // choked on with an unqualified, guest-stack-free "Is a directory" IOException
+            // (see engine.io, a socket.io transitive dependency, in NpmCompatibilityTest).
+            if (Files.isRegularFile(candidate)) return candidate
             return resolveExtensionlessPath(candidate)
         }
         coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
-        return when (val resolution = resolveNodeModule(specifier, fromDir)) {
+        // preferRequire = true: this is a CJS require() target, so a dual-mode package's
+        // exports map should prefer its "require" condition over "import" — see
+        // resolveNodeModule's own comment.
+        return when (val resolution = resolveNodeModule(specifier, fromDir, preferRequire = true)) {
             is NodeModuleResolution.Found -> resolution.path
             is NodeModuleResolution.PackageNotFound, NodeModuleResolution.NoNodeModulesTree ->
                 throw MyceliumException(
@@ -881,14 +974,23 @@ class InterceptingFileSystem : FileSystem {
             }
         """.trimIndent()
 
+        // `preferRequire` picks the condition-priority order: a CJS `require()` resolution
+        // (see resolveRequireTarget) prefers the `"require"` condition over `"import"`, and
+        // vice versa for an ESM `import` (see parsePath) — a dual-mode package's `exports`
+        // map can declare sibling `"import"`/`"require"` conditions with no enclosing
+        // `"default"` (e.g. `ws`'s `{".": {"import": "./wrapper.mjs", "require":
+        // "./index.js"}}`), and always preferring `"import"` regardless of which module
+        // system is actually asking hands a `require()` caller an ESM-only module built for
+        // a different module system than the one requesting it.
         private val ENTRY_POINT_RESOLVER = """
-            (function (json) {
+            (function (json, preferRequire) {
                 $RESOLVE_CONDITIONS_FN
                 var pkg = JSON.parse(json);
                 var exp = pkg.exports;
+                var conditions = preferRequire ? ["node", "require", "default"] : ["node", "import", "default"];
                 if (exp) {
                     var dot = typeof exp === "string" ? exp : (exp["."] !== undefined ? exp["."] : exp);
-                    var resolved = resolveConditions(dot, ["node", "import", "default"]);
+                    var resolved = resolveConditions(dot, conditions);
                     if (resolved) return resolved;
                 }
                 return pkg.main || "index.js";
@@ -927,16 +1029,19 @@ class InterceptingFileSystem : FileSystem {
         // string (meaning the package has no subpath exports at all, only a root export),
         // or no key/pattern matches — which the Kotlin caller distinguishes from a real
         // string result via `isString`, falling back to a literal on-disk path check.
+        // `preferRequire` has the same meaning as on ENTRY_POINT_RESOLVER above — `true` for
+        // a CJS `require()` resolution, `false` for an ESM `import`.
         private val SUBPATH_EXPORT_RESOLVER = """
-            (function (json, subPath) {
+            (function (json, subPath, preferRequire) {
                 $RESOLVE_CONDITIONS_FN
                 try {
                     var pkg = JSON.parse(json);
                     var exp = pkg.exports;
                     if (!exp || typeof exp !== "object") return null;
+                    var conditions = preferRequire ? ["node", "require", "default"] : ["node", "import", "default"];
                     var key = "./" + subPath;
                     if (Object.prototype.hasOwnProperty.call(exp, key)) {
-                        return resolveConditions(exp[key], ["node", "import", "default"]);
+                        return resolveConditions(exp[key], conditions);
                     }
                     var keys = Object.keys(exp);
                     for (var i = 0; i < keys.length; i++) {
@@ -947,7 +1052,7 @@ class InterceptingFileSystem : FileSystem {
                         var suffix = k.slice(starIdx + 1);
                         if (key.indexOf(prefix) === 0 && key.slice(key.length - suffix.length) === suffix) {
                             var matched = key.slice(prefix.length, key.length - suffix.length);
-                            var target = resolveConditions(exp[k], ["node", "import", "default"]);
+                            var target = resolveConditions(exp[k], conditions);
                             if (typeof target === "string") return target.split("*").join(matched);
                         }
                     }

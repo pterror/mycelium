@@ -115,6 +115,10 @@ export function endianness() {
     return JByteOrder.nativeOrder().toString() === "BIG_ENDIAN" ? "BE" : "LE";
 }
 
+export function availableParallelism() {
+    return Number(JRuntime.getRuntime().availableProcessors());
+}
+
 export const constants = {
     signals: {},
     errno: {},
@@ -137,5 +141,6 @@ export default {
     networkInterfaces,
     loadavg,
     endianness,
+    availableParallelism,
     constants,
 };

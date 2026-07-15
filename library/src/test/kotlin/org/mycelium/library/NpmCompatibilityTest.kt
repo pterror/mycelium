@@ -120,10 +120,9 @@ import java.net.URI
 //     counterpart) exist, inquirer WORKS end-to-end — see inquirerLoadsWithNamedCjsExports.
 //
 // Fourth round — heavier, more complex real-world packages (fastify, jsonwebtoken, bcryptjs,
-// moment, yaml, socket.io, mongoose, pg, sharp, esbuild), 3/10 pass. Per the sweep's "find
-// gaps, don't fix them yet" approach, none of these gaps were fixed this round — only
-// cataloged (failing packages below are `@Disabled` tests documenting the exact error,
-// not fixes):
+// moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — now 9/10 pass; only mongoose
+// remains `@Disabled`, on a distinct gap unrelated to the ones fixed below (see its own
+// entry further down):
 //
 //   - bcryptjs (password hashing, pure JS): WORKS. No native bindings involved (that's the
 //     real `bcrypt` package, not tested here) — hashSync/compareSync round-trip cleanly.
@@ -142,20 +141,44 @@ import java.net.URI
 //     default { ... }` object omits `KeyObject` entirely, so `require('crypto').KeyObject`
 //     is `undefined`, and `x instanceof undefined` throws `TypeError: Right-hand-side of
 //     instanceof is not an object` rather than evaluating to `false`.
-//   - socket.io (WebSocket framework): FAILS with a generic `Is a directory` exception and
-//     no guest-code stack frame at all (the failure happens during import-graph resolution,
-//     before any module body executes) — the same failure *signature* documented for
-//     yargs's pre-fix escalade gap in round 3 (an unhandled `exports` shape falling through
-//     to a literal on-disk path check against a directory), but socket.io's own top-level
-//     `exports["."]` is a plain `{types, import, require}` object (not nested/array-shaped),
-//     so the trigger is a different, not-yet-identified `exports` shape somewhere in
-//     socket.io's transitive dependency tree (engine.io / ws / base64id, etc.), not
-//     socket.io's own package.json.
-//   - mongoose (MongoDB ODM): FAILS with the exact same unqualified `Is a directory`
-//     exception and no guest-code stack frame as socket.io — very likely the same
-//     underlying `exports`-resolution gap, not yet isolated to a specific transitive
-//     package given mongoose's dependency tree size (kareem, mquery, bson, mongodb driver,
-//     etc.).
+//   - socket.io (WebSocket framework): WORKS as of this round — was FAILing with a generic
+//     `Is a directory` exception and no guest-code stack frame at all. Root cause, now
+//     isolated: it wasn't an `exports`-shape gap at all (socket.io's own `exports["."]` is
+//     a plain `{types, import, require}` object, handled fine) — it was
+//     `resolveExtensionlessPath` (and its two direct-`Files.exists` callers,
+//     `resolveRequireTarget` and `resolveNodeModule`'s subpath branch) treating
+//     `java.nio.file.Files.exists()` as "this candidate resolves to something usable",
+//     when `Files.exists` is *also* true for directories. engine.io's `build/server.js`
+//     (a socket.io transitive dependency) does `require("./transports")`, where
+//     `./transports` is a directory whose real entry point is `./transports/index.js` —
+//     the old `Files.exists(candidate)` check short-circuited on the directory itself
+//     before any `<dir>/index.*` probing ran, handing the bare directory `Path` straight
+//     to `resolved.readText()` in `requireCjsModule`, which throws a raw, unqualified
+//     `IOException("Is a directory")` with no guest-code stack frame (the failure happens
+//     inside `require()`'s host-side resolution, not inside any evaluated guest code).
+//     All three call sites now check `Files.isRegularFile` instead, so a directory
+//     candidate correctly falls through to `<dir>/index.js`/`.mjs`/`.cjs`/`.json` probing.
+//     This also unblocked `timers`/`timers/promises`, transitively required by engine.io
+//     once resolution got past the directory bug — now registered as core modules.
+//   - mongoose (MongoDB ODM): still FAILS, but no longer on the directory bug above (fixed
+//     the same way, and unblocked by registering `timers`/`timers/promises` as core
+//     modules) — it now progresses to a distinct, legitimate gap: `TypeError:
+//     data.readUInt32BE is not a function` inside `@mongodb-js/saslprep` (a transitive
+//     dependency of the `bson`/mongodb driver). Root cause: `resolvePackageEntryPoint`
+//     (used for both `import` *and* `require()` resolution, since both funnel through
+//     `resolveNodeModule`) always resolves a package's `exports` map with import-biased
+//     condition priority (`["node", "import", "default"]`), even when the package is being
+//     `require()`d. saslprep's `exports` has sibling `import`/`require` conditions with no
+//     enclosing `"default"` — `{"browser": {...}, "import": {types, default: "./dist/
+//     .esm-wrapper.mjs"}, "require": {types, default: "./dist/node.js"}}` — so a CJS
+//     `require("@mongodb-js/saslprep")` incorrectly resolves to the ESM wrapper instead of
+//     `./dist/node.js`, and that wrapper's own re-exported binary code-point data isn't
+//     backed by Mycelium's `Buffer` subclass the way `dist/node.js`'s is, so
+//     `data.readUInt32BE` (a `Buffer`-only method) is missing. Fixing this needs
+//     `resolveNodeModule`/`resolvePackageEntryPoint` to thread through whether the
+//     resolution is for a `require()` or an `import` (preferring the `"require"` condition
+//     over `"import"` in the former case) — a distinct, larger fix from the directory bug
+//     above, out of scope for this round.
 //   - pg (PostgreSQL client): FAILS. `node_modules/pg/lib` does `require('util/types')`
 //     (the extensionless subpath form, not `node:util/types`) — Mycelium registers `util`
 //     as a core module but has no `util/types` (or `node:util/types`) module of its own;
@@ -897,15 +920,23 @@ class NpmCompatibilityTest {
         assertEquals(2, mc.eval("js", "globalThis.__yamlListLength").asInt())
     }
 
-    // --- 24. fastify — HTTP framework, alternative to express. FAILS: `node:dns` is not a
-    // registered core module (see class doc above) — cataloged, not fixed this round. ---
+    // --- 24. fastify — HTTP framework, alternative to express. `dns`/`node:dns` are now
+    // registered synthetic core modules (node-stdlib/dns.mjs), which was the originally
+    // cataloged blocker — but the package now progresses further and FAILS on an unrelated
+    // GraalJS parser gap in a transitive dependency (toad-cache): its .mjs output ends a
+    // class declaration and immediately follows it with `export{...}` on the same line, with
+    // no separating token — `}export{` — which is valid per the spec (a ClassDeclaration is
+    // a complete statement; no semicolon/ASI needed before the next statement) but GraalJS's
+    // parser rejects it as "Expected an operand but found export". Not fixed this round —
+    // cataloged as a new, distinct gap. ---
 
     @Test
     @Disabled(
-        "FAILS: fastify's lib/*.js does require('node:dns') at module scope; 'dns' is not " +
-            "among Mycelium's synthetic core modules (see TODO.md 'Missing Node stdlib " +
-            "modules'). Exact error: com.oracle.truffle.host.HostException: mycelium: cannot " +
-            "find module 'node:dns' required from '<tmp>/node_modules/fastify/lib'"
+        "FAILS (new blocker, dns gap now fixed): com.oracle.truffle.host.HostException: " +
+            "SyntaxError: node_modules/toad-cache/dist/toad-cache.mjs:849:1 Expected an " +
+            "operand but found export — GraalJS's parser rejects a class declaration " +
+            "immediately followed by `export{...}` with no separating token/newline " +
+            "(`}export{`), even though that's valid per the ECMAScript grammar."
     )
     fun fastifyListensAndCloses() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
@@ -927,18 +958,10 @@ class NpmCompatibilityTest {
         assertTrue(mc.eval("js", "globalThis.__fastifyPort").asInt() > 0)
     }
 
-    // --- 25. jsonwebtoken — JWT sign/verify, uses crypto. FAILS: `node-stdlib/crypto.mjs`
-    // has a working internal `KeyObject` class but never exports it (see class doc above) —
-    // cataloged, not fixed this round. ---
+    // --- 25. jsonwebtoken — JWT sign/verify, uses crypto. Fixed: `node-stdlib/crypto.mjs`
+    // now exports its internal `KeyObject` class. ---
 
     @Test
-    @Disabled(
-        "FAILS: sign.js does `secretOrPrivateKey instanceof KeyObject` where KeyObject is " +
-            "require('crypto').KeyObject; node-stdlib/crypto.mjs has an internal KeyObject " +
-            "class but never exports it, so KeyObject is undefined. Exact error: " +
-            "TypeError: Right-hand-side of instanceof is not an object " +
-            "(node_modules/jsonwebtoken/sign.js)"
-    )
     fun jsonwebtokenSignsAndVerifies() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
@@ -957,18 +980,17 @@ class NpmCompatibilityTest {
         assertTrue(mc.eval("js", "globalThis.__jwtSubMatches").asBoolean())
     }
 
-    // --- 26. socket.io — WebSocket framework. FAILS: an unqualified `Is a directory`
-    // exception with no guest-code stack frame — same failure signature as yargs's pre-fix
-    // escalade `exports`-array gap in round 3, but the trigger hasn't been isolated to a
-    // specific transitive package (see class doc above) — cataloged, not fixed this round. ---
+    // --- 26. socket.io — WebSocket framework. WORKS: was FAILing with an unqualified `Is a
+    // directory` exception and no guest-code stack frame — root cause isolated to
+    // `resolveExtensionlessPath` (and its two direct-`Files.exists` callers) treating an
+    // existing *directory* the same as an existing *file*, so engine.io's (a transitive
+    // dependency) `require("./transports")` — where `./transports` is a directory whose
+    // real entry point is `./transports/index.js` — short-circuited on the bare directory
+    // path instead of falling through to `<dir>/index.*` probing (see class doc above for
+    // the full root-cause writeup). Also needed `timers`/`timers/promises` registered as
+    // core modules, transitively required once resolution got past the directory bug. ---
 
     @Test
-    @Disabled(
-        "FAILS: com.oracle.truffle.host.HostException: Is a directory, no guest-code stack " +
-            "frame (fails during import-graph resolution before any module body runs) — an " +
-            "'exports'-resolution gap in socket.io's transitive dependency tree, not yet " +
-            "isolated to a specific package or exports shape."
-    )
     fun socketIoServerLoads() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
@@ -989,17 +1011,26 @@ class NpmCompatibilityTest {
         assertEquals("function", mc.eval("js", "globalThis.__socketIoOnType").asString())
     }
 
-    // --- 27. mongoose — MongoDB ODM, huge dependency tree. FAILS with the exact same
-    // unqualified `Is a directory` exception as socket.io — very likely the same underlying
-    // gap, not yet isolated given mongoose's dependency tree size (see class doc above) —
-    // cataloged, not fixed this round. ---
+    // --- 27. mongoose — MongoDB ODM, huge dependency tree. Still FAILS, but no longer on
+    // the directory bug that used to throw an unqualified `Is a directory` exception (see
+    // class doc above — fixed the same way as socket.io, and also unblocked by registering
+    // `timers`/`timers/promises`). Now fails on a distinct, legitimate gap instead: a CJS
+    // `require()` of a dual-mode package (`@mongodb-js/saslprep`, transitive via bson/the
+    // mongodb driver) resolves through the *import*-biased `exports` condition priority
+    // (`resolvePackageEntryPoint`'s `["node", "import", "default"]`) instead of preferring
+    // the `"require"` condition, landing on the package's ESM wrapper instead of its CJS
+    // entry point — see class doc above for the full writeup. ---
 
     @Test
     @Disabled(
-        "FAILS: com.oracle.truffle.host.HostException: Is a directory, no guest-code stack " +
-            "frame — same failure signature as socket.io above; not yet isolated to a " +
-            "specific package in mongoose's dependency tree (kareem, mquery, bson, mongodb " +
-            "driver, etc.)."
+        "FAILS: TypeError: data.readUInt32BE is not a function " +
+            "(node_modules/@mongodb-js/saslprep/dist/memory-code-points.js) — " +
+            "resolvePackageEntryPoint resolves exports with import-biased condition " +
+            "priority even when the package is being require()'d, so saslprep's " +
+            "require('@mongodb-js/saslprep') incorrectly resolves to its ESM wrapper " +
+            "(./dist/.esm-wrapper.mjs) instead of its CJS entry (./dist/node.js); the " +
+            "wrapper's re-exported binary data isn't backed by Mycelium's Buffer subclass " +
+            "the way the CJS entry's is."
     )
     fun mongooseLoads() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
@@ -1019,16 +1050,10 @@ class NpmCompatibilityTest {
         assertEquals("function", mc.eval("js", "globalThis.__mongooseSchemaType").asString())
     }
 
-    // --- 28. pg — PostgreSQL client. FAILS: `require('util/types')` (extensionless subpath
-    // form) is not a registered core module — only `util` itself is registered, not
-    // `util/types` (see class doc above) — cataloged, not fixed this round. ---
+    // --- 28. pg — PostgreSQL client. Fixed: `util/types` / `node:util/types` are now
+    // registered synthetic core modules (node-stdlib/util-types.mjs). ---
 
     @Test
-    @Disabled(
-        "FAILS: com.oracle.truffle.host.HostException: mycelium: cannot find module " +
-            "'util/types' required from '<tmp>/node_modules/pg/lib' — Mycelium registers " +
-            "'util' as a core module but not 'util/types' (or 'node:util/types')."
-    )
     fun pgClientLoads() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
@@ -1047,16 +1072,25 @@ class NpmCompatibilityTest {
         assertEquals("function", mc.eval("js", "globalThis.__pgPoolType").asString())
     }
 
-    // --- 29. sharp — native image-processing addon. FAILS, but not on the native binding as
-    // expected going in — `node:os` doesn't export `availableParallelism` (Node 19+), so ES
-    // module linking rejects the whole graph before any native-addon loading is attempted
-    // (see class doc above) — cataloged, not fixed this round. ---
+    // --- 29. sharp — native image-processing addon. `node:os` now exports
+    // `availableParallelism`, which was the originally cataloged blocker — but the package
+    // now progresses past module-link time into its native-binding loader, which FAILS as
+    // expected going in (Mycelium has no real native N-API addon loading): every
+    // `require("@img/sharp-*")` candidate throws, but the error objects those `require()`
+    // calls throw don't carry a `.code` property the way Node's real MODULE_NOT_FOUND errors
+    // do, so sharp's own error-formatting loop (`err.code.endsWith("MODULE_NOT_FOUND")`)
+    // throws on the missing `.code` before it can report "no native binding found". Not
+    // fixed this round — cataloged as a new, distinct gap (native addon loading is out of
+    // scope for a synthetic-core-module fix). ---
 
     @Test
     @Disabled(
-        "FAILS: SyntaxError: The requested module 'node:os' does not provide an export " +
-            "named 'availableParallelism' (node_modules/sharp/dist/utility.mjs) — fails at " +
-            "module-link time, before sharp's native addon is ever loaded."
+        "FAILS (new blocker, availableParallelism gap now fixed): TypeError: Cannot read " +
+            "property 'endsWith' of undefined (node_modules/sharp/dist/sharp.mjs) — sharp's " +
+            "native-binding loader assumes every require() failure is a Node-shaped " +
+            "MODULE_NOT_FOUND error with a `.code` string; Mycelium's require() throws " +
+            "errors without a `.code` property, and there is no real native N-API addon " +
+            "loading for sharp to fall back to anyway."
     )
     fun sharpLoads() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
@@ -1074,17 +1108,10 @@ class NpmCompatibilityTest {
         assertEquals("function", mc.eval("js", "globalThis.__sharpType").asString())
     }
 
-    // --- 30. esbuild — build tool, spawns a native binary via child_process. FAILS:
-    // `require.resolve` is not implemented — Mycelium's CJS shim provides `require()` but
-    // never attaches a `.resolve` method (see class doc above) — cataloged, not fixed this
-    // round. ---
+    // --- 30. esbuild — build tool, spawns a native binary via child_process. Fixed:
+    // Mycelium's CJS `require()` shim now attaches `.resolve` / `.resolve.paths`. ---
 
     @Test
-    @Disabled(
-        "FAILS: TypeError: require.resolve is not a function " +
-            "(node_modules/esbuild/lib/main.js, downloadedBinPath) — Mycelium's CJS " +
-            "require() shim has no .resolve method."
-    )
     fun esbuildTransformsTypeScript() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 

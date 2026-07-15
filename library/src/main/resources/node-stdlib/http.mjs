@@ -97,6 +97,23 @@ class EventEmitter {
         return this.removeListener(event, listener);
     }
 
+    // Alias for `on` — real Node's EventEmitter exposes both names for the same method,
+    // and packages that attach a request handler via `server.addListener("request", ...)`
+    // rather than `.on(...)` (both are equally idiomatic in real Node) would otherwise call
+    // a non-existent method on this minimal, http.mjs-local EventEmitter.
+    addListener(event, listener) {
+        return this.on(event, listener);
+    }
+
+    removeAllListeners(event) {
+        if (event === undefined) {
+            this._events = Object.create(null);
+        } else {
+            delete this._events[event];
+        }
+        return this;
+    }
+
     emit(event, ...args) {
         const handlers = this._events[event];
         if (handlers === undefined) {
@@ -113,6 +130,21 @@ class EventEmitter {
     listenerCount(event) {
         const handlers = this._events[event];
         return handlers === undefined ? 0 : handlers.length;
+    }
+
+    // Returns each listener with its original callback unwrapped from any `once()`
+    // wrapper (`wrapper.listener` — see `once` above) — needed by packages that snapshot
+    // and later re-attach a server's existing listeners (e.g. engine.io's `attach()`,
+    // which caches `server.listeners("request")` before replacing them with its own
+    // dispatcher, then still invokes the originals for requests it doesn't intercept).
+    listeners(event) {
+        const handlers = this._events[event];
+        if (handlers === undefined) return [];
+        return handlers.map((l) => l.listener || l);
+    }
+
+    eventNames() {
+        return Object.keys(this._events);
     }
 }
 

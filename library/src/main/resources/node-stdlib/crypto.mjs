@@ -71,6 +71,17 @@ function toJByteArray(data) {
         buf.get(bytes);
         return bytes;
     }
+    // A secret KeyObject (e.g. from createSecretKey/createHmac callers that pass a
+    // KeyObject where Node also accepts a raw string/Buffer, per jwa's `crypto.createHmac`
+    // usage in jsonwebtoken) — unwrap to the raw key bytes it already wraps rather than
+    // trying to treat the KeyObject instance itself as an array-like of byte values (which
+    // has no numeric `.length`, and previously blew up JByteArray construction).
+    if (data instanceof KeyObject) {
+        if (data.type !== "secret") {
+            throw new TypeError("Expected a secret KeyObject or raw key material");
+        }
+        return data._key;
+    }
     // Buffer/Uint8Array-like
     const bytes = new JByteArray(data.length);
     for (let i = 0; i < data.length; i++) {
@@ -736,6 +747,8 @@ export function createSecretKey(key) {
     return new KeyObject("secret", toJByteArray(key));
 }
 
+export { KeyObject };
+
 // --- Sign / Verify ---
 
 function normalizeDigestName(algorithm) {
@@ -998,5 +1011,6 @@ export default {
     createPrivateKey,
     createPublicKey,
     createSecretKey,
+    KeyObject,
     constants,
 };

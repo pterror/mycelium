@@ -168,20 +168,57 @@ export function callbackify(fn) {
     return callbackified;
 }
 
+// Node's `util.types` type-checking functions. Also re-exported standalone from
+// util-types.mjs for the `util/types` / `node:util/types` subpath (see
+// InterceptingFileSystem.kt's coreModules map) — that shim just re-exports this object's
+// members, so this is the single source of truth for all of them.
 export const types = {
-    isDate: (v) => v instanceof Date,
-    isRegExp: (v) => v instanceof RegExp,
-    isNativeError: (v) => v instanceof Error,
-    isAsyncFunction: (v) => typeof v === "function" && v.constructor.name === "AsyncFunction",
-    isGeneratorFunction: (v) => typeof v === "function" && v.constructor.name === "GeneratorFunction",
-    isPromise: (v) => v instanceof Promise,
+    isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer),
     isArrayBuffer: (v) => v instanceof ArrayBuffer,
-    isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
-    isMap: (v) => v instanceof Map,
-    isSet: (v) => v instanceof Set,
+    isArrayBufferView: (v) => ArrayBuffer.isView(v),
+    isAsyncFunction: (v) => typeof v === "function" && v.constructor.name === "AsyncFunction",
+    isBigInt64Array: (v) => typeof BigInt64Array !== "undefined" && v instanceof BigInt64Array,
+    isBigUint64Array: (v) => typeof BigUint64Array !== "undefined" && v instanceof BigUint64Array,
     isBooleanObject: (v) => typeof v === "object" && v !== null && v instanceof Boolean,
+    isBoxedPrimitive: (v) =>
+        typeof v === "object" &&
+        v !== null &&
+        (v instanceof Boolean || v instanceof Number || v instanceof String || v instanceof Symbol || (typeof BigInt !== "undefined" && v instanceof Object && v.constructor === BigInt)),
+    isDataView: (v) => v instanceof DataView,
+    isDate: (v) => v instanceof Date,
+    isExternal: (v) => false,
+    isFloat32Array: (v) => v instanceof Float32Array,
+    isFloat64Array: (v) => v instanceof Float64Array,
+    isGeneratorFunction: (v) => typeof v === "function" && v.constructor.name === "GeneratorFunction",
+    isGeneratorObject: (v) =>
+        typeof v === "object" &&
+        v !== null &&
+        typeof v.next === "function" &&
+        typeof v.throw === "function" &&
+        typeof v[Symbol.iterator] === "function",
+    isInt8Array: (v) => v instanceof Int8Array,
+    isInt16Array: (v) => v instanceof Int16Array,
+    isInt32Array: (v) => v instanceof Int32Array,
+    isMap: (v) => v instanceof Map,
+    isMapIterator: (v) => typeof v === "object" && v !== null && v[Symbol.toStringTag] === "Map Iterator",
+    isModuleNamespaceObject: (v) => typeof v === "object" && v !== null && Symbol.toStringTag in v && v[Symbol.toStringTag] === "Module",
+    isNativeError: (v) => v instanceof Error,
     isNumberObject: (v) => typeof v === "object" && v !== null && v instanceof Number,
+    isPromise: (v) => v instanceof Promise,
+    isProxy: (v) => false,
+    isRegExp: (v) => v instanceof RegExp,
+    isSet: (v) => v instanceof Set,
+    isSetIterator: (v) => typeof v === "object" && v !== null && v[Symbol.toStringTag] === "Set Iterator",
+    isSharedArrayBuffer: (v) => typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer,
     isStringObject: (v) => typeof v === "object" && v !== null && v instanceof String,
+    isSymbolObject: (v) => typeof v === "object" && v !== null && v instanceof Symbol,
+    isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
+    isUint8Array: (v) => v instanceof Uint8Array,
+    isUint8ClampedArray: (v) => v instanceof Uint8ClampedArray,
+    isUint16Array: (v) => v instanceof Uint16Array,
+    isUint32Array: (v) => v instanceof Uint32Array,
+    isWeakMap: (v) => v instanceof WeakMap,
+    isWeakSet: (v) => v instanceof WeakSet,
 };
 
 // Re-export the guest environment's globals (GraalJS provides both) rather than

@@ -543,6 +543,8 @@ class InterceptingFileSystem : FileSystem {
         "node:net" to "net.mjs",
         "tls" to "tls.mjs",
         "node:tls" to "tls.mjs",
+        "child_process" to "child_process.mjs",
+        "node:child_process" to "child_process.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

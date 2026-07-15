@@ -1598,6 +1598,100 @@ class MyceliumIntegrationTest {
         assertEquals("function", mc.eval("js", "globalThis.__ttyWriteStreamType").asString())
     }
 
+    // --- Node stdlib `child_process` module ---
+    //
+    // execSync (and the other *Sync APIs) never spawn extra threads — everything is a
+    // plain blocking Java I/O call made directly from the calling JS thread (see
+    // child_process.mjs's own doc comment) — so it's safe to run against the shared `vm`
+    // the same as any other synchronous stdlib call.
+    //
+    // spawn()/exec(), by contrast, stream stdout/stderr via dedicated daemon reader
+    // threads that call back into the context to `emit('data', ...)`, plus a separate
+    // waiter thread that emits `exit`/`close` once the process terminates — the same
+    // "another thread enters the context" pattern net.mjs's socket reader and
+    // TIMERS_INIT_SCRIPT's timer thread already rely on. Per those tests' own precedent
+    // (see setTimeoutWorks/pollUntilTrue above), these use a dedicated, throwaway
+    // Mycelium instance and poll for completion rather than touching the shared `vm`.
+
+    @Test fun importChildProcessModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import cp from 'child_process';
+            globalThis.__cpExecType = typeof cp.exec;
+            globalThis.__cpExecSyncType = typeof cp.execSync;
+            globalThis.__cpSpawnType = typeof cp.spawn;
+            globalThis.__cpSpawnSyncType = typeof cp.spawnSync;
+            globalThis.__cpExecFileType = typeof cp.execFile;
+            globalThis.__cpExecFileSyncType = typeof cp.execFileSync;
+            globalThis.__cpForkType = typeof cp.fork;
+            globalThis.__cpChildProcessType = typeof cp.ChildProcess;
+        """.trimIndent())
+        assertEquals("function", mc.eval("js", "globalThis.__cpExecType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpExecSyncType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpSpawnType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpSpawnSyncType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpExecFileType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpExecFileSyncType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpForkType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__cpChildProcessType").asString())
+    }
+
+    @Test fun childProcessExecSyncRunsCommand() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { execSync } from 'child_process';
+            const out = execSync('echo hello');
+            globalThis.__cpExecSyncResult = out.toString();
+        """.trimIndent())
+        assertEquals("hello\n", mc.eval("js", "globalThis.__cpExecSyncResult").asString())
+    }
+
+    @Test fun childProcessSpawnRunsCommand() {
+        val mc = Mycelium()
+        runJsWithImports(mc, """
+            import { spawn } from 'child_process';
+            globalThis.__cpSpawnDone = false;
+            globalThis.__cpSpawnOutput = '';
+            const child = spawn('echo', ['hello', 'from', 'spawn']);
+            let chunks = [];
+            child.stdout.on('data', (chunk) => chunks.push(chunk));
+            child.on('close', (code) => {
+                let str = '';
+                for (const chunk of chunks) {
+                    for (let i = 0; i < chunk.length; i++) str += String.fromCharCode(chunk[i]);
+                }
+                globalThis.__cpSpawnOutput = str;
+                globalThis.__cpSpawnExitCode = code;
+                globalThis.__cpSpawnDone = true;
+            });
+        """.trimIndent())
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__cpSpawnDone"),
+            "spawn()'d process did not report 'close' within the timeout"
+        )
+        assertEquals("hello from spawn\n", mc.eval("js", "globalThis.__cpSpawnOutput").asString())
+        assertEquals(0, mc.eval("js", "globalThis.__cpSpawnExitCode").asInt())
+    }
+
+    @Test fun childProcessExecRunsCommand() {
+        val mc = Mycelium()
+        runJsWithImports(mc, """
+            import { exec } from 'child_process';
+            globalThis.__cpExecDone = false;
+            exec('echo hello from exec', (error, stdout, stderr) => {
+                globalThis.__cpExecError = error;
+                globalThis.__cpExecStdout = stdout;
+                globalThis.__cpExecDone = true;
+            });
+        """.trimIndent())
+        assertTrue(
+            pollUntilTrue(mc, "globalThis.__cpExecDone"),
+            "exec()'d command's callback did not fire within the timeout"
+        )
+        assertTrue(mc.eval("js", "globalThis.__cpExecError === null").asBoolean())
+        assertEquals("hello from exec\n", mc.eval("js", "globalThis.__cpExecStdout").asString())
+    }
+
     // --- Global `Buffer` (no import required) ---
 
     @Test fun globalBufferExists() {

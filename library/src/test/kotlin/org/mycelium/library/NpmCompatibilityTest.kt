@@ -1,6 +1,7 @@
 package org.mycelium.library
 
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
@@ -117,6 +118,63 @@ import java.net.URI
 //     a last gap: `fs.mkdtempSync` (used by `@inquirer/external-editor` to create a scratch
 //     dir) wasn't implemented in node-stdlib/fs.mjs. Now that it (and its `fs/promises`
 //     counterpart) exist, inquirer WORKS end-to-end — see inquirerLoadsWithNamedCjsExports.
+//
+// Fourth round — heavier, more complex real-world packages (fastify, jsonwebtoken, bcryptjs,
+// moment, yaml, socket.io, mongoose, pg, sharp, esbuild), 3/10 pass. Per the sweep's "find
+// gaps, don't fix them yet" approach, none of these gaps were fixed this round — only
+// cataloged (failing packages below are `@Disabled` tests documenting the exact error,
+// not fixes):
+//
+//   - bcryptjs (password hashing, pure JS): WORKS. No native bindings involved (that's the
+//     real `bcrypt` package, not tested here) — hashSync/compareSync round-trip cleanly.
+//   - moment (legacy date library, pure JS): WORKS. No core-module or exports-resolution
+//     surface at all — same "just works" shape as lodash/semver/zod.
+//   - yaml (pure JS YAML parser): WORKS. Same shape as moment/bcryptjs.
+//   - fastify (HTTP framework): FAILS. `node_modules/fastify/lib` does
+//     `require('node:dns')` at module scope — `dns` is not among Mycelium's synthetic core
+//     modules (it's listed under "Missing Node stdlib modules" in TODO.md, alongside `net`,
+//     `worker_threads`/`readline`/`module` — the latter three since fixed in round 3).
+//   - jsonwebtoken (JWT sign/verify, uses crypto): FAILS. `sign.js` does
+//     `secretOrPrivateKey instanceof KeyObject` where `KeyObject` comes from
+//     `require('crypto')`. Mycelium's `node-stdlib/crypto.mjs` *has* a working internal
+//     `KeyObject` class (used by its own `createPrivateKey`/`createPublicKey`/
+//     `createSecretKey` implementations) but never exports it — `crypto.mjs`'s `export
+//     default { ... }` object omits `KeyObject` entirely, so `require('crypto').KeyObject`
+//     is `undefined`, and `x instanceof undefined` throws `TypeError: Right-hand-side of
+//     instanceof is not an object` rather than evaluating to `false`.
+//   - socket.io (WebSocket framework): FAILS with a generic `Is a directory` exception and
+//     no guest-code stack frame at all (the failure happens during import-graph resolution,
+//     before any module body executes) — the same failure *signature* documented for
+//     yargs's pre-fix escalade gap in round 3 (an unhandled `exports` shape falling through
+//     to a literal on-disk path check against a directory), but socket.io's own top-level
+//     `exports["."]` is a plain `{types, import, require}` object (not nested/array-shaped),
+//     so the trigger is a different, not-yet-identified `exports` shape somewhere in
+//     socket.io's transitive dependency tree (engine.io / ws / base64id, etc.), not
+//     socket.io's own package.json.
+//   - mongoose (MongoDB ODM): FAILS with the exact same unqualified `Is a directory`
+//     exception and no guest-code stack frame as socket.io — very likely the same
+//     underlying `exports`-resolution gap, not yet isolated to a specific transitive
+//     package given mongoose's dependency tree size (kareem, mquery, bson, mongodb driver,
+//     etc.).
+//   - pg (PostgreSQL client): FAILS. `node_modules/pg/lib` does `require('util/types')`
+//     (the extensionless subpath form, not `node:util/types`) — Mycelium registers `util`
+//     as a core module but has no `util/types` (or `node:util/types`) module of its own;
+//     real Node's `util/types` exposes `isDate`/`isRegExp`/`isProxy`/etc. type-tag checks
+//     pg's binary-protocol type coercion relies on.
+//   - sharp (native image-processing addon): FAILS — but not on the native binding, which
+//     was the expected failure mode going in. `dist/utility.mjs` does `import {
+//     availableParallelism } from 'node:os'` at module scope; `node-stdlib/os.mjs` is
+//     registered but doesn't export `availableParallelism` (Node 19+), so ES module linking
+//     rejects the whole graph before any native-addon loading is ever attempted:
+//     `SyntaxError: The requested module 'node:os' does not provide an export named
+//     'availableParallelism'`.
+//   - esbuild (build tool, spawns a native `esbuild` binary via child_process): FAILS.
+//     `lib/main.js`'s `downloadedBinPath` calls `require.resolve(...)` to locate the
+//     platform-specific binary package — Mycelium's CJS shim provides a `require()`
+//     function but never attaches a `.resolve` method to it, so the call fails with
+//     `TypeError: require.resolve is not a function` before esbuild ever gets to spawning
+//     the child process (a separate, likely-also-missing piece of Node compat that this
+//     gap masks).
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -776,5 +834,271 @@ class NpmCompatibilityTest {
             """.trimIndent()
         )
         assertEquals("function", mc.eval("js", "globalThis.__inquirerPromptType").asString())
+    }
+
+    // --- 21. bcryptjs — password hashing, pure JS (no native bindings — that's the separate
+    // `bcrypt` package, not this one). WORKS. ---
+
+    @Test fun bcryptjsHashesAndComparesPassword() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-bcryptjs-")
+        npmInstall(dir, "bcryptjs")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import bcrypt from 'bcryptjs';
+            const hash = bcrypt.hashSync('password123', 10);
+            globalThis.__bcryptMatches = bcrypt.compareSync('password123', hash);
+            globalThis.__bcryptRejectsWrong = bcrypt.compareSync('wrong-password', hash);
+            """.trimIndent()
+        )
+        assertTrue(mc.eval("js", "globalThis.__bcryptMatches").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__bcryptRejectsWrong").asBoolean())
+    }
+
+    // --- 22. moment — legacy date library, pure JS, zero core-module surface. WORKS. ---
+
+    @Test fun momentFormatsDate() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-moment-")
+        npmInstall(dir, "moment")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import moment from 'moment';
+            globalThis.__momentResult = moment('2024-01-15').format('MMMM Do YYYY');
+            """.trimIndent()
+        )
+        assertEquals("January 15th 2024", mc.eval("js", "globalThis.__momentResult").asString())
+    }
+
+    // --- 23. yaml — pure JS YAML parser. WORKS. ---
+
+    @Test fun yamlParsesDocument() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-yaml-")
+        npmInstall(dir, "yaml")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import YAML from 'yaml';
+            const doc = YAML.parse('hello: world\nlist:\n  - 1\n  - 2');
+            globalThis.__yamlHello = doc.hello;
+            globalThis.__yamlListLength = doc.list.length;
+            """.trimIndent()
+        )
+        assertEquals("world", mc.eval("js", "globalThis.__yamlHello").asString())
+        assertEquals(2, mc.eval("js", "globalThis.__yamlListLength").asInt())
+    }
+
+    // --- 24. fastify — HTTP framework, alternative to express. FAILS: `node:dns` is not a
+    // registered core module (see class doc above) — cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: fastify's lib/*.js does require('node:dns') at module scope; 'dns' is not " +
+            "among Mycelium's synthetic core modules (see TODO.md 'Missing Node stdlib " +
+            "modules'). Exact error: com.oracle.truffle.host.HostException: mycelium: cannot " +
+            "find module 'node:dns' required from '<tmp>/node_modules/fastify/lib'"
+    )
+    fun fastifyListensAndCloses() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-fastify-")
+        npmInstall(dir, "fastify")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import Fastify from 'fastify';
+            const app = Fastify({ logger: false });
+            app.get('/', async () => ({ hello: 'mycelium' }));
+            await app.listen({ port: 0 });
+            globalThis.__fastifyPort = app.server.address().port;
+            await app.close();
+            """.trimIndent()
+        )
+        assertTrue(mc.eval("js", "globalThis.__fastifyPort").asInt() > 0)
+    }
+
+    // --- 25. jsonwebtoken — JWT sign/verify, uses crypto. FAILS: `node-stdlib/crypto.mjs`
+    // has a working internal `KeyObject` class but never exports it (see class doc above) —
+    // cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: sign.js does `secretOrPrivateKey instanceof KeyObject` where KeyObject is " +
+            "require('crypto').KeyObject; node-stdlib/crypto.mjs has an internal KeyObject " +
+            "class but never exports it, so KeyObject is undefined. Exact error: " +
+            "TypeError: Right-hand-side of instanceof is not an object " +
+            "(node_modules/jsonwebtoken/sign.js)"
+    )
+    fun jsonwebtokenSignsAndVerifies() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-jsonwebtoken-")
+        npmInstall(dir, "jsonwebtoken")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import jwt from 'jsonwebtoken';
+            const token = jwt.sign({ sub: 'mycelium' }, 'secret-key', { algorithm: 'HS256' });
+            const decoded = jwt.verify(token, 'secret-key');
+            globalThis.__jwtSubMatches = decoded.sub === 'mycelium';
+            """.trimIndent()
+        )
+        assertTrue(mc.eval("js", "globalThis.__jwtSubMatches").asBoolean())
+    }
+
+    // --- 26. socket.io — WebSocket framework. FAILS: an unqualified `Is a directory`
+    // exception with no guest-code stack frame — same failure signature as yargs's pre-fix
+    // escalade `exports`-array gap in round 3, but the trigger hasn't been isolated to a
+    // specific transitive package (see class doc above) — cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: com.oracle.truffle.host.HostException: Is a directory, no guest-code stack " +
+            "frame (fails during import-graph resolution before any module body runs) — an " +
+            "'exports'-resolution gap in socket.io's transitive dependency tree, not yet " +
+            "isolated to a specific package or exports shape."
+    )
+    fun socketIoServerLoads() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-socketio-")
+        npmInstall(dir, "socket.io")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import { Server } from 'socket.io';
+            import { createServer } from 'http';
+            const httpServer = createServer();
+            const io = new Server(httpServer);
+            globalThis.__socketIoOnType = typeof io.on;
+            httpServer.close();
+            """.trimIndent()
+        )
+        assertEquals("function", mc.eval("js", "globalThis.__socketIoOnType").asString())
+    }
+
+    // --- 27. mongoose — MongoDB ODM, huge dependency tree. FAILS with the exact same
+    // unqualified `Is a directory` exception as socket.io — very likely the same underlying
+    // gap, not yet isolated given mongoose's dependency tree size (see class doc above) —
+    // cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: com.oracle.truffle.host.HostException: Is a directory, no guest-code stack " +
+            "frame — same failure signature as socket.io above; not yet isolated to a " +
+            "specific package in mongoose's dependency tree (kareem, mquery, bson, mongodb " +
+            "driver, etc.)."
+    )
+    fun mongooseLoads() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-mongoose-")
+        npmInstall(dir, "mongoose")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import mongoose from 'mongoose';
+            globalThis.__mongooseConnectType = typeof mongoose.connect;
+            globalThis.__mongooseSchemaType = typeof mongoose.Schema;
+            """.trimIndent()
+        )
+        assertEquals("function", mc.eval("js", "globalThis.__mongooseConnectType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__mongooseSchemaType").asString())
+    }
+
+    // --- 28. pg — PostgreSQL client. FAILS: `require('util/types')` (extensionless subpath
+    // form) is not a registered core module — only `util` itself is registered, not
+    // `util/types` (see class doc above) — cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: com.oracle.truffle.host.HostException: mycelium: cannot find module " +
+            "'util/types' required from '<tmp>/node_modules/pg/lib' — Mycelium registers " +
+            "'util' as a core module but not 'util/types' (or 'node:util/types')."
+    )
+    fun pgClientLoads() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-pg-")
+        npmInstall(dir, "pg")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import pg from 'pg';
+            globalThis.__pgClientType = typeof pg.Client;
+            globalThis.__pgPoolType = typeof pg.Pool;
+            """.trimIndent()
+        )
+        assertEquals("function", mc.eval("js", "globalThis.__pgClientType").asString())
+        assertEquals("function", mc.eval("js", "globalThis.__pgPoolType").asString())
+    }
+
+    // --- 29. sharp — native image-processing addon. FAILS, but not on the native binding as
+    // expected going in — `node:os` doesn't export `availableParallelism` (Node 19+), so ES
+    // module linking rejects the whole graph before any native-addon loading is attempted
+    // (see class doc above) — cataloged, not fixed this round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: SyntaxError: The requested module 'node:os' does not provide an export " +
+            "named 'availableParallelism' (node_modules/sharp/dist/utility.mjs) — fails at " +
+            "module-link time, before sharp's native addon is ever loaded."
+    )
+    fun sharpLoads() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-sharp-")
+        npmInstall(dir, "sharp")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import sharp from 'sharp';
+            globalThis.__sharpType = typeof sharp;
+            """.trimIndent()
+        )
+        assertEquals("function", mc.eval("js", "globalThis.__sharpType").asString())
+    }
+
+    // --- 30. esbuild — build tool, spawns a native binary via child_process. FAILS:
+    // `require.resolve` is not implemented — Mycelium's CJS shim provides `require()` but
+    // never attaches a `.resolve` method (see class doc above) — cataloged, not fixed this
+    // round. ---
+
+    @Test
+    @Disabled(
+        "FAILS: TypeError: require.resolve is not a function " +
+            "(node_modules/esbuild/lib/main.js, downloadedBinPath) — Mycelium's CJS " +
+            "require() shim has no .resolve method."
+    )
+    fun esbuildTransformsTypeScript() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-esbuild-")
+        npmInstall(dir, "esbuild")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import * as esbuild from 'esbuild';
+            const result = await esbuild.transform('const x: number = 1', { loader: 'ts' });
+            globalThis.__esbuildResultHasConstX = result.code.includes('const x');
+            """.trimIndent()
+        )
+        assertTrue(mc.eval("js", "globalThis.__esbuildResultHasConstX").asBoolean())
     }
 }

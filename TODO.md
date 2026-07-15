@@ -79,6 +79,18 @@ All findings above are cataloged as tests in `NpmCompatibilityTest.kt` (see its 
 - Also fixed while in the area (not gating any round-3 package directly, but needed for real-world npm compat): `util.mjs` gained `debuglog`/`debug`, `parseArgs`, `promisify.custom`, `styleText`, `formatWithOptions`, `getSystemErrorName`, `toUSVString`.
 - `assert.strict.rejects`/`assert.strict.doesNotReject` — checked, were already correctly implemented (no bug found there).
 
+**Round 4 (fastify, jsonwebtoken, bcryptjs, moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — heavier/more complex packages, 3/10 pass, cataloged only (no fixes this round):**
+- `bcryptjs`, `moment`, `yaml` — WORK (no gaps; same "pure JS, no exotic surface" shape as lodash/moment/zod).
+- `fastify` — FAILS. `require('node:dns')` at module scope; `dns` still isn't a registered core module.
+- `jsonwebtoken` — FAILS. `secretOrPrivateKey instanceof KeyObject` where `KeyObject` comes from `require('crypto')` — `node-stdlib/crypto.mjs` has a working internal `KeyObject` class (used by its own `createPrivateKey`/`createPublicKey`/`createSecretKey`) but its `export default {...}` never includes it, so `KeyObject` is `undefined` and `instanceof undefined` throws instead of evaluating false.
+- `socket.io` — FAILS with an unqualified `Is a directory` exception and no guest-code stack frame (fails during import resolution before any module body runs) — same failure signature as round 3's pre-fix yargs/escalade gap, but socket.io's own top-level `exports` is a plain (non-nested, non-array) object, so the trigger is somewhere in its transitive dependency tree, not yet isolated.
+- `mongoose` — FAILS with the exact same unqualified `Is a directory` exception as socket.io, likely the same underlying gap; not yet isolated given mongoose's dependency tree size.
+- `pg` — FAILS. `require('util/types')` (extensionless subpath, not `node:util/types`) isn't a registered core module — only `util` itself is.
+- `sharp` — FAILS, but *not* on native-addon loading as expected going in: `dist/utility.mjs` does `import { availableParallelism } from 'node:os'` at module scope, and `os.mjs` doesn't export it (Node 19+ addition) — ES module linking rejects the whole graph before sharp ever attempts to load its native binding.
+- `esbuild` — FAILS. `require.resolve` is not implemented at all — Mycelium's CJS `require()` shim has no `.resolve` method, so `downloadedBinPath`'s `require.resolve(...)` call (used to locate the platform-specific binary package) throws before esbuild even gets to spawning its child-process binary.
+
+All round 4 findings are cataloged as `@Disabled` tests (failing packages) or real passing tests (bcryptjs/moment/yaml) in `NpmCompatibilityTest.kt` — see its class doc comment for full detail — **cataloged, not fixed**, same sweep approach as prior rounds.
+
 ### Next npm gaps to fix (ordered simplest → hardest)
 1. `node:module` core module (at least `builtinModules`) — unblocks yargs.
 2. `worker_threads` core module (stub acceptable) — unblocks pino.
@@ -86,7 +98,7 @@ All findings above are cataloged as tests in `NpmCompatibilityTest.kt` (see its 
 4. Expose `URL`/`URLSearchParams` as globals (not just importable from `url`) — unblocks glob/minimatch/path-scurry.
 
 ### Missing Node stdlib modules
-`net`, `worker_threads`, `readline`, `module`, `dns`, `dgram`, `cluster`. (`child_process`, `tty`, `diagnostics_channel`, `async_hooks`, `fs/promises` are now implemented.) Also: console output could be improved beyond GraalJS's defaults.
+`net`, `dns`, `dgram`, `cluster`, `util/types` (subpath of `util`, not a top-level gap). (`child_process`, `tty`, `diagnostics_channel`, `async_hooks`, `fs/promises`, `worker_threads`, `readline`, `module` are now implemented.) Also: console output could be improved beyond GraalJS's defaults; `require.resolve` is unimplemented (esbuild, round 4); `os.mjs` is missing `availableParallelism` (Node 19+, sharp, round 4); `crypto.mjs`'s internal `KeyObject` class is never exported (jsonwebtoken, round 4).
 
 ## Language support status
 

@@ -599,7 +599,15 @@ class InterceptingFileSystem : FileSystem {
             val targetLang = mc.supportForExtension(path.extension)
             if (targetLang != null && targetLang.needsCompilation && !path.startsWith("/.mycelium/")) {
                 val compiled = Compiler.compile(path, targetLang)
-                val source = Source.newBuilder("llvm", compiled.toFile()).build()
+                // Every compiled LanguageSupport so far (C, Rust) emits LLVM bitcode, which
+                // GraalVM loads under the "llvm" language ID regardless of the source
+                // language. TinyGoSupport is the first exception — tinygo emits a
+                // WebAssembly binary, which must be loaded under "wasm" instead. Keying off
+                // outputExtension (rather than targetLang.languageId, which is itself
+                // "wasm" for Go) keeps this in sync with whatever Compiler.compile actually
+                // wrote to disk.
+                val compiledLanguageId = if (targetLang.outputExtension == "wasm") "wasm" else "llvm"
+                val source = Source.newBuilder(compiledLanguageId, compiled.toFile()).build()
                 val value = context!!.eval(source)
                 return generateShim(hostLang, value, path.toString())
             }

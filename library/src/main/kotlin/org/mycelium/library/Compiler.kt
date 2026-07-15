@@ -17,7 +17,7 @@ object Compiler {
         val hash = MessageDigest.getInstance("SHA-256")
             .digest(sourceFile.readBytes())
             .joinToString("") { "%02x".format(it) }
-        val outputFile = File(cacheDir, "$hash.bc")
+        val outputFile = File(cacheDir, "$hash.${lang.outputExtension}")
         if (outputFile.exists()) return outputFile.toPath()
         val cmd = compilerCmd + listOf(outputFile.absolutePath, sourceFile.absolutePath)
         val process =

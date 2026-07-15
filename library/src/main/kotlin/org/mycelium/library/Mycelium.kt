@@ -7,7 +7,7 @@ import org.graalvm.polyglot.io.IOAccess
 
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
-        JsSupport, RubySupport, PythonSupport, CSupport, RustSupport
+        JsSupport, RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport
     ),
     // When true, a bare specifier that can't be resolved against any existing
     // node_modules tree triggers an automatic `npm install`/`pnpm install` of the

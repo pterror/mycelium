@@ -82,6 +82,7 @@ class LanguageSupportTest {
         assertEquals("python", mc.languageFromExtension("py"))
         assertEquals("llvm", mc.languageFromExtension("c"))
         assertEquals("llvm", mc.languageFromExtension("rs"))
+        assertEquals("wasm", mc.languageFromExtension("go"))
         assertNull(mc.languageFromExtension("unknown"))
     }
 
@@ -125,8 +126,28 @@ class LanguageSupportTest {
     @Test fun needsCompilation() {
         assertTrue(CSupport.needsCompilation)
         assertTrue(RustSupport.needsCompilation)
+        assertTrue(TinyGoSupport.needsCompilation)
         assertFalse(JsSupport.needsCompilation)
         assertFalse(RubySupport.needsCompilation)
         assertFalse(PythonSupport.needsCompilation)
+    }
+
+    @Test fun goValidExportNames() {
+        assertTrue(TinyGoSupport.isValidExportName("add"))
+        assertTrue(TinyGoSupport.isValidExportName("Multiply"))
+        assertFalse(TinyGoSupport.isValidExportName("__builtin_something"))
+        assertFalse(TinyGoSupport.isValidExportName("llvm.lifetime.start"))
+    }
+
+    @Test fun goCompiledArtifactUsesWasmExtensionAndLanguage() {
+        // C/Rust are LLVM bitcode, so they keep the default "bc" output extension and load
+        // via the "llvm" guest language; TinyGoSupport is the one exception, needing a
+        // "wasm" cache file extension and the "wasm" guest language instead — see
+        // LanguageSupport.outputExtension and InterceptingFileSystem's compiled-import
+        // branch.
+        assertEquals("bc", CSupport.outputExtension)
+        assertEquals("bc", RustSupport.outputExtension)
+        assertEquals("wasm", TinyGoSupport.outputExtension)
+        assertEquals("wasm", TinyGoSupport.languageId)
     }
 }

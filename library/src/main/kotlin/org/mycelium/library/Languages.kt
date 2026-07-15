@@ -122,30 +122,59 @@ object RustSupport : LanguageSupport {
     override fun generateShim(exports: Map<String, String>) = ""
 }
 
-// EXPERIMENTAL — not wired into Mycelium's default language list.
+// Go support, via tinygo -> WASM. Wired into Mycelium's default language list (see
+// Mycelium.kt) despite tinygo not being guaranteed present in the environment: the
+// existing Compiler/InterceptingFileSystem plumbing already turns a missing compiler
+// binary into a clean MyceliumException at the point a .go file is actually imported
+// (ProcessBuilder's IOException is caught in Compiler.compile), rather than at startup —
+// so listing TinyGoSupport by default costs nothing for consumers who never import a Go
+// file, exactly like the other compiled languages (C/Rust) already work.
 //
-// Investigated 2026-07-15: there's no single-command Go -> LLVM bitcode pipeline the way
+// Why WASM and not LLVM: there's no single-command Go -> LLVM bitcode pipeline the way
 // there is for C (clang -emit-llvm) or Rust (rustc --emit=llvm-bc). Stock `go build` only
-// emits native machine code or, via `-buildmode=c-shared`, a platform shared object — never
-// LLVM IR/bitcode GraalVM's LLVM runtime can load. gollvm (Go's experimental LLVM backend)
-// could theoretically emit bitcode but is unmaintained/hard to obtain as of this writing.
+// emits native machine code or, via `-buildmode=c-shared`, a platform shared object —
+// never LLVM IR/bitcode GraalVM's LLVM runtime can load. gollvm (Go's experimental LLVM
+// backend) could theoretically emit bitcode but is unmaintained/hard to obtain as of this
+// writing, and bouncing through a .a archive + clang to recover bitcode from it is fragile
+// enough (and undocumented enough) not to be worth building on. So Go -> LLVM is not
+// offered here at all — Go's only compiled path is Go -> WASM via tinygo
+// (`tinygo build -target=wasi`), loaded through GraalVM's WASM language (Truffle wasm)
+// rather than the LLVM language every other compiled LanguageSupport here targets. That
+// makes `languageId = "wasm"`, not "llvm", and `outputExtension = "wasm"` (see
+// LanguageSupport.outputExtension / InterceptingFileSystem's compiled-import branch,
+// which uses outputExtension rather than languageId to decide "llvm" vs "wasm" so
+// Compiler's cache file extension and the guest language used to load it never drift
+// apart).
 //
-// The viable path instead looks like Go -> WASM via tinygo (`tinygo build -target=wasi`),
-// loaded through GraalVM's WASM language (Truffle wasm) rather than the LLVM language that
-// every other LanguageSupport here targets. That means `languageId = "wasm"`, not "llvm" —
-// this is a genuinely different runtime, not just another compilerCommand.
+// Requirements: `tinygo` must be on PATH (not stock `go` — stock Go has no wasi/wasm
+// target that emits a small, freestanding-friendly binary the way tinygo does). Compiled
+// output is cached the same way as C/Rust (content-hashed under
+// $XDG_CACHE_HOME/mycelium/<hash>.wasm).
 //
-// Open question this raises for Mycelium: WASM (even under wasi) is sandboxed with its own
-// linear memory and import/export ABI, unlike the LLVM bitcode path where C/Rust functions
-// share the same native address space and can be called with plain scalar args/returns.
-// Whether GraalVM's polyglot bindings can bridge a wasm export as transparently as an LLVM
-// symbol (numeric args are probably fine; strings/structs would need explicit
-// memory-marshaling through the wasm instance's linear memory) is unverified — this object
-// is a stub for that investigation, not a tested integration.
+// Known limitations:
+//  - Untested without a real tinygo binary in this environment (none is installed here as
+//    of this writing — see flake.nix). generateShim/isValidExportName below mirror
+//    CSupport/RustSupport's LLVM conventions on the assumption that GraalVM's WASM engine
+//    exposes a module's exports as Value.memberKeys the same way the LLVM engine exposes a
+//    bitcode module's global symbols (both are meant to follow the same polyglot Value
+//    convention), but this has not been confirmed against a real compiled .wasm file.
+//  - WASM (even under wasi) is sandboxed with its own linear memory and import/export ABI,
+//    unlike the LLVM bitcode path where C/Rust functions share the same native address
+//    space and can be called with plain scalar args/returns. Numeric args/returns
+//    (int32/int64/float32/float64) should bridge transparently through polyglot Value the
+//    same way LLVM's do; strings and structs will not — Go's ABI for those (e.g. Go
+//    strings as a pointer+length pair into wasm linear memory) needs explicit marshaling
+//    that this shim layer does not attempt. Keep exported functions to scalar
+//    parameters/returns (see the //export comment convention tinygo requires) until that's
+//    built out.
+//  - main()'s WASI startup semantics (tinygo emits a `_start` export by default when
+//    targeting wasi) aren't accounted for here; only //export-annotated functions are
+//    expected to be usable as importable members.
 object TinyGoSupport : LanguageSupport {
     override val languageId = "wasm"
     override val extensions = listOf("go")
     override val compilerCommand = listOf("tinygo", "build", "-target=wasi", "-o")
+    override val outputExtension = "wasm"
 
     override fun detectFrame(frame: String) = false
     override fun isValidExportName(name: String) =

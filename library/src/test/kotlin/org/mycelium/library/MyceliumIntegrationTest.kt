@@ -138,6 +138,22 @@ class MyceliumIntegrationTest {
         assertEquals(42, result.asInt())
     }
 
+    // tinygo (not stock `go`) is required for the Go -> WASM path — see TinyGoSupport's
+    // doc comment in Languages.kt for why. Not (yet) guaranteed present in every
+    // environment this test suite runs in, so skip gracefully like jsImportsRust does for
+    // rustc above, rather than failing the whole suite where tinygo is absent.
+    @Test fun jsImportsGoWasm() {
+        assumeTrue(isCommandAvailable("tinygo"), "tinygo not available in PATH — skipping Go/WASM interop test")
+        val mc = vm
+        val path = testResourcePath("add.go")
+        runJsWithImports(mc, """
+            import { add } from "$path";
+            globalThis.__testResult = add(2, 3);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__testResult")
+        assertEquals(5, result.asInt())
+    }
+
     @Test fun jsImportsAllAtOnce() {
         val mc = vm
         val jsPath = testResourcePath("constant.mjs")

@@ -4,7 +4,6 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
-import org.graalvm.polyglot.PolyglotException
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -104,12 +103,20 @@ import java.net.URI
 //     end-to-end — see pinoLogsMessage.
 //   - inquirer: originally FAILED with "unknown core module 'node:async_hooks'" — fixed by
 //     registering a real `async_hooks.mjs` core module, then progressed to a missing
-//     `node:readline` core module. Now that `readline` is registered too, it progresses
-//     past both and fails on an unrelated CJS/ESM interop gap instead: `chardet` is CJS and
-//     its named export `detect` is used via `import { detect } from 'chardet'` in
-//     `@inquirer/external-editor`'s ESM entry point, and Mycelium's CJS-to-ESM named-export
-//     inference doesn't pick it up ("The requested module 'chardet' does not provide an
-//     export named 'detect'") — see inquirerFailsOnChardetNamedExportInterop.
+//     `node:readline` core module. Now that `readline` is registered too, it progressed
+//     past both and failed on a CJS/ESM interop gap instead: `chardet` is CJS and its
+//     named export `detect` is used via `import { detect } from 'chardet'` in
+//     `@inquirer/external-editor`'s ESM entry point, and Mycelium's CJS-to-ESM shim only
+//     ever exposed `export default <wholeModule>` — never named re-exports for the CJS
+//     module's own properties. `InterceptingFileSystem.buildCjsEsmShim` now `require()`s
+//     the CJS module eagerly (reusing the same cjsModuleCache `__mycelium_require__` uses,
+//     so the module's top-level code still only runs once) purely to enumerate its own
+//     member keys, and bakes a `export const <key> = _mod.<key>;` per valid-identifier key
+//     into the generated shim alongside the default export — mirroring what Node's
+//     cjs-module-lexer-based interop does. That unblocked `chardet`, which in turn exposed
+//     a last gap: `fs.mkdtempSync` (used by `@inquirer/external-editor` to create a scratch
+//     dir) wasn't implemented in node-stdlib/fs.mjs. Now that it (and its `fs/promises`
+//     counterpart) exist, inquirer WORKS end-to-end — see inquirerLoadsWithNamedCjsExports.
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -750,40 +757,24 @@ class NpmCompatibilityTest {
     // `node:readline`, which wasn't registered as a core module either.
     //
     // `readline`/`node:readline` (plus `readline/promises`) are now registered core modules
-    // too — but inquirer still doesn't run end-to-end, on a gap unrelated to any missing
-    // core module: `@inquirer/external-editor`'s ESM entry does `import { detect } from
-    // 'chardet'`, chardet is CJS (`module.exports = ChardetCls; ChardetCls.detect = ...`),
-    // and Mycelium's CJS-to-ESM named-export inference doesn't surface `detect` as a named
-    // export of the synthesized ESM wrapper — "The requested module 'chardet' does not
-    // provide an export named 'detect'". Open gap, not part of this sweep. Only checks that
-    // importing the module fails at load time — no interactive prompt is attempted. ---
+    // too, and `chardet`'s named export `detect` is now surfaced by the CJS-to-ESM shim (see
+    // class doc above), and `fs.mkdtempSync`/`fs/promises.mkdtemp` are now implemented —
+    // inquirer now WORKS end-to-end. Only checks that the module loads and exposes `prompt`
+    // — no interactive prompt is attempted (this test harness has no real TTY). ---
 
-    @Test fun inquirerFailsOnChardetNamedExportInterop() {
+    @Test fun inquirerLoadsWithNamedCjsExports() {
         assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
 
         val dir = tempProjectDir("mycelium-npm-inquirer-")
         npmInstall(dir, "inquirer")
 
-        val ex = assertThrows(PolyglotException::class.java) {
-            writeAndRun(
-                dir,
-                """
-                import inquirer from 'inquirer';
-                globalThis.__inquirerPromptType = typeof inquirer.prompt;
-                """.trimIndent()
-            )
-        }
-        assertFalse(
-            ex.message!!.contains("async_hooks"),
-            "async_hooks should now resolve — unexpected error: ${ex.message}"
+        val mc = writeAndRun(
+            dir,
+            """
+            import inquirer from 'inquirer';
+            globalThis.__inquirerPromptType = typeof inquirer.prompt;
+            """.trimIndent()
         )
-        assertFalse(
-            ex.message!!.contains("node:readline"),
-            "readline should now resolve — unexpected error: ${ex.message}"
-        )
-        assertTrue(
-            ex.message!!.contains("chardet") && ex.message!!.contains("detect"),
-            "unexpected error: ${ex.message}"
-        )
+        assertEquals("function", mc.eval("js", "globalThis.__inquirerPromptType").asString())
     }
 }

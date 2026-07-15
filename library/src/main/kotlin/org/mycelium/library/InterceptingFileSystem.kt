@@ -727,6 +727,42 @@ class InterceptingFileSystem : FileSystem {
         return moduleObj.getMember("exports")
     }
 
+    // Node's CJS/ESM interop statically analyzes a required CJS module's exports object
+    // (via cjs-module-lexer) and synthesizes a named ES export for each of its own
+    // properties — that's what makes `import { detect } from 'chardet'` work even though
+    // chardet only ever does `module.exports.detect = ...` / `exports.detect = ...`, never
+    // an explicit ESM `export`. Mycelium has no static lexer, so this mirrors that by
+    // actually `require()`-ing the module right now (via requireModule, the exact same
+    // path/cache `__mycelium_require__` uses at runtime — see cjsModuleCache) purely to
+    // discover its own member keys, then bakes a `export const x = _mod.x;` per member
+    // into the generated shim alongside the whole-module default export. Because
+    // requireModule shares cjsModuleCache with `__mycelium_require__`, the module's
+    // top-level code still only runs once: this call runs it (if not already cached), and
+    // the `__mycelium_require__` call embedded in the shim below just replays the cached
+    // `module.exports` when the shim itself is evaluated.
+    private fun buildCjsEsmShim(path: String, dir: String): String {
+        val exportsValue = requireModule(path, dir)
+        val sb = StringBuilder()
+        sb.append("const _mod = globalThis.__mycelium_require__(")
+        sb.append(jsonStringLiteral(path)).append(", ").append(jsonStringLiteral(dir)).append(");\n")
+        sb.append("export default _mod;\n")
+        // `module.exports = function(){...}` (or any other non-object primitive) is a
+        // valid CJS export shape — hasMembers() is false for those (well, functions do
+        // have members, but e.g. a string/number export doesn't), so guard before
+        // enumerating rather than letting memberKeys throw/return garbage.
+        if (exportsValue.hasMembers()) {
+            for (key in exportsValue.memberKeys) {
+                // Node never re-exports "default" as a named binding (it's already the
+                // default export above), and only valid JS identifiers/non-reserved-words
+                // can become `export const <name> = ...;` declarations — anything else
+                // (numeric keys, "foo-bar", etc.) is simply skipped, same as cjs-module-lexer.
+                if (key == "default" || !JsSupport.isValidExportName(key)) continue
+                sb.append("export const ").append(key).append(" = _mod.").append(key).append(";\n")
+            }
+        }
+        return sb.toString()
+    }
+
     // Escapes `s` as a JS double-quoted string literal, for splicing an arbitrary
     // filesystem path into generated JS source text.
     private fun jsonStringLiteral(s: String): String =
@@ -1020,8 +1056,7 @@ class InterceptingFileSystem : FileSystem {
                     return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
                 }
                 val dir = (path.parent ?: path).toString()
-                val esmShim = "export default globalThis.__mycelium_require__(" +
-                    "${jsonStringLiteral(path.toString())}, ${jsonStringLiteral(dir)});\n"
+                val esmShim = buildCjsEsmShim(path.toString(), dir)
                 return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(esmShim))
             }
             val mc = mycelium!!

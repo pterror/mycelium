@@ -99,10 +99,16 @@ class PythonInteropExperimentTest {
         // Confirms we're past the false-positive import-interception bug and now hitting
         // only the deeper GraalPython dict/foreign-object issue. On GraalVM 24.1.1 this
         // surfaced as a plain-text SystemError message; on 24.2.1 the same underlying bug
-        // still fires but is now surfaced as a wrapped host exception object instead of a
-        // readable string (message is literally "JavaObject[...HostException]"), so match
-        // on that instead of the old SystemError text.
-        assertTrue(ex.message?.contains("HostException") == true)
+        // still fired but was surfaced as a wrapped host exception object instead of a
+        // readable string (message is literally "JavaObject[...HostException]"). On 25.0.0
+        // the underlying bug still fires but manifests as a host-side NullPointerException
+        // ("Null receiver values are not supported by libraries") instead, still reported
+        // as a host exception (isHostException == true). Match on that instead.
+        assertTrue(ex.isHostException)
+        assertTrue(
+            ex.message?.contains("HostException") == true ||
+                ex.message?.contains("Null receiver values are not supported by libraries") == true
+        )
     }
 
     @Disabled("Blocked on GraalPython 24.1.1: crashes with " +

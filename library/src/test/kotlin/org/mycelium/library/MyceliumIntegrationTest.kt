@@ -600,12 +600,15 @@ class MyceliumIntegrationTest {
         }
         // On GraalVM 24.1.1, a host exception thrown from a host callback during JS module
         // resolution surfaced as ex.isHostException == true, unwrappable via
-        // ex.asHostException(). On 24.2.1 the same throw now surfaces as a *guest*
-        // exception instead (isHostException == false), with ex.message reduced to the
-        // interop toString of the wrapped host object ("JavaObject[...]") rather than the
-        // original message text. No Mycelium production code depends on isHostException
-        // (only this test did), so this is purely an assertion update, not a functional fix.
-        assertTrue(ex.isGuestException)
-        assertTrue(ex.message?.contains("MyceliumException") == true)
+        // ex.asHostException(), with the original message text intact. On 24.2.1 the same
+        // throw surfaced as a *guest* exception instead (isHostException == false), with
+        // ex.message reduced to the interop toString of the wrapped host object
+        // ("JavaObject[...]") rather than the original message text. On 25.0.0 it reverted
+        // back to the 24.1.1 shape (isHostException == true, original message text intact).
+        // No Mycelium production code depends on isHostException (only this test did), so
+        // this is purely an assertion update, not a functional fix.
+        assertTrue(ex.isHostException)
+        assertTrue(ex.asHostException() is MyceliumException)
+        assertTrue(ex.message?.contains("cannot find module") == true)
     }
 }

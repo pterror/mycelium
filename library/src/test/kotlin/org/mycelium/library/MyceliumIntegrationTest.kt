@@ -724,4 +724,63 @@ class MyceliumIntegrationTest {
         assertTrue(ex.asHostException() is MyceliumException)
         assertTrue(ex.message?.contains("cannot find module") == true)
     }
+
+    // --- Node stdlib `events` module ---
+
+    @Test fun importEventsModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { EventEmitter } from 'events';
+            const emitter = new EventEmitter();
+            let received = null;
+            emitter.on('greet', (name) => { received = 'hello ' + name; });
+            emitter.emit('greet', 'world');
+            globalThis.__eventsResult = received;
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__eventsResult")
+        assertEquals("hello world", result.asString())
+    }
+
+    // --- Node stdlib `util` module ---
+
+    @Test fun importUtilModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import util from 'util';
+            globalThis.__utilResult = util.format('%s is %d years old', 'Bob', 42);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__utilResult")
+        assertEquals("Bob is 42 years old", result.asString())
+    }
+
+    // --- Node stdlib `os` module ---
+
+    @Test fun importOsModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import os from 'os';
+            globalThis.__osPlatform = os.platform();
+            globalThis.__osHomedir = os.homedir();
+        """.trimIndent())
+        val platform = mc.eval("js", "globalThis.__osPlatform")
+        val homedir = mc.eval("js", "globalThis.__osHomedir")
+        assertTrue(platform.isString && platform.asString().isNotEmpty())
+        assertTrue(homedir.isString && homedir.asString().isNotEmpty())
+    }
+
+    // --- Node stdlib `fs` module ---
+
+    @Test fun importFsModule() {
+        val mc = vm
+        val tmpFile = java.nio.file.Files.createTempFile("mycelium-fs-test-", ".txt").toFile()
+        tmpFile.deleteOnExit()
+
+        runJsWithImports(mc, """
+            import fs from 'fs';
+            fs.writeFileSync("${tmpFile.absolutePath}", "hello from mycelium fs");
+            globalThis.__fsResult = fs.readFileSync("${tmpFile.absolutePath}", "utf8");
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__fsResult")
+        assertEquals("hello from mycelium fs", result.asString())
+    }
 }

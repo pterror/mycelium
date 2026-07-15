@@ -196,6 +196,14 @@ class InterceptingFileSystem : FileSystem {
     private val coreModules = mapOf(
         "path" to "path.mjs",
         "node:path" to "path.mjs",
+        "events" to "events.mjs",
+        "node:events" to "events.mjs",
+        "util" to "util.mjs",
+        "node:util" to "util.mjs",
+        "os" to "os.mjs",
+        "node:os" to "os.mjs",
+        "fs" to "fs.mjs",
+        "node:fs" to "fs.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

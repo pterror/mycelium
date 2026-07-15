@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
+import org.graalvm.polyglot.PolyglotException
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -63,6 +64,36 @@ import java.net.URI
 //   - express (CJS, big dependency tree): WORKS for the exact same reason as debug — it
 //     pulls in `debug` transitively (via `body-parser`), so it needed the same `tty`
 //     module. Not a distinct express-specific fix.
+//
+// Third round — harder still (ws, commander, yargs, glob, pino, zod, nanoid, inquirer),
+// 4/8 pass:
+//
+//   - ws (WebSocket server, uses net/crypto/stream/http/events): WORKS. All transitive
+//     requirements were already-implemented core modules.
+//   - zod (pure JS/TS, zero deps): WORKS. Same shape as lodash/semver.
+//   - nanoid (uses crypto): WORKS. Bottoms out on the same `globalThis.crypto`
+//     (`crypto.getRandomValues`) mechanism uuid's v4 generator already exercises.
+//   - commander (ESM v15): FAILS — but on a different gap than its `node:child_process`
+//     import would suggest. `lib/command.js` also does `import { stripVTControlCharacters }
+//     from 'node:util'` at module scope; `util` *is* registered but doesn't export that
+//     function, and ES module linking validates all named imports before any module body
+//     runs, so this surfaces first as "The requested module 'node:util' does not provide an
+//     export named 'stripVTControlCharacters'" — the also-real child_process gap (no
+//     child_process shim exists at all) never gets exercised.
+//   - yargs (ESM v18): FAILS, but not on a missing core module — its transitive dependency
+//     escalade declares `exports["./sync"]` as an *array* of fallback candidates
+//     (`[{import:{...}, require:{...}}, "./sync/index.js"]`), a distinct exports pattern
+//     from the nested-conditions-object shape axios already covers. `RESOLVE_CONDITIONS_FN`
+//     doesn't recurse into arrays (only plain objects via `hasOwnProperty` on known
+//     condition keys), so resolution silently fails and falls back to treating the export
+//     key itself as a literal on-disk path — which is a directory, producing an
+//     `EISDIR`-shaped "Error: Is a directory" instead of a real resolution.
+//   - glob (v11): FAILS — "unknown core module 'node:fs/promises'". Only plain `fs` is
+//     registered; there's no `fs/promises` core module.
+//   - pino: FAILS — "unknown core module 'node:diagnostics_channel'" / "cannot find module
+//     'node:diagnostics_channel'". Not registered at all, unlike `tty`.
+//   - inquirer: FAILS — "unknown core module 'node:async_hooks'". A separate gap from the
+//     `tty` one debug/chalk/express already exercise; `tty` alone isn't enough for inquirer.
 class NpmCompatibilityTest {
     private fun isCommandAvailable(cmd: String): Boolean =
         try {
@@ -462,5 +493,235 @@ class NpmCompatibilityTest {
         assertEquals(":method", mc.eval("js", "globalThis.__http2Method").asString())
         assertEquals(":status", mc.eval("js", "globalThis.__http2Status").asString())
         assertEquals("object", mc.eval("js", "globalThis.__http2DefaultSettingsType").asString())
+    }
+
+    // --- 13. ws — WebSocket server/client, uses net/crypto/stream/http/events. WORKS: all
+    // of ws's transitive requirements (net.Server, crypto hashing for the handshake, the
+    // Duplex stream base class, http.Server) are already-implemented core modules; nothing
+    // new needed. Only checks that a server can be constructed and closed — no real
+    // handshake/frame round trip. ---
+
+    @Test fun wsServerConstructsAndCloses() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-ws-")
+        npmInstall(dir, "ws")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import { WebSocketServer } from 'ws';
+            const wss = new WebSocketServer({ port: 0 });
+            globalThis.__wsAddressType = typeof wss.address;
+            wss.close();
+            """.trimIndent()
+        )
+        assertEquals("function", mc.eval("js", "globalThis.__wsAddressType").asString())
+    }
+
+    // --- 14. commander — CLI framework, pure JS (v15). FAILS, and not for the reason
+    // expected going in: commander's `lib/command.js` has two separate at-module-scope
+    // imports from core modules Mycelium only partially supports — `import childProcess
+    // from 'node:child_process'` (entirely unregistered, no child_process.mjs at all) and
+    // `import { stripVTControlCharacters } from 'node:util'` (util *is* registered, but
+    // node-stdlib/util.mjs doesn't export `stripVTControlCharacters`). ES module linking
+    // resolves/validates named imports for the whole module graph before any module body
+    // runs, and the `node:util` import is what fails first — a `SyntaxError: The requested
+    // module 'node:util' does not provide an export named 'stripVTControlCharacters'` —
+    // so commander never gets far enough to hit the also-real child_process gap. ---
+
+    @Test fun commanderFailsOnMissingUtilExport() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-commander-")
+        npmInstall(dir, "commander")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import { Command } from 'commander';
+                const program = new Command();
+                program.name('test').version('1.0.0').option('-d, --debug');
+                program.parse(['node', 'test', '--debug']);
+                globalThis.__commanderDebug = program.opts().debug;
+                """.trimIndent()
+            )
+        }
+        assertTrue(
+            ex.message!!.contains("stripVTControlCharacters"),
+            "unexpected error: ${ex.message}"
+        )
+    }
+
+    // --- 15. yargs — CLI framework, ESM (v18). FAILS, but not on a missing core module:
+    // yargs's platform shim (lib/platform-shims/esm.mjs) does `import escalade from
+    // 'escalade/sync'`, and escalade's package.json `exports["./sync"]` is an *array* of
+    // fallback candidates — `[{import: {...}, require: {...}}, "./sync/index.js"]` — a
+    // distinct "try each in order" exports pattern from the nested-conditions-object shape
+    // axios already exercises (see axiosLoadsSuccessfully above). `RESOLVE_CONDITIONS_FN`
+    // in InterceptingFileSystem only recurses into plain conditions *objects* (checking
+    // `hasOwnProperty` for known condition keys); given an array, `typeof node === "object"`
+    // is true (arrays are objects) but none of `node`/`import`/`default` are own keys of an
+    // array (its own keys are `"0"`, `"1"`, ...), so resolution silently returns null and
+    // falls through to a literal on-disk path check against the *export key itself*
+    // (`./sync`) — which exists as a directory (`escalade/sync/`), not a file, hence the
+    // `EISDIR`-shaped "Error: Is a directory" rather than a "no such export" error. Open gap:
+    // exports/imports conditions arrays aren't resolved. ---
+
+    @Test fun yargsFailsOnArrayExportsFallback() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-yargs-")
+        npmInstall(dir, "yargs")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import yargs from 'yargs';
+                import { hideBin } from 'yargs/helpers';
+                const argv = yargs(hideBin(['node', 'test', '--name', 'mycelium'])).argv;
+                globalThis.__yargsName = argv.name;
+                """.trimIndent()
+            )
+        }
+        assertTrue(
+            ex.message!!.contains("Is a directory"),
+            "unexpected error: ${ex.message}"
+        )
+    }
+
+    // --- 16. glob — file matching, uses path/fs. FAILS: glob v11's implementation
+    // (via the `path-scurry`/`minimatch` dependency chain) does `require('node:fs/promises')`
+    // (or `import ... from 'node:fs/promises'` depending on the entry point) — the promise-
+    // based `fs` API surface, which isn't registered as its own core module (only plain
+    // `fs` is — see library/src/main/resources/node-stdlib/fs.mjs; there's no
+    // fs/promises.mjs and no `fs`-module `.promises` export wired up as a separate
+    // specifier). ---
+
+    @Test fun globFailsOnMissingFsPromisesModule() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-glob-")
+        npmInstall(dir, "glob")
+        File(dir, "dummy.json").writeText("{}")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import { globSync } from 'glob';
+                const files = globSync('*.json');
+                globalThis.__globHasMatches = files.length > 0;
+                """.trimIndent()
+            )
+        }
+        assertTrue(
+            ex.message!!.contains("unknown core module 'node:fs/promises'"),
+            "unexpected error: ${ex.message}"
+        )
+    }
+
+    // --- 17. pino — fast logger, uses stream/os/events/sonic-boom. FAILS: pino's core
+    // (lib/tools.js, imported at module scope from pino.js) does
+    // `require('node:diagnostics_channel')` — a core module Mycelium doesn't register at
+    // all (not even a stub), unlike `tty` (registered specifically to unblock debug/chalk/
+    // express — see class doc above). ---
+
+    @Test fun pinoFailsOnMissingDiagnosticsChannelModule() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-pino-")
+        npmInstall(dir, "pino")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import pino from 'pino';
+                const logger = pino({ level: 'info' });
+                logger.info('hello from mycelium');
+                globalThis.__pinoLoaded = true;
+                """.trimIndent()
+            )
+        }
+        assertTrue(
+            ex.message!!.contains("unknown core module 'node:diagnostics_channel'") ||
+                ex.message!!.contains("cannot find module 'node:diagnostics_channel'"),
+            "unexpected error: ${ex.message}"
+        )
+    }
+
+    // --- 18. zod — schema validation, pure JS/TS, zero deps. WORKS. Same "pure JS, no
+    // exotic package.json fields or core-module dependencies" shape as lodash/semver. ---
+
+    @Test fun zodValidatesSchema() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-zod-")
+        npmInstall(dir, "zod")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import { z } from 'zod';
+            const schema = z.object({ name: z.string(), age: z.number() });
+            globalThis.__zodValidResult = schema.safeParse({ name: 'mycelium', age: 1 }).success;
+            globalThis.__zodInvalidResult = schema.safeParse({ name: 'mycelium', age: 'not a number' }).success;
+            """.trimIndent()
+        )
+        assertTrue(mc.eval("js", "globalThis.__zodValidResult").asBoolean())
+        assertFalse(mc.eval("js", "globalThis.__zodInvalidResult").asBoolean())
+    }
+
+    // --- 19. nanoid — ID generator, uses crypto. WORKS: like uuid, nanoid's non-secure and
+    // secure code paths both bottom out on the Web Crypto API (`crypto.getRandomValues`)
+    // exposed as `globalThis.crypto`, the same mechanism uuid's v4 generator relies on. ---
+
+    @Test fun nanoidGeneratesIdOfExpectedLength() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-nanoid-")
+        npmInstall(dir, "nanoid")
+
+        val mc = writeAndRun(
+            dir,
+            """
+            import { nanoid } from 'nanoid';
+            globalThis.__nanoidResult = nanoid();
+            """.trimIndent()
+        )
+        val result = mc.eval("js", "globalThis.__nanoidResult").asString()
+        assertEquals(21, result.length)
+    }
+
+    // --- 20. inquirer — interactive prompts, uses readline/tty/stream/events. FAILS:
+    // inquirer's core (`@inquirer/core`, pulled in transitively) does
+    // `require('node:async_hooks')` (used for its `AsyncLocalStorage`-based prompt-context
+    // tracking) at module scope, and `async_hooks` isn't among Mycelium's synthetic core
+    // modules — a separate gap from the `tty` one debug/chalk/express already exercise (see
+    // class doc above); `tty` alone isn't enough for inquirer to load. Only checks that
+    // importing the module fails at load time — no interactive prompt is attempted. ---
+
+    @Test fun inquirerFailsOnMissingAsyncHooksModule() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping npm compatibility test")
+
+        val dir = tempProjectDir("mycelium-npm-inquirer-")
+        npmInstall(dir, "inquirer")
+
+        val ex = assertThrows(PolyglotException::class.java) {
+            writeAndRun(
+                dir,
+                """
+                import inquirer from 'inquirer';
+                globalThis.__inquirerPromptType = typeof inquirer.prompt;
+                """.trimIndent()
+            )
+        }
+        assertTrue(
+            ex.message!!.contains("unknown core module 'node:async_hooks'"),
+            "unexpected error: ${ex.message}"
+        )
     }
 }

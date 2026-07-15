@@ -827,6 +827,117 @@ class MyceliumIntegrationTest {
         assertEquals("hello from mycelium fs", result.asString())
     }
 
+    // --- Node stdlib `buffer` module ---
+
+    @Test fun importBufferModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Buffer } from 'buffer';
+            const hex = Buffer.from('hello').toString('hex');
+            const concatLen = Buffer.concat([Buffer.from('ab'), Buffer.from('cd')]).toString('utf8');
+            const b64 = Buffer.from('hello').toString('base64');
+            const roundTrip = Buffer.from(b64, 'base64').toString('utf8');
+            globalThis.__bufHex = hex;
+            globalThis.__bufConcat = concatLen;
+            globalThis.__bufRoundTrip = roundTrip;
+            globalThis.__bufIsBuffer = Buffer.isBuffer(Buffer.alloc(3));
+            globalThis.__bufAlloc = JSON.stringify(Array.from(Buffer.alloc(3, 1)));
+        """.trimIndent())
+        assertEquals("68656c6c6f", mc.eval("js", "globalThis.__bufHex").asString())
+        assertEquals("abcd", mc.eval("js", "globalThis.__bufConcat").asString())
+        assertEquals("hello", mc.eval("js", "globalThis.__bufRoundTrip").asString())
+        assertTrue(mc.eval("js", "globalThis.__bufIsBuffer").asBoolean())
+        assertEquals("[1,1,1]", mc.eval("js", "globalThis.__bufAlloc").asString())
+    }
+
+    // --- Node stdlib `url` module ---
+
+    @Test fun importUrlModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import url, { URL } from 'url';
+            const parsed = url.parse('https://user:pass@example.com:8080/path?a=1#frag');
+            globalThis.__urlParsedHost = parsed.hostname;
+            globalThis.__urlParsedPort = parsed.port;
+            globalThis.__urlParsedPath = parsed.pathname;
+            const u = new URL('https://example.com/foo?x=1');
+            globalThis.__urlHref = u.href;
+            globalThis.__urlHost = u.hostname;
+        """.trimIndent())
+        assertEquals("example.com", mc.eval("js", "globalThis.__urlParsedHost").asString())
+        assertEquals("8080", mc.eval("js", "globalThis.__urlParsedPort").asString())
+        assertEquals("/path", mc.eval("js", "globalThis.__urlParsedPath").asString())
+        assertEquals("https://example.com/foo?x=1", mc.eval("js", "globalThis.__urlHref").asString())
+        assertEquals("example.com", mc.eval("js", "globalThis.__urlHost").asString())
+    }
+
+    // --- Node stdlib `stream` module ---
+
+    @Test fun importStreamModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import { Readable, Writable } from 'stream';
+
+            const chunks = [];
+            const writable = new Writable({
+                write(chunk, encoding, callback) {
+                    chunks.push(chunk);
+                    callback();
+                }
+            });
+
+            const source = ['hello', ' ', 'world'];
+            const readable = new Readable({
+                read() {
+                    if (source.length === 0) {
+                        this.push(null);
+                    } else {
+                        this.push(source.shift());
+                    }
+                }
+            });
+
+            let finished = false;
+            writable.on('finish', () => { finished = true; });
+            readable.pipe(writable);
+
+            // All of Readable/Writable's event delivery here is microtask-based (see
+            // stream.mjs's `nextTick`, which is a plain `Promise.resolve().then`), and
+            // GraalJS drains the microtask queue to completion before a top-level
+            // `context.eval` call returns — so by the time `runFile` returns below, the
+            // whole pipe chain (including the final 'finish' event) has already settled;
+            // no macrotask timer is needed to observe the end state.
+            globalThis.__streamData = () => chunks.join('');
+            globalThis.__streamFinished = () => finished;
+        """.trimIndent())
+        assertEquals("hello world", mc.eval("js", "globalThis.__streamData()").asString())
+        assertTrue(mc.eval("js", "globalThis.__streamFinished()").asBoolean())
+    }
+
+    // --- Node stdlib `crypto` module ---
+
+    @Test fun importCryptoModule() {
+        val mc = vm
+        runJsWithImports(mc, """
+            import crypto from 'crypto';
+            globalThis.__cryptoSha256 = crypto.createHash('sha256').update('hello').digest('hex');
+            globalThis.__cryptoHmac = crypto.createHmac('sha256', 'secret').update('hello').digest('hex');
+            globalThis.__cryptoRandomBytesLen = crypto.randomBytes(16).length;
+            globalThis.__cryptoUUID = crypto.randomUUID();
+            globalThis.__cryptoTimingSafeEqual = crypto.timingSafeEqual(
+                crypto.createHash('md5').update('a').digest(),
+                crypto.createHash('md5').update('a').digest()
+            );
+        """.trimIndent())
+        assertEquals(
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            mc.eval("js", "globalThis.__cryptoSha256").asString()
+        )
+        assertEquals(16, mc.eval("js", "globalThis.__cryptoRandomBytesLen").asInt())
+        assertTrue(mc.eval("js", "globalThis.__cryptoUUID").asString().matches(Regex("[0-9a-f-]{36}")))
+        assertTrue(mc.eval("js", "globalThis.__cryptoTimingSafeEqual").asBoolean())
+    }
+
     // --- Python site-packages / Ruby gem bare-specifier resolution ---
     //
     // resolvePythonPackage/resolveRubyGem both accept an explicit `searchPaths` override

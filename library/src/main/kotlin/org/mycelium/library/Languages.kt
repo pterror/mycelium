@@ -151,25 +151,30 @@ object RustSupport : LanguageSupport {
 // output is cached the same way as C/Rust (content-hashed under
 // $XDG_CACHE_HOME/mycelium/<hash>.wasm).
 //
-// Known limitations:
-//  - Untested without a real tinygo binary in this environment (none is installed here as
-//    of this writing — see flake.nix). generateShim/isValidExportName below mirror
-//    CSupport/RustSupport's LLVM conventions on the assumption that GraalVM's WASM engine
-//    exposes a module's exports as Value.memberKeys the same way the LLVM engine exposes a
-//    bitcode module's global symbols (both are meant to follow the same polyglot Value
-//    convention), but this has not been confirmed against a real compiled .wasm file.
-//  - WASM (even under wasi) is sandboxed with its own linear memory and import/export ABI,
-//    unlike the LLVM bitcode path where C/Rust functions share the same native address
-//    space and can be called with plain scalar args/returns. Numeric args/returns
-//    (int32/int64/float32/float64) should bridge transparently through polyglot Value the
-//    same way LLVM's do; strings and structs will not — Go's ABI for those (e.g. Go
-//    strings as a pointer+length pair into wasm linear memory) needs explicit marshaling
-//    that this shim layer does not attempt. Keep exported functions to scalar
-//    parameters/returns (see the //export comment convention tinygo requires) until that's
-//    built out.
-//  - main()'s WASI startup semantics (tinygo emits a `_start` export by default when
-//    targeting wasi) aren't accounted for here; only //export-annotated functions are
-//    expected to be usable as importable members.
+// CRITICAL BLOCKER (discovered 2026-07-15 during first end-to-end test):
+// GraalVM's WASM language does NOT expose module exports via Value.memberKeys the way
+// the LLVM language does. When a WASM binary is evaluated with context.eval("wasm", ...),
+// the resulting Value has ZERO memberKeys and no methods to instantiate or access exports.
+// This makes the whole cross-language import mechanism impossible — the shim generation
+// needs exports to work, but GraalVM WASM gives us none.
+//
+// The original design assumed WASM would work like LLVM (exposing exports as Value members),
+// by analogy. Testing with tinygo 0.41.1 + GraalVM 25.0.2 proved this wrong. The WASM
+// language in GraalVM may require a different runtime or API — needs investigation.
+//
+// Options going forward:
+//  1. Use a JavaScript-based WASM loader (e.g. WebAssembly API in JS) instead of GraalVM's
+//     WASM language — would require passing WASM binaries to JS and letting JS instantiate
+//     and call them, with Polyglot wrapping the results. More complex, may have ABI issues.
+//  2. Find / contribute a GraalVM patch to make WASM exports available as Value members.
+//  3. Drop Go support from Mycelium (simplest, but limits usefulness).
+//  4. Compile Go → LLVM instead of WASM (Go doesn't have a straightforward LLVM pipeline;
+//     gollvm is unmaintained; not pursued).
+//
+// For now, TinyGoSupport is kept in the default language list to fail gracefully with a
+// clean error message pointing to this blocker, rather than either silently omitting Go or
+// crashing with an opaque error. The test (jsImportsGoWasm) will fail until WASM support
+// is unblocked.
 object TinyGoSupport : LanguageSupport {
     override val languageId = "wasm"
     override val extensions = listOf("go")

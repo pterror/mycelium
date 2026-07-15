@@ -367,6 +367,14 @@ class InterceptingFileSystem : FileSystem {
         "node:os" to "os.mjs",
         "fs" to "fs.mjs",
         "node:fs" to "fs.mjs",
+        "buffer" to "buffer.mjs",
+        "node:buffer" to "buffer.mjs",
+        "url" to "url.mjs",
+        "node:url" to "url.mjs",
+        "stream" to "stream.mjs",
+        "node:stream" to "stream.mjs",
+        "crypto" to "crypto.mjs",
+        "node:crypto" to "crypto.mjs",
     )
 
     private fun syntheticCoreModulePath(resourceFile: String): Path =

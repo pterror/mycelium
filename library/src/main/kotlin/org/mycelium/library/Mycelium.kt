@@ -12,6 +12,17 @@ class Mycelium(
 ) {
     private val filesystem = InterceptingFileSystem()
 
+    // js.commonjs-require was prototyped here and reverted — see TODO.md. Enabling it
+    // swaps GraalJS's ES module loader for NpmCompatibleESModuleLoader, which rejects any
+    // import specifier whose extension isn't on its own hardcoded whitelist (js/mjs/cjs/
+    // json/node) with "Unsupported file extension" *before* InterceptingFileSystem.
+    // newByteChannel ever runs — so it broke every cross-language import (.c/.rb/.rs) and
+    // the new TypeScript-via-esbuild support (.ts) in one shot: 16 of 62 tests failed.
+    // Mycelium's whole cross-language-import mechanism depends on GraalJS accepting
+    // "unrecognized" extensions and handing them to our FileSystem to shim, so this
+    // option cannot be enabled globally on the shared Context without redesigning that
+    // mechanism (e.g. a separate Context per CJS-only subtree, which conflicts with the
+    // single shared Context/polyglot-bindings architecture used everywhere else here).
     private val context: Context =
         Context.newBuilder()
             .allowAllAccess(true)

@@ -578,6 +578,41 @@ class MyceliumIntegrationTest {
         assertEquals("from exports field", result.asString())
     }
 
+    // --- CommonJS require() (js.commonjs-require experimental option) ---
+    //
+    // Prototyped and reverted — see the comment on Mycelium.context. Enabling
+    // js.commonjs-require replaces GraalJS's ES module loader with one (Node-compatible
+    // NpmCompatibleESModuleLoader) that rejects any import specifier whose extension
+    // isn't on its own hardcoded whitelist (js/mjs/cjs/json/node) with "Unsupported file
+    // extension" *before* InterceptingFileSystem.newByteChannel ever runs. That broke
+    // every cross-language import (.c/.rb/.rs) and the TypeScript-via-esbuild import
+    // (.ts) below in one shot — 16 of 62 tests failed with the option enabled. No test
+    // exercises it here because it cannot be safely left on; see cjs-module.js in
+    // test resources and TODO.md for what was learned:
+    //   - `require()` IS injected as a global and DOES successfully load a CJS module —
+    //     but only via an absolute path.
+    //   - Relative specifiers (`require("./foo.js")`) resolve against the fixed
+    //     `js.commonjs-require-cwd` the Context was built with, not against the
+    //     requiring file's own directory (confirmed experimentally: identical relative
+    //     require() succeeds when the target happens to sit directly under
+    //     commonjs-require-cwd, and fails everywhere else with "Cannot load script").
+    //     Since that cwd is a Context-build-time option, it can't be re-pointed per
+    //     `runFile` call without rebuilding the Context per entry point, which conflicts
+    //     with Mycelium's single shared Context.
+
+    // --- TypeScript via esbuild ---
+
+    @Test fun jsImportsTypeScript() {
+        val mc = vm
+        val path = testResourcePath("typed.ts")
+        runJsWithImports(mc, """
+            import { add } from "$path";
+            globalThis.__tsResult = add(4, 5);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__tsResult")
+        assertEquals(9, result.asInt())
+    }
+
     @Test fun nonexistentBareSpecifierGivesFriendlyError() {
         val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-npm-missing-").toFile()
         tmpDir.deleteOnExit()

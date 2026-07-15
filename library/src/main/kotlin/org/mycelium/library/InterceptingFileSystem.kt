@@ -37,8 +37,25 @@ class InterceptingFileSystem : FileSystem {
         }
     }
 
+    // `uri.toString()` for a real filesystem URI is always of the form "file:/..." (or
+    // "file:///...") — it never starts with '/' itself, scheme included. The previous
+    // `uri.toString().startsWith('/')` check was therefore never true for genuine file
+    // URIs, so every file: URI fell through to the "wrap as synthetic /.mycelium/ URL"
+    // branch below. That was invisible as long as nothing exercised this overload with
+    // plain file URIs — but GraalJS's CommonJS/ESM package-scope lookup (enabled via
+    // js.commonjs-require) walks a file's ancestor directories by repeatedly calling
+    // Env.getPublicTruffleFile(URI) with file: URIs, which routes through this method.
+    // The old buggy branch wrapped each of those in another "/.mycelium/" layer rather
+    // than returning a real, shrinking parent path, so each "walk up to the parent
+    // directory" step actually produced a *longer* synthetic path instead — an
+    // unbounded loop that alternated between two DEBUG-observed shapes:
+    //   file:/.mycelium/file:/.mycelium/.../home/me/package.json
+    //   file:///.mycelium/file:/.mycelium/.../home/me
+    // growing without bound until the process was killed. Only the scheme, not the
+    // string's first character, distinguishes a real filesystem path (file:, or no
+    // scheme at all) from our synthetic http(s)-as-import-URL convention.
     override fun parsePath(uri: URI): Path =
-        if (uri.toString().startsWith('/')) Path.of(uri) else Path.of("/.mycelium/$uri")
+        if (uri.scheme == null || uri.scheme == "file") Path.of(uri) else Path.of("/.mycelium/$uri")
 
     override fun parsePath(path: String): Path {
         // Guest languages' own runtimes (e.g. LLVM loading its internal bitcode libraries)
@@ -203,6 +220,18 @@ class InterceptingFileSystem : FileSystem {
             sourceDirectoryStack.get().addFirst(parent)
         }
         try {
+            // TypeScript is transpiled to plain JS via esbuild before GraalJS ever sees it —
+            // GraalJS itself has no TypeScript support. This only strips types/syntax (no
+            // bundling), so import specifiers inside the output are left for
+            // InterceptingFileSystem's normal resolution to handle, same as any other JS file.
+            if (!path.startsWith("/.mycelium/") &&
+                (path.extension == "ts" || path.extension == "mts") &&
+                !options.contains(StandardOpenOption.WRITE) &&
+                !options.contains(StandardOpenOption.CREATE)
+            ) {
+                val js = TsCompiler.transpile(path)
+                return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
+            }
             val mc = mycelium!!
             val frames = mutableListOf<String>()
             Truffle.getRuntime().iterateFrames { frame ->

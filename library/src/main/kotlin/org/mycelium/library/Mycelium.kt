@@ -8,7 +8,12 @@ import org.graalvm.polyglot.io.IOAccess
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
         JsSupport, RubySupport, PythonSupport, CSupport, RustSupport
-    )
+    ),
+    // When true, a bare specifier that can't be resolved against any existing
+    // node_modules tree triggers an automatic `npm install`/`pnpm install` of the
+    // missing package (see InterceptingFileSystem.yoloInstall) rather than immediately
+    // failing with "cannot find module".
+    val yolo: Boolean = false
 ) {
     private val filesystem = InterceptingFileSystem()
 
@@ -55,7 +60,7 @@ class Mycelium(
     }
 
     init {
-        filesystem.init(context, this)
+        filesystem.init(context, this, yolo)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }

@@ -770,6 +770,33 @@ class MyceliumIntegrationTest {
 
     // --- Node stdlib `fs` module ---
 
+    // --- --yolo auto-install ---
+
+    // Real network + npm dependent: creates a fresh temp project with no node_modules,
+    // imports a tiny real npm package, and lets --yolo shell out to `npm install` to
+    // fetch it before retrying resolution. Skipped (not failed) wherever npm isn't on
+    // PATH, mirroring jsImportsRust's assumeTrue-gated skip for rustc above.
+    @Test fun yoloAutoInstallsMissingPackage() {
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping --yolo network test")
+
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-yolo-").toFile()
+        tmpDir.deleteOnExit()
+
+        val mainFile = File(tmpDir, "main.mjs")
+        mainFile.writeText(
+            """
+            import isOdd from "is-odd";
+            globalThis.__yoloResult = isOdd(3);
+            """.trimIndent()
+        )
+        mainFile.deleteOnExit()
+
+        val mc = Mycelium(yolo = true)
+        mc.runFile(mainFile.absolutePath)
+        val result = mc.eval("js", "globalThis.__yoloResult")
+        assertTrue(result.asBoolean())
+    }
+
     @Test fun importFsModule() {
         val mc = vm
         val tmpFile = java.nio.file.Files.createTempFile("mycelium-fs-test-", ".txt").toFile()

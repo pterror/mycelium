@@ -17,12 +17,14 @@ import kotlin.io.path.readText
 class InterceptingFileSystem : FileSystem {
     private var context: Context? = null
     private var mycelium: Mycelium? = null
+    private var yolo: Boolean = false
     private val delegate = FileSystem.newDefaultFileSystem()
     private val sourceDirectoryStack = ThreadLocal.withInitial { ArrayDeque<Path>() }
 
-    fun init(context: Context, mycelium: Mycelium) {
+    fun init(context: Context, mycelium: Mycelium, yolo: Boolean = false) {
         this.context = context
         this.mycelium = mycelium
+        this.yolo = yolo
     }
 
     // Seeds the source-directory stack with `dir` for the duration of `block`, so that
@@ -86,10 +88,20 @@ class InterceptingFileSystem : FileSystem {
             val fromDir = sourceDirectoryStack.get().firstOrNull() ?: Path.of("").toAbsolutePath()
             when (val resolution = resolveNodeModule(path, fromDir)) {
                 is NodeModuleResolution.Found -> return resolution.path
-                is NodeModuleResolution.PackageNotFound -> throw MyceliumException(
-                    "mycelium: cannot find module '$path' — no node_modules/$path found from " +
-                        "'$fromDir' or any parent directory"
-                )
+                is NodeModuleResolution.PackageNotFound -> {
+                    if (yolo) {
+                        val (packageName, _) = splitSpecifier(path)
+                        yoloInstall(packageName)
+                        when (val retry = resolveNodeModule(path, fromDir)) {
+                            is NodeModuleResolution.Found -> return retry.path
+                            else -> {}
+                        }
+                    }
+                    throw MyceliumException(
+                        "mycelium: cannot find module '$path' — no node_modules/$path found from " +
+                            "'$fromDir' or any parent directory"
+                    )
+                }
                 NodeModuleResolution.NoNodeModulesTree -> {}
             }
         }
@@ -154,6 +166,40 @@ class InterceptingFileSystem : FileSystem {
         }
         return if (sawNodeModulesTree) NodeModuleResolution.PackageNotFound else NodeModuleResolution.NoNodeModulesTree
     }
+
+    // `--yolo` support: when a bare specifier can't be found in any node_modules tree,
+    // shell out to `npm install <packageName>` (falling back to `pnpm install` if npm
+    // isn't on PATH) in the entry file's own directory, then let the caller retry
+    // resolution. The install directory is the *topmost* entry on the source-directory
+    // stack (i.e. the running file's own directory, not whichever nested file happens to
+    // be importing the missing package) so packages always land in the project root's
+    // node_modules rather than scattered across subdirectories, mirroring how `npm
+    // install` is normally invoked from a project's root. Falls back to the process's
+    // cwd if the stack is empty (e.g. installing while evaluating inline code rather than
+    // a file via runFile).
+    private fun yoloInstall(packageName: String) {
+        val installDir = (sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()).toFile()
+        System.err.println("mycelium: installing $packageName...")
+        val exitCode = runInstallCommand(listOf("npm", "install", packageName), installDir)
+            ?: runInstallCommand(listOf("pnpm", "install", packageName), installDir)
+            ?: throw MyceliumException("mycelium: --yolo requires npm or pnpm to be installed")
+        if (exitCode != 0) {
+            throw MyceliumException(
+                "mycelium: --yolo install of '$packageName' failed (exit code $exitCode)"
+            )
+        }
+    }
+
+    // Runs an install command, returning its exit code, or `null` if the command itself
+    // couldn't be launched (e.g. the binary isn't on PATH) so the caller can fall back to
+    // a different package manager. IO is inherited so the user sees npm/pnpm's own
+    // install progress rather than it being silently swallowed.
+    private fun runInstallCommand(command: List<String>, dir: File): Int? =
+        try {
+            ProcessBuilder(command).directory(dir).inheritIO().start().waitFor()
+        } catch (e: java.io.IOException) {
+            null
+        }
 
     // Splits a bare specifier into its package name and an optional subpath, honoring
     // scoped packages (`@scope/name[/subpath]`) as well as plain ones (`name[/subpath]`).

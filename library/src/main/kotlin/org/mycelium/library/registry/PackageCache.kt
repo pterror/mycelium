@@ -14,6 +14,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -38,10 +39,26 @@ import org.mycelium.library.MyceliumException
 // since here the cache holds *unpacked packages* rather than *index documents* (that part
 // is HttpMetadataCache's job).
 object PackageCache {
-    private val baseCacheDir = File(
-        System.getenv("XDG_CACHE_HOME") ?: File(System.getProperty("user.home"), ".cache").path,
-        "mycelium/packages"
-    )
+    private val xdgCacheHome = System.getenv("XDG_CACHE_HOME") ?: File(System.getProperty("user.home"), ".cache").path
+
+    private val baseCacheDir = File(xdgCacheHome, "mycelium/packages")
+
+    // Content-addressable store: every regular file extracted from any package, of any
+    // ecosystem/name/version, ends up here exactly once, named by its own SHA-256 — the same
+    // trick pnpm's store uses. baseCacheDir above still holds one directory per (ecosystem,
+    // name, version) so existing lookups (installDir/isCached/the .meta.json sidecar) keep
+    // working unchanged; after extraction each file in that directory is replaced by a
+    // hardlink into casBaseDir, so identical file contents shared across versions/packages
+    // (lodash@4.17.21 vs 4.17.20, or the same package depended on from two projects) are
+    // stored on disk exactly once.
+    private val casBaseDir = File(xdgCacheHome, "mycelium/cas")
+
+    // Sidecar recorded alongside a package's extracted files (inside its own install
+    // directory, unlike the .meta.json sidecar which lives beside it) mapping every relative
+    // path back to the CAS entry (by hash) it was replaced with, plus whether it needs the
+    // executable bit set on install (see CasManifestEntry below for why permissions can't
+    // just be read off the CAS file's own inode).
+    private const val CAS_MANIFEST_FILENAME = ".cas-manifest.json"
 
     // --- System-aware performance tuning -----------------------------------------------
     // Sized from what the JVM actually has available rather than a fixed constant, so a
@@ -222,6 +239,13 @@ object PackageCache {
                     )
                 }
             }
+
+            // Fold every extracted file into the content-addressable store *before* tempDir
+            // becomes visible as `dir` — this way a concurrent reader that only ever sees
+            // fully-extracted, atomically-renamed package directories (the same invariant
+            // downloadAndExtract already gave callers pre-CAS) also only ever sees packages
+            // whose CAS manifest is already complete.
+            populateCas(tempDir)
 
             // If another process/thread won the race and already populated `dir` while we
             // were downloading, prefer its result over ours (both are equally valid — same
@@ -414,6 +438,134 @@ object PackageCache {
         }
     }
 
+    // One CAS manifest entry: the SHA-256 (hex) of a file's contents, plus whether the
+    // extracted file had the executable bit set. The executable bit can't simply be read off
+    // whatever CAS entry ends up holding this content at install time, because a hardlink
+    // shares its *inode* — and therefore its permission bits — with every other hardlink to
+    // the same inode. If an executable script and a non-executable file elsewhere happened to
+    // have byte-identical contents, storing them under the same CAS path and later chmod'ing
+    // one consumer's copy would silently flip permissions for every other consumer sharing
+    // that inode. casPathFor sidesteps this by keying the executable and non-executable
+    // variants of the same content to *different* CAS paths (an ".exec" suffix) rather than
+    // mutating shared inodes after the fact, and this manifest records which variant each
+    // relative path needs so install-time linking picks the right one.
+    private data class CasManifestEntry(val hash: String, val executable: Boolean)
+
+    // cas/<hash[0:2]>/<hash[2:4]>/<hash>[.exec] — two levels of sharding (256 * 256 possible
+    // subdirectories) keeps any single directory from accumulating enough entries to slow
+    // down filesystem lookups even once the store holds millions of files.
+    private fun casPathFor(hash: String, executable: Boolean): Path {
+        val suffix = if (executable) ".exec" else ""
+        return File(casBaseDir, "${hash.substring(0, 2)}/${hash.substring(2, 4)}/$hash$suffix").toPath()
+    }
+
+    private fun sha256Hex(file: Path): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(file).use { input ->
+            val buffer = ByteArray(ioBufferSize)
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                digest.update(buffer, 0, n)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    // Walks every regular file under a freshly-extracted package directory, stores each one's
+    // content in the CAS (deduplicating against whatever's already there, from this package
+    // version, a different version, or an entirely different package), replaces the file in
+    // place with a hardlink to its CAS entry, and records a manifest of relative-path -> CAS
+    // entry so a later installInto (of this package, or a fresh process that never re-extracts
+    // it) can hardlink straight from the CAS rather than needing to re-walk/re-hash anything.
+    private fun populateCas(extractedDir: Path) {
+        val manifest = sortedMapOf<String, CasManifestEntry>()
+        Files.walk(extractedDir).use { paths ->
+            paths.filter { Files.isRegularFile(it) }.sorted().forEach { file ->
+                val relative = extractedDir.relativize(file).toString()
+                val executable = file.toFile().canExecute()
+                val hash = storeInCas(file, executable)
+                manifest[relative] = CasManifestEntry(hash, executable)
+            }
+        }
+        writeManifest(extractedDir, manifest)
+    }
+
+    // Computes `file`'s content hash, ensures the CAS holds a copy of it (writing one — via a
+    // temp file that's hashed/finalized before an atomic rename into place — only if no other
+    // thread/process has already done so for this exact hash+executable-bit combination), and
+    // then replaces `file` in place with a hardlink to that CAS entry. Returns the hash for the
+    // manifest.
+    private fun storeInCas(file: Path, executable: Boolean): String {
+        val hash = sha256Hex(file)
+        val casTarget = casPathFor(hash, executable)
+        if (!Files.exists(casTarget)) {
+            Files.createDirectories(casTarget.parent)
+            val temp = Files.createTempFile(casTarget.parent, "cas-", ".tmp")
+            try {
+                Files.copy(file, temp, StandardCopyOption.REPLACE_EXISTING)
+                if (executable) temp.toFile().setExecutable(true)
+                try {
+                    // Atomic rename into its final content-addressed name — this is the one
+                    // moment a partially-written file could otherwise be observed by a
+                    // concurrent reader, and ATOMIC_MOVE rules that out entirely.
+                    Files.move(temp, casTarget, StandardCopyOption.ATOMIC_MOVE)
+                } catch (e: FileAlreadyExistsException) {
+                    // Another thread/process finished writing this exact hash first —
+                    // its content is byte-identical (same hash), so ours is redundant.
+                }
+            } finally {
+                Files.deleteIfExists(temp)
+            }
+        }
+
+        // Replace `file` with a hardlink to the CAS entry without ever leaving `file` missing
+        // if linking fails partway: link into a sibling temp path first, then atomically rename
+        // that temp path over `file`. Falls back to leaving `file`'s own (already-correct)
+        // content in place — un-deduplicated, but correct — if hardlinks aren't supported
+        // between the package cache and the CAS (e.g. they end up on different filesystems).
+        val tempLink = file.resolveSibling("${file.fileName}.caslink.tmp")
+        try {
+            Files.deleteIfExists(tempLink)
+            Files.createLink(tempLink, casTarget)
+            Files.move(tempLink, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (e: java.io.IOException) {
+            Files.deleteIfExists(tempLink)
+        }
+        return hash
+    }
+
+    private fun manifestFile(packageDir: Path): File = File(packageDir.toFile(), CAS_MANIFEST_FILENAME)
+
+    private fun writeManifest(packageDir: Path, manifest: Map<String, CasManifestEntry>) {
+        val filesJson = JSONObject()
+        for ((relative, entry) in manifest) {
+            val entryJson = JSONObject()
+            entryJson.put("hash", entry.hash)
+            entryJson.put("executable", entry.executable)
+            filesJson.put(relative, entryJson)
+        }
+        val root = JSONObject()
+        root.put("files", filesJson)
+        manifestFile(packageDir).writeText(root.toString())
+    }
+
+    private fun readManifest(packageDir: Path): Map<String, CasManifestEntry>? {
+        val file = manifestFile(packageDir)
+        if (!file.isFile) return null
+        val root = JSONObject(file.readText())
+        val filesJson = root.optJSONObject("files") ?: return emptyMap()
+        val manifest = linkedMapOf<String, CasManifestEntry>()
+        for (relative in filesJson.keySet()) {
+            val entryJson = filesJson.getJSONObject(relative)
+            manifest[relative] = CasManifestEntry(
+                hash = entryJson.getString("hash"),
+                executable = entryJson.optBoolean("executable", false),
+            )
+        }
+        return manifest
+    }
+
     // Installs a cached package into a project's own dependency directory (node_modules for
     // npm, a vendor/gems-style directory for the other ecosystems — see PackageInstaller) by
     // hardlinking every file from the cache rather than copying — the same "content-addressed
@@ -424,6 +576,20 @@ object PackageCache {
     fun installInto(cacheDir: Path, targetDir: Path, packageName: String) {
         val dest = targetDir.resolve(packageName)
         Files.createDirectories(dest)
+
+        // Packages extracted since the CAS was introduced carry a manifest recording each
+        // file's content hash, so install straight from the CAS (one hop) rather than through
+        // cacheDir's own copy (which is itself just a hardlink to the same CAS entry — going
+        // via the manifest also means a fresh process never needs to re-walk/re-stat cacheDir
+        // to find files, just read one small JSON sidecar). Packages already sitting in an
+        // older cache from before this feature existed won't have a manifest; for those, fall
+        // back to the original walk-and-hardlink-from-cacheDir behavior unchanged.
+        val manifest = readManifest(cacheDir)
+        if (manifest != null) {
+            installFromManifest(manifest, dest)
+            return
+        }
+
         Files.walk(cacheDir).use { paths ->
             paths.sorted().forEach { source ->
                 val relative = cacheDir.relativize(source)
@@ -440,6 +606,23 @@ object PackageCache {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private fun installFromManifest(manifest: Map<String, CasManifestEntry>, dest: Path) {
+        for ((relative, entry) in manifest) {
+            val target = dest.resolve(relative)
+            if (Files.exists(target)) continue
+            Files.createDirectories(target.parent)
+            val casSource = casPathFor(entry.hash, entry.executable)
+            try {
+                Files.createLink(target, casSource)
+            } catch (e: java.io.IOException) {
+                // Cross-device (cache and target on different filesystems) or the CAS entry
+                // is somehow missing (e.g. hand-edited cache) — fall back to a plain copy.
+                Files.copy(casSource, target, StandardCopyOption.COPY_ATTRIBUTES)
+                if (entry.executable) target.toFile().setExecutable(true)
             }
         }
     }

@@ -53,6 +53,14 @@ class InterceptingFileSystem : FileSystem {
     private var rubyGemsInstaller: PackageInstaller? = null
     private var pyPIInstaller: PackageInstaller? = null
 
+    // The directory relative paths fall back to resolving against when nothing more
+    // specific applies (see currentResolutionDir/toAbsolutePath/yoloInstall*'s own uses
+    // below) — defaults to the real JVM process's own cwd, but overridden per-request in
+    // daemon mode (see init's `cwd` param and Mycelium's own `cwd` constructor param) so a
+    // request's relative paths resolve against the *calling* process's directory rather
+    // than the long-running daemon's.
+    private var cwd: Path = Path.of("").toAbsolutePath()
+
     private val nodeModuleResolver = NodeModuleResolver { context!! }
     private val pythonModuleResolver = PythonModuleResolver()
     private val rubyModuleResolver = RubyModuleResolver()
@@ -99,7 +107,7 @@ class InterceptingFileSystem : FileSystem {
     private fun currentResolutionDir(): Path =
         lastReadModuleDir.get()
             ?: sourceDirectoryStack.get().firstOrNull()
-            ?: Path.of("").toAbsolutePath()
+            ?: cwd
 
     fun init(
         context: Context,
@@ -109,6 +117,7 @@ class InterceptingFileSystem : FileSystem {
         yolo: Boolean = false,
         rubyGemsInstaller: PackageInstaller? = null,
         pyPIInstaller: PackageInstaller? = null,
+        cwd: Path? = null,
     ) {
         this.context = context
         this.mycelium = mycelium
@@ -117,6 +126,7 @@ class InterceptingFileSystem : FileSystem {
         this.yolo = yolo
         this.rubyGemsInstaller = rubyGemsInstaller
         this.pyPIInstaller = pyPIInstaller
+        if (cwd != null) this.cwd = cwd
     }
 
     // Seeds the source-directory stack with `dir` for the duration of `block`, so that
@@ -339,7 +349,7 @@ class InterceptingFileSystem : FileSystem {
     // installing a single missing package no longer requires npm/pnpm to be present at
     // all in the common case.
     private fun yoloInstall(packageName: String) {
-        val installDir = (sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()).toFile()
+        val installDir = (sourceDirectoryStack.get().lastOrNull() ?: cwd).toFile()
         System.err.println("mycelium: installing $packageName...")
         try {
             packageInstaller!!.installPackageTree(
@@ -375,7 +385,7 @@ class InterceptingFileSystem : FileSystem {
     // missing/failed pure-Kotlin install should simply surface as the same "cannot find
     // module" the caller already reports when nothing resolves.
     private fun yoloInstallRubyGem(gemName: String) {
-        val installDir = sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()
+        val installDir = sourceDirectoryStack.get().lastOrNull() ?: cwd
         val vendorDir = installDir.resolve(".mycelium-vendor").resolve("gems")
         System.err.println("mycelium: installing gem '$gemName'...")
         try {
@@ -391,7 +401,7 @@ class InterceptingFileSystem : FileSystem {
     // directory to avoid colliding with a real virtualenv's own "pypi" or similarly-named
     // directory, no pip subprocess fallback).
     private fun yoloInstallPyPIPackage(packageName: String) {
-        val installDir = sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()
+        val installDir = sourceDirectoryStack.get().lastOrNull() ?: cwd
         val vendorDir = installDir.resolve(".mycelium-vendor").resolve("pypi")
         System.err.println("mycelium: installing PyPI package '$packageName'...")
         try {
@@ -649,12 +659,32 @@ class InterceptingFileSystem : FileSystem {
             if (stack.isNotEmpty()) {
                 return stack.first().resolve(path).normalize()
             }
+            // No active runFile/withSourceDirectory scope (e.g. resolving a path outside
+            // any file read) — fall back to this instance's own cwd (the caller's cwd in
+            // daemon mode, see `cwd`'s own doc comment) rather than `path.toAbsolutePath()`,
+            // which would silently resolve against the real JVM process's cwd instead.
+            return cwd.resolve(path).normalize()
         }
         return path.toAbsolutePath()
     }
 
     override fun toRealPath(path: Path, vararg linkOptions: LinkOption): Path =
         path.toRealPath(*linkOptions)
+
+    // GraalVM's FileSystem interface throws UnsupportedOperationException from this
+    // method by default — Context.Builder.currentWorkingDirectory(Path) (see Mycelium's
+    // `cwd` constructor param) calls straight through to this on whatever FileSystem the
+    // Context is configured with, so leaving the default in place would make setting a
+    // per-request cwd blow up the moment daemon mode tried to use it. Overriding it to
+    // update our own `cwd` field keeps a single source of truth: this is also the field
+    // `currentResolutionDir`/`toAbsolutePath`/`yoloInstall*` already fall back to, and
+    // `init`'s own `cwd` param (called before the Context/builder exist) sets the same
+    // field, so a request's cwd ends up consistent regardless of which of the two paths
+    // (constructor-time `init`, or GraalVM calling this during `Context.build()`) sets it
+    // last.
+    override fun setCurrentWorkingDirectory(currentWorkingDirectory: Path) {
+        cwd = currentWorkingDirectory
+    }
 
     override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> =
         delegate.readAttributes(path, attributes, *options)

@@ -38,7 +38,35 @@ class Mycelium(
     // unconditionally (not gated on yolo) since installing exactly what a manifest already
     // declares is a much safer default than yolo's "install whatever a bare import
     // resolves to". Set to false (the app's `--no-install` flag) to skip it entirely.
-    val autoInstall: Boolean = true
+    val autoInstall: Boolean = true,
+    // Daemon support: when non-null, the Context built below attaches to this shared
+    // Engine (`.engine(engine)`) instead of getting its own implicit one — see
+    // DaemonServer, which builds one Engine per process and passes it to every
+    // per-request Mycelium instance so compiled code / warm-up cost is amortized across
+    // requests while each request still gets an isolated Context (see `context` below).
+    // Left null for the normal CLI "run and exit" path, where a single implicit Engine
+    // tied to the one Context is exactly what's wanted.
+    private val engine: Engine? = null,
+    // Backs `process.exit(code)` (see PROCESS_INIT_SCRIPT) — defaults to actually
+    // terminating the JVM, matching the CLI's existing behavior. The daemon overrides
+    // this to throw ProcessExitException instead, so a guest script's `process.exit()`
+    // ends only that one request rather than killing the whole long-running daemon
+    // process (and every other client's in-flight/future request with it).
+    private val exitHandler: (Int) -> Unit = { code -> System.exit(code) },
+    // Per-request working directory / environment, threaded straight from the caller's own
+    // process — see DaemonServer.handleRun, which resolves these from the wire protocol's
+    // `run` request (App.kt/DaemonClient populate them from the *client* process's
+    // `user.dir`/`System.getenv()` before sending, not the daemon's own). Left null for the
+    // normal CLI "run and exit" path, where the JVM's own real cwd/env are already correct
+    // and don't need overriding. When non-null, `cwd` is applied to the Context (via
+    // `currentWorkingDirectory` below) *and* to InterceptingFileSystem's own resolution
+    // fallbacks (see `filesystem.init`'s `cwd` param) — the FileSystem does its own
+    // relative-path resolution rather than delegating to GraalVM's Context-level cwd, so
+    // both need to agree. `env`, when non-null, replaces (not merges with) the Context's
+    // visible environment (`allowEnvironmentAccess(NONE)` + `environment(env)`) and backs
+    // `process.env` (see PROCESS_INIT_SCRIPT's `__mycelium_env__` binding below).
+    private val cwd: String? = null,
+    private val env: Map<String, String>? = null,
 ) {
     // JVM-mode support: library/build.gradle.kts splits the GraalVM language runtimes
     // (ruby/python/java/llvm/wasm) into separate, non-transitive Gradle Configurations
@@ -125,9 +153,54 @@ class Mycelium(
     private val jsAvailable = "js" in availableLanguageIds
 
     private val context: Context = run {
-        val builder = Context.newBuilder()
+        // When attached to an explicit, potentially multi-Context Engine (daemon mode —
+        // see `engine` above), GraalVM requires every permitted language to be declared
+        // up front on the Context itself rather than allowed lazily (`Context.newBuilder()`
+        // with no arguments): languages that don't support context-independent sharing
+        // (Ruby is the one that actually hits this — see the class-level comment on
+        // `availableLanguageIds`) refuse to lazily initialize against a shared Engine and
+        // throw a PolyglotException instead. Passing the permitted IDs explicitly is a
+        // no-op for the normal (unshared, implicit-Engine) CLI path, so it's done
+        // unconditionally rather than only when `engine` is non-null.
+        val permittedLanguageIds = languages.map { it.languageId }.distinct().toTypedArray()
+        val builder = Context.newBuilder(*permittedLanguageIds)
             .allowAllAccess(true)
             .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
+            // Bind the Context's out/err explicitly to whatever `System.out`/`System.err`
+            // currently are, evaluated at Context-construction time (i.e. per-`Mycelium`
+            // instance, per-request in daemon mode) rather than left on GraalVM's own
+            // default. GraalJS's built-in `console.log`/`console.error` write through the
+            // Context's configured out()/err() streams, not through a live lookup of
+            // `System.out`/`System.err` at print time — so DaemonServer's per-request
+            // `System.setOut`/`setErr` swap (see its own doc comment) would otherwise be
+            // invisible to `console.log` even though it *does* reach
+            // PROCESS_INIT_SCRIPT's `process.stdout.write`, which calls `JSystem.out`
+            // directly on every write. Explicit here removes that asymmetry, and is a
+            // no-op for the CLI path (System.out/err there are the real process streams
+            // for the whole run anyway).
+            .out(System.out)
+            .err(System.err)
+        if (engine != null) {
+            builder.engine(engine)
+        }
+        // Per-Context cwd — see the `cwd` constructor param's own doc comment. A no-op for
+        // the normal CLI path (cwd left null there), where the Context's default (the
+        // JVM's own real working directory) is already exactly right.
+        if (cwd != null) {
+            builder.currentWorkingDirectory(File(cwd).toPath())
+        }
+        // Per-Context environment — replaces (rather than merges with) whatever the
+        // Context would otherwise see: EnvironmentAccess.NONE means *no* environment
+        // variable is visible except the ones explicitly listed in `environment(env)`
+        // below, so a daemon request's caller-supplied env is the complete picture rather
+        // than a set of overrides layered on the daemon process's own env (which would
+        // leak the daemon's environment into the guest script otherwise). A no-op for the
+        // normal CLI path (env left null there), where EnvironmentAccess defaults to
+        // INHERIT and the guest already sees this process's real environment.
+        if (env != null) {
+            builder.allowEnvironmentAccess(org.graalvm.polyglot.EnvironmentAccess.NONE)
+            builder.environment(env)
+        }
         // JS-specific Context options — only applied when GraalJS is actually on the
         // classpath. These are `js.*`-namespaced options that GraalVM will reject outright
         // ("Unknown option: js.esm-eval-returns-exports") if no language with ID "js" is
@@ -139,11 +212,18 @@ class Mycelium(
                 // instead of `undefined`. Needed by InterceptingFileSystem.requireModule.
                 .option("js.esm-eval-returns-exports", "true")
                 // Enables GraalJS's built-in `WebAssembly` JS API global. Additionally
-                // gated on "wasm" being available — GraalJS's WebAssembly API requires the
-                // "wasm" Truffle language to exist so it can delegate to it internally, and
-                // throws IllegalStateException out of JSRealm's constructor if "wasm" is
-                // absent.
-                .option("js.webassembly", ("wasm" in availableLanguageIds).toString())
+                // gated on "wasm" being permitted on *this* Context (`permittedLanguageIds`,
+                // derived from the caller's requested `languages` — see above), not merely
+                // available on the classpath (`availableLanguageIds`): now that the Context
+                // is built with an explicit permitted-language list (needed for engine
+                // sharing — see the comment above `permittedLanguageIds`), turning this on
+                // when "wasm" wasn't actually requested (e.g. a composable subset built
+                // without TinyGoSupport, whose languageId is "wasm") throws
+                // IllegalStateException out of JSRealm's constructor the moment the JS
+                // bindings are first touched, since GraalJS's WebAssembly API requires the
+                // "wasm" language to be both available *and* permitted so it can delegate to
+                // it internally.
+                .option("js.webassembly", ("wasm" in permittedLanguageIds).toString())
         }
         builder.build()
     }
@@ -171,6 +251,15 @@ class Mycelium(
 
     private val requireResolvePathsFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
         filesystem.resolveRequireSpecifierPaths(args[0].asString(), args[1].asString())
+    }
+
+    // Backs `process.exit(code)` in PROCESS_INIT_SCRIPT — routed through the
+    // constructor-supplied `exitHandler` rather than calling `System.exit` directly here,
+    // so daemon mode can intercept it (see `exitHandler`'s own doc comment above).
+    private val processExitFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        val code = if (args.isNotEmpty() && args[0].isNumber) args[0].asInt() else 0
+        exitHandler(code)
+        null
     }
 
     // Host-side single-threaded event loop backing `setTimeout`/`setInterval`/
@@ -222,7 +311,10 @@ class Mycelium(
     }
 
     init {
-        filesystem.init(context, this, compileToJsDispatcher, packageInstaller, yolo, rubyGemsInstaller, pyPIInstaller)
+        filesystem.init(
+            context, this, compileToJsDispatcher, packageInstaller, yolo, rubyGemsInstaller, pyPIInstaller,
+            cwd = cwd?.let { File(it).toPath() },
+        )
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
@@ -237,6 +329,7 @@ class Mycelium(
             context.getBindings("js").putMember("__mycelium_require__", requireFn)
             context.getBindings("js").putMember("__mycelium_require_resolve__", requireResolveFn)
             context.getBindings("js").putMember("__mycelium_require_resolve_paths__", requireResolvePathsFn)
+            context.getBindings("js").putMember("__mycelium_process_exit__", processExitFn)
             // setTimeout/setInterval/setImmediate and their clear* counterparts are
             // implemented entirely host-side (TimerManager) rather than in
             // TIMERS_INIT_SCRIPT's JS — see TimerManager's doc comment.
@@ -246,6 +339,17 @@ class Mycelium(
             context.getBindings("js").putMember("clearInterval", clearTimerFn)
             context.getBindings("js").putMember("setImmediate", setImmediateFn)
             context.getBindings("js").putMember("clearImmediate", clearTimerFn)
+            // Backs PROCESS_INIT_SCRIPT's `process.cwd()`/`process.env` — only set when
+            // this Mycelium instance was actually given an explicit cwd/env (daemon mode;
+            // see the constructor params' own doc comment). PROCESS_INIT_SCRIPT falls back
+            // to the real `java.lang.System` cwd/env when these bindings are absent, so the
+            // normal CLI path (cwd/env left null) is unaffected.
+            if (cwd != null) {
+                context.getBindings("js").putMember("__mycelium_cwd__", cwd)
+            }
+            if (env != null) {
+                context.getBindings("js").putMember("__mycelium_env__", env)
+            }
             context.eval("js", GLOBAL_ALIAS_INIT_SCRIPT)
             context.eval("js", PROCESS_INIT_SCRIPT)
             context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
@@ -516,8 +620,17 @@ class Mycelium(
                 var JSystem = Java.type('java.lang.System');
                 var JProcessHandle = Java.type('java.lang.ProcessHandle');
 
+                // Prefers the per-request `__mycelium_env__` binding (daemon mode — see
+                // Mycelium's `env` constructor param) over the real JVM process
+                // environment, so a daemon-served request sees the *caller's* environment
+                // rather than the long-running daemon process's own. `__mycelium_env__` is
+                // itself a plain `java.util.Map<String,String>` (Kotlin's `Map` interface),
+                // so it supports the same `.get`/`.containsKey`/`.keySet` calls below as
+                // `JSystem.getenv()` already does.
                 function getenvMap() {
-                    return JSystem.getenv();
+                    return typeof globalThis.__mycelium_env__ !== 'undefined'
+                        ? globalThis.__mycelium_env__
+                        : JSystem.getenv();
                 }
 
                 // Mutations (process.env.FOO = 'bar') never reach the real OS environment
@@ -570,9 +683,17 @@ class Mycelium(
                 globalThis.process = {
                     env: envProxy,
                     argv: [],
-                    cwd: function () { return String(JSystem.getProperty('user.dir')); },
+                    // Prefers the per-request `__mycelium_cwd__` binding (daemon mode —
+                    // see Mycelium's `cwd` constructor param) over the JVM process's own
+                    // `user.dir` system property, so a daemon-served request reports the
+                    // *caller's* working directory rather than the daemon's.
+                    cwd: function () {
+                        return typeof globalThis.__mycelium_cwd__ !== 'undefined'
+                            ? String(globalThis.__mycelium_cwd__)
+                            : String(JSystem.getProperty('user.dir'));
+                    },
                     chdir: function (dir) { /* not really possible in JVM */ },
-                    exit: function (code) { JSystem.exit(code || 0); },
+                    exit: function (code) { globalThis.__mycelium_process_exit__(code || 0); },
                     platform: (function () {
                         var os = String(JSystem.getProperty('os.name')).toLowerCase();
                         if (os.includes('linux')) return 'linux';

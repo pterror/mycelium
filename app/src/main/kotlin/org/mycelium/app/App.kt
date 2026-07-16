@@ -4,8 +4,13 @@ import org.mycelium.library.Mycelium
 import org.mycelium.library.MyceliumException
 import org.mycelium.library.compiler.CompilerDownloader
 import org.mycelium.library.compiler.CompilerRegistry
+import org.mycelium.library.config.Config
+import org.mycelium.library.config.DaemonConfig
+import org.mycelium.library.daemon.DaemonClient
+import org.mycelium.library.daemon.DaemonPaths
 import org.mycelium.library.registry.NpmRegistryClient
 import java.io.File
+import java.io.IOException
 
 // The CLI's own small composition root for the `mycelium compiler ...` subcommands, which
 // operate on the compiler registry/downloader directly rather than through a running
@@ -50,6 +55,7 @@ fun main(args: Array<String>) {
         }
         "version" -> println("mycelium 0.1.0-dev")
         "compiler" -> runCompilerCommand(rest.drop(1))
+        "daemon" -> runDaemonCommand(rest.drop(1))
         "help", "--help", "-h" -> printUsage()
         else -> {
             // If it looks like a file path, treat it as implicit `run`
@@ -65,12 +71,47 @@ fun main(args: Array<String>) {
 }
 
 private fun runFile(path: String, yolo: Boolean, noInstall: Boolean) {
+    val config = Config.load()
+    val absolutePath = File(path).absolutePath
+    val exitCode = tryRunViaDaemon(config.daemon, absolutePath, yolo, noInstall)
+    if (exitCode != null) {
+        if (exitCode != 0) System.exit(exitCode)
+        return
+    }
+    runFileInProcess(path, yolo, noInstall)
+}
+
+private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean) {
     try {
         val vm = Mycelium(yolo = yolo, autoInstall = !noInstall)
         vm.runFile(path)
     } catch (e: MyceliumException) {
         System.err.println(e.message)
         System.exit(1)
+    }
+}
+
+// Tries the daemon fast path for `path` (already made absolute by the caller — the entry
+// file's own path must be resolved by the client since the daemon's cwd generally isn't
+// the caller's, but DaemonClient.runFile separately forwards the caller's actual cwd/env
+// on the wire so node_modules resolution, `process.cwd()`, and `process.env` inside the
+// script still see the invoking shell's own directory/environment, not the daemon's).
+// Returns the exit code to propagate on success, or null if the daemon path wasn't usable
+// at all (disabled in config, or couldn't be reached even after an auto-start attempt) —
+// callers fall back to `runFileInProcess` in that case, so this never leaves the user
+// without a way to run their file.
+private fun tryRunViaDaemon(daemonConfig: DaemonConfig, absolutePath: String, yolo: Boolean, noInstall: Boolean): Int? {
+    if (!daemonConfig.enabled) return null
+    val socketPath = DaemonPaths.socketFile(daemonConfig.socketDir)
+    if (!DaemonClient.isRunning(socketPath)) {
+        if (!DaemonLauncher.startAndWait(daemonConfig, socketPath)) return null
+    }
+    return try {
+        DaemonClient.runFile(socketPath, absolutePath, yolo = yolo, noInstall = noInstall)
+    } catch (e: IOException) {
+        // Daemon vanished between the isRunning check and the actual request (e.g. hit
+        // its idle timeout in that window) — fall back rather than erroring out.
+        null
     }
 }
 
@@ -85,13 +126,142 @@ private fun printUsage() {
                                           Prefetch a compile-to-JS compiler
           mycelium compiler list         List known compile-to-JS languages
           mycelium compiler cache        Show cached compiler/package downloads
+          mycelium daemon start          Start the daemon in the background
+          mycelium daemon stop           Stop the running daemon
+          mycelium daemon status         Show daemon uptime/memory/loaded languages
           mycelium version               Show version
           mycelium help                  Show this help
 
         flags:
           --yolo                 Auto-install missing npm packages on import
           --no-install           Skip auto-installing dependencies declared in package.json
+
+        `mycelium run`/`mycelium <file>` auto-start a background daemon on first use
+        (amortizes JVM/GraalVM startup across runs) unless disabled via
+        ~/.config/mycelium/config.toml or .mycelium/config.toml — see daemon subcommands
+        above to manage it directly.
     """.trimIndent())
+}
+
+private fun printDaemonUsage() {
+    println("""
+        usage:
+          mycelium daemon start    Start the daemon in the background (no-op if already running)
+          mycelium daemon stop     Stop the running daemon
+          mycelium daemon status   Show daemon uptime/memory/loaded languages
+    """.trimIndent())
+}
+
+private fun runDaemonCommand(args: List<String>) {
+    val config = Config.load().daemon
+    val socketPath = DaemonPaths.socketFile(config.socketDir)
+    if (args.isEmpty()) {
+        printDaemonUsage()
+        System.exit(1)
+        return
+    }
+    when (args[0]) {
+        "start" -> {
+            if (DaemonClient.isRunning(socketPath)) {
+                println("mycelium: daemon already running (socket: $socketPath)")
+                return
+            }
+            if (DaemonLauncher.startAndWait(config, socketPath)) {
+                println("mycelium: daemon started (socket: $socketPath)")
+            } else {
+                System.err.println("mycelium: daemon failed to start")
+                System.exit(1)
+            }
+        }
+        "stop" -> {
+            if (!DaemonClient.isRunning(socketPath)) {
+                println("mycelium: daemon not running")
+                return
+            }
+            if (DaemonClient.stop(socketPath)) {
+                println("mycelium: daemon stopped")
+            } else {
+                System.err.println("mycelium: failed to stop daemon")
+                System.exit(1)
+            }
+        }
+        "status" -> {
+            val status = DaemonClient.status(socketPath)
+            if (status == null) {
+                println("mycelium: daemon not running")
+                return
+            }
+            val usedMb = status.usedMemoryBytes / (1024 * 1024)
+            val maxMb = status.maxMemoryBytes / (1024 * 1024)
+            val languages = status.loadedLanguages
+            println("mycelium daemon — pid ${status.pid}, socket $socketPath")
+            println("  uptime: ${status.uptimeSeconds}s, requests served: ${status.requestCount}")
+            println("  memory: ${usedMb}MB / ${maxMb}MB")
+            println("  languages loaded: ${if (languages.isEmpty()) "(none yet)" else languages.joinToString(", ")}")
+            println("  idle timeout: ${status.idleTimeoutSeconds}s")
+        }
+        else -> {
+            System.err.println("mycelium: unknown daemon subcommand '${args[0]}'")
+            printDaemonUsage()
+            System.exit(1)
+        }
+    }
+}
+
+// Forks a daemon process against the launcher's own classpath/`java` binary and waits
+// (polling) for its socket to become connectable, so a caller that just auto-started the
+// daemon can immediately hand it a request. Returns false (without leaving a half-started
+// process running forever, though the forked JVM is left alive to finish booting even on
+// a timeout — a slow-to-start daemon that isn't hung will still come up and be picked up
+// by the *next* invocation's `isRunning` check) if the socket never appears in time.
+private object DaemonLauncher {
+    private const val STARTUP_TIMEOUT_MILLIS = 15_000L
+    private const val POLL_INTERVAL_MILLIS = 100L
+
+    fun startAndWait(config: DaemonConfig, socketPath: File): Boolean {
+        val javaBin = File(File(System.getProperty("java.home"), "bin"), "java").path
+        val classpath = System.getProperty("java.class.path")
+        val pidPath = DaemonPaths.pidFile(config.socketDir)
+
+        val command = mutableListOf(
+            javaBin,
+            "-XX:+UseG1GC",
+            "-XX:G1PeriodicGCInterval=1000",
+            "-XX:MinHeapFreeRatio=10",
+            "-XX:MaxHeapFreeRatio=20",
+            "-Xmx${config.jvm.maxHeap}",
+        )
+        command.addAll(config.jvm.extraArgs)
+        command += listOf(
+            "-cp", classpath,
+            "org.mycelium.library.daemon.DaemonServerKt",
+            socketPath.absolutePath,
+            pidPath.absolutePath,
+            config.idleTimeout.toString(),
+        )
+
+        try {
+            // `Redirect.DISCARD` is only valid for an output stream (it redirects to
+            // /dev/null for writing) — `ProcessBuilder.redirectInput` throws
+            // IllegalArgumentException if handed a write-mode Redirect, so stdin gets an
+            // explicit read-mode redirect from /dev/null instead.
+            ProcessBuilder(command)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                .start()
+        } catch (e: IOException) {
+            System.err.println("mycelium: failed to launch daemon — ${e.message}")
+            return false
+        }
+
+        val deadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MILLIS
+        while (System.currentTimeMillis() < deadline) {
+            if (DaemonClient.isRunning(socketPath)) return true
+            Thread.sleep(POLL_INTERVAL_MILLIS)
+        }
+        return false
+    }
 }
 
 private fun printCompilerUsage() {

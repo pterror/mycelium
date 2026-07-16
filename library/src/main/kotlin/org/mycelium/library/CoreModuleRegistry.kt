@@ -83,6 +83,10 @@ object CoreModuleRegistry {
         "node:perf_hooks" to "perf_hooks.mjs",
         "vm" to "vm.mjs",
         "node:vm" to "vm.mjs",
+        "dgram" to "dgram.mjs",
+        "node:dgram" to "dgram.mjs",
+        "cluster" to "cluster.mjs",
+        "node:cluster" to "cluster.mjs",
     )
 
     fun isCoreModule(specifier: String): Boolean = coreModules.containsKey(specifier)

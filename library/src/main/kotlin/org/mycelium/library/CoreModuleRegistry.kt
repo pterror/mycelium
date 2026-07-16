@@ -95,6 +95,57 @@ object CoreModuleRegistry {
         val stream = javaClass.classLoader.getResourceAsStream("node-stdlib/$resourceName")
             ?: throw MyceliumException("mycelium: unknown core module resource '$resourceName'")
         val content = stream.use { it.readBytes() }.toString(StandardCharsets.UTF_8)
-        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
+        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(normalizeCoreModuleSpecifiers(content)))
+    }
+
+    // GraalJS's own ESM loader (DefaultESModuleLoader, GraalVM 24.2/25.0/25.1) keys its
+    // module cache differently depending on whether an import specifier contains a colon.
+    // A specifier like "events" (no colon) is resolved to a TruffleFile via our FileSystem
+    // and the cache is keyed on that file's path — but a specifier like "node:events" is
+    // first parsed as an *absolute URI* (scheme "node") by the loader itself, purely as
+    // string parsing, before our FileSystem is ever consulted; that routes it through a
+    // completely different method (loadModuleFromURL, as opposed to loadModuleFromFile)
+    // whose cache key is the raw specifier string ("node:events") rather than any resolved
+    // path — our FileSystem's own resolution of the "node:" URI (see
+    // InterceptingFileSystem.parsePath(URI)) only supplies the byte content, it has no
+    // influence on the cache key GraalJS uses. The two keys ("node:events" vs
+    // "/.mycelium-core/events.mjs") never match as strings, so a module written with the
+    // "node:" prefix and the equivalent bare form are never recognized as the same module
+    // by GraalJS — each is loaded and evaluated separately, producing two distinct classes
+    // (e.g. two different `EventEmitter` constructors) even though both ultimately read the
+    // exact same resource. This can't be fixed by anything our FileSystem returns from
+    // parsePath, since the URI-shaped route's cache key is decided before our FileSystem is
+    // even called.
+    //
+    // The fix applied here: normalize every "node:"-prefixed *import/export specifier* for a
+    // recognized core module to the bare form before GraalJS ever parses the source, so
+    // resolving that module always takes the bare-specifier (loadModuleFromFile) route and
+    // therefore always shares one cached module instance with every other place that imports
+    // the same core module — which is what lets e.g. stream.mjs's Readable/Writable and
+    // http.mjs's IncomingMessage/ServerResponse extend the exact same EventEmitter class as
+    // everything else that imports "events"/"node:events", instead of each ending up with its
+    // own separately-evaluated copy.
+    //
+    // Applied to our own bundled node-stdlib resources (via readCoreModule, above) so
+    // core-module-to-core-module imports are unaffected by which form the .mjs source
+    // happens to use, AND to every plain project/npm .js/.mjs file InterceptingFileSystem
+    // reads (see its newByteChannel), so a project that writes `import { EventEmitter } from
+    // "node:events"` at its own top level still shares identity with whatever core modules
+    // it transitively imports (which, per the previous paragraph, always resolve `events` via
+    // the bare route). Safe to run over arbitrary project/npm source too, unlike a blanket
+    // "any node:-prefixed string" rewrite would be: the regex only fires immediately after an
+    // `import`/`export ... from`/dynamic `import(` token, and only for specifiers matching a
+    // *known* core module name — so an unrelated string literal that merely looks like
+    // "node:events" (e.g. used as data, not as an import specifier) is never touched.
+    private val CORE_MODULE_IMPORT_SPECIFIER = Regex(
+        """((?:\bfrom\s*|\bimport\s*\(\s*))(['"])node:([\w/-]+)\2"""
+    )
+
+    fun normalizeCoreModuleSpecifiers(content: String): String {
+        if (!content.contains("node:")) return content
+        return CORE_MODULE_IMPORT_SPECIFIER.replace(content) { match ->
+            val (prefix, quote, moduleName) = match.destructured
+            if (coreModules.containsKey(moduleName)) "$prefix$quote$moduleName$quote" else match.value
+        }
     }
 }

@@ -1,79 +1,10 @@
 // Minimal Node.js-compatible `stream` module, served by Mycelium as the synthetic core
 // module resolved for `import ... from "stream"` / `"node:stream"`. Pure JS — no Java
-// interop needed. Since core modules are loaded as standalone synthetic ESM resources
-// (see InterceptingFileSystem), importing the `events` core module from here via a
-// standard `import` isn't reliable, so EventEmitter is duplicated inline (kept minimal —
-// just what Stream's subclasses need) rather than shared.
-
-class EventEmitter {
-    constructor() {
-        this._events = Object.create(null);
-    }
-
-    on(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) this._events[event] = [listener];
-        else existing.push(listener);
-        return this;
-    }
-
-    addListener(event, listener) {
-        return this.on(event, listener);
-    }
-
-    once(event, listener) {
-        const wrapper = (...args) => {
-            this.removeListener(event, wrapper);
-            listener.apply(this, args);
-        };
-        wrapper.listener = listener;
-        return this.on(event, wrapper);
-    }
-
-    removeListener(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) return this;
-        const idx = existing.findIndex((l) => l === listener || l.listener === listener);
-        if (idx !== -1) existing.splice(idx, 1);
-        if (existing.length === 0) delete this._events[event];
-        return this;
-    }
-
-    off(event, listener) {
-        return this.removeListener(event, listener);
-    }
-
-    removeAllListeners(event) {
-        if (event === undefined) this._events = Object.create(null);
-        else delete this._events[event];
-        return this;
-    }
-
-    emit(event, ...args) {
-        const handlers = this._events[event];
-        if (handlers === undefined) {
-            if (event === "error") {
-                const err = args[0];
-                throw err instanceof Error ? err : new Error(String(err));
-            }
-            return false;
-        }
-        for (const listener of handlers.slice()) {
-            listener.apply(this, args);
-        }
-        return true;
-    }
-
-    listenerCount(event) {
-        const handlers = this._events[event];
-        return handlers === undefined ? 0 : handlers.length;
-    }
-
-    listeners(event) {
-        const handlers = this._events[event];
-        return handlers === undefined ? [] : handlers.slice();
-    }
-}
+// interop needed. EventEmitter is imported from the `events` core module rather than
+// duplicated — see CoreModuleRegistry.normalizeInterCoreModuleImports for how Mycelium
+// makes inter-core-module imports like this one reliably share a single cached module
+// instance with every other core module (and user code) importing "events"/"node:events".
+import { EventEmitter } from "node:events";
 
 // Runs `fn` on a microtask/macrotask so callers observing events (e.g. `.on('data', ...)`
 // registered right after construction) don't miss synchronously-emitted events — mirrors

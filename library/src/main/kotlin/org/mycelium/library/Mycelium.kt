@@ -289,7 +289,15 @@ class Mycelium(
         if (autoInstall) {
             maybeInstallDependencies(file.absoluteFile.parentFile)
         }
-        val code = file.readText()
+        // Normalize "node:"-prefixed core-module imports the same way InterceptingFileSystem
+        // does for every other .js/.mjs file it reads (see
+        // CoreModuleRegistry.normalizeCoreModuleSpecifiers) — the entry file's own source is
+        // read directly here rather than through the FileSystem (GraalJS is handed a Source
+        // built from this string, not a file path it resolves itself), so it would otherwise
+        // be the one file in the whole program whose own "node:events"-style imports aren't
+        // normalized, defeating the point when the entry file itself does exactly that.
+        val rawCode = file.readText()
+        val code = if (language == "js") CoreModuleRegistry.normalizeCoreModuleSpecifiers(rawCode) else rawCode
         val source = Source.newBuilder(language, code, path).build()
         val dir = file.absoluteFile.parentFile.toPath()
         filesystem.withSourceDirectory(dir) { context.eval(source) }
@@ -325,7 +333,12 @@ class Mycelium(
         }
         val tmpFile = File.createTempFile("mycelium-module-", moduleExtensionForLanguage(languageId))
         tmpFile.deleteOnExit()
-        tmpFile.writeText(code)
+        // Same "node:"-prefixed core-module import normalization as runFile — see that
+        // method's own comment for why the entry source needs it applied explicitly rather
+        // than relying on InterceptingFileSystem (this Source is also built directly from a
+        // string, not resolved as a file through the FileSystem).
+        val normalizedCode = if (languageId == "js") CoreModuleRegistry.normalizeCoreModuleSpecifiers(code) else code
+        tmpFile.writeText(normalizedCode)
         val source = Source.newBuilder(languageId, tmpFile).build()
         return context.eval(source)
     }

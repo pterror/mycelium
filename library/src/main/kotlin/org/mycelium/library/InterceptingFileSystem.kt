@@ -575,7 +575,35 @@ class InterceptingFileSystem : FileSystem {
                     }
                 } else {
                     try {
-                        delegate.newByteChannel(path, options, *attrs)
+                        // A project/npm file importing a core module via the "node:" prefix
+                        // (e.g. `import { EventEmitter } from "node:events"`) would otherwise
+                        // be resolved by GraalJS's ESM loader through a different module-cache
+                        // key than the bare form ("events") — see
+                        // CoreModuleRegistry.normalizeCoreModuleSpecifiers's own comment for
+                        // why — so such a project ends up with two separately-evaluated copies
+                        // of that core module (one for its own "node:events" import, another
+                        // shared by whatever core modules it transitively imports, which
+                        // always resolve via the bare form). Normalizing real .js/.mjs files'
+                        // own "node:"-prefixed core-module imports here, the same as is already
+                        // done for our bundled node-stdlib resources, keeps both sides on the
+                        // same bare-specifier route so they share one instance.
+                        if ((path.extension == "js" || path.extension == "mjs") &&
+                            !options.contains(StandardOpenOption.WRITE) &&
+                            !options.contains(StandardOpenOption.CREATE)
+                        ) {
+                            val content = path.readText()
+                            if (content.contains("node:")) {
+                                ReadOnlyBufferChannel(
+                                    StandardCharsets.UTF_8.encode(
+                                        CoreModuleRegistry.normalizeCoreModuleSpecifiers(content)
+                                    )
+                                )
+                            } else {
+                                delegate.newByteChannel(path, options, *attrs)
+                            }
+                        } else {
+                            delegate.newByteChannel(path, options, *attrs)
+                        }
                     } catch (e: NoSuchFileException) {
                         if (targetLang == null && path.extension.isNotEmpty() &&
                             !isSyntheticIdentifier(path.fileName.toString())) {

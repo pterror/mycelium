@@ -1,17 +1,20 @@
 // Minimal Node.js-compatible `https` module, served by Mycelium as the synthetic core
 // module resolved for `import ... from "https"` / `"node:https"`. Mirrors http.mjs's
-// client implementation closely (same EventEmitter/IncomingMessage/ClientRequest shape),
-// but opens connections via `javax.net.ssl.HttpsURLConnection` explicitly and defaults the
-// scheme/port to `https:`/443. Duplicated rather than imported from the `http` core module
-// — see stream.mjs's comment on why core modules don't import each other here: each is
-// served as a standalone synthetic ESM resource, and cross-core-module `import` isn't a
-// pattern exercised/relied on elsewhere in this codebase.
+// client implementation closely (same IncomingMessage/ClientRequest shape, and now the
+// exact same EventEmitter class — imported from the `events` core module rather than
+// duplicated, see CoreModuleRegistry.normalizeInterCoreModuleImports), but opens
+// connections via `javax.net.ssl.HttpsURLConnection` explicitly and defaults the
+// scheme/port to `https:`/443. The IncomingMessage/ClientRequest classes themselves are
+// still duplicated rather than imported from the `http` core module — deduplicating those
+// is a larger refactor than this EventEmitter fix.
 //
 // `createServer` is a stub: a real HTTPS server needs a configured `SSLContext`
 // (certificate + private key) that Node's `https.createServer({ key, cert }, ...)` takes
 // as JS-supplied PEM strings — wiring that up to `com.sun.net.httpserver.HttpsServer` /
 // `javax.net.ssl.SSLContext` is out of scope here, so it throws rather than silently
 // behaving like a plain HTTP server.
+
+import { EventEmitter } from "node:events";
 
 const JURL = Java.type("java.net.URL");
 const JByteArrayOutputStream = Java.type("java.io.ByteArrayOutputStream");
@@ -50,58 +53,6 @@ function readAllBytes(inputStream) {
     }
     inputStream.close();
     return baos.toByteArray();
-}
-
-class EventEmitter {
-    constructor() {
-        this._events = Object.create(null);
-    }
-
-    on(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) this._events[event] = [listener];
-        else existing.push(listener);
-        return this;
-    }
-
-    once(event, listener) {
-        const wrapper = (...args) => {
-            this.removeListener(event, wrapper);
-            listener.apply(this, args);
-        };
-        wrapper.listener = listener;
-        return this.on(event, wrapper);
-    }
-
-    removeListener(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) return this;
-        const idx = existing.findIndex((l) => l === listener || l.listener === listener);
-        if (idx !== -1) existing.splice(idx, 1);
-        return this;
-    }
-
-    off(event, listener) {
-        return this.removeListener(event, listener);
-    }
-
-    emit(event, ...args) {
-        const handlers = this._events[event];
-        if (handlers === undefined) {
-            if (event === "error") {
-                const err = args[0];
-                throw err instanceof Error ? err : new Error(String(err));
-            }
-            return false;
-        }
-        for (const listener of handlers.slice()) listener.apply(this, args);
-        return true;
-    }
-
-    listenerCount(event) {
-        const handlers = this._events[event];
-        return handlers === undefined ? 0 : handlers.length;
-    }
 }
 
 function nextTick(fn) {

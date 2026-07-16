@@ -14,6 +14,12 @@
 // request bodies, no HTTP/2 — enough for typical npm packages (e.g. simple REST clients)
 // to make/receive basic requests.
 
+// EventEmitter is imported from the `events` core module rather than duplicated — see
+// CoreModuleRegistry.normalizeInterCoreModuleImports for how Mycelium makes
+// inter-core-module imports like this one reliably share a single cached module instance
+// with every other core module (and user code) importing "events"/"node:events".
+import { EventEmitter } from "node:events";
+
 const JURL = Java.type("java.net.URL");
 const JHttpURLConnection = Java.type("java.net.HttpURLConnection");
 const JByteArrayOutputStream = Java.type("java.io.ByteArrayOutputStream");
@@ -59,93 +65,6 @@ function readAllBytes(inputStream) {
     }
     inputStream.close();
     return baos.toByteArray();
-}
-
-// Minimal EventEmitter, self-contained (see stream.mjs's comment on why: core modules are
-// standalone synthetic resources, so importing the `events` core module from here isn't
-// reliable).
-class EventEmitter {
-    constructor() {
-        this._events = Object.create(null);
-    }
-
-    on(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) this._events[event] = [listener];
-        else existing.push(listener);
-        return this;
-    }
-
-    once(event, listener) {
-        const wrapper = (...args) => {
-            this.removeListener(event, wrapper);
-            listener.apply(this, args);
-        };
-        wrapper.listener = listener;
-        return this.on(event, wrapper);
-    }
-
-    removeListener(event, listener) {
-        const existing = this._events[event];
-        if (existing === undefined) return this;
-        const idx = existing.findIndex((l) => l === listener || l.listener === listener);
-        if (idx !== -1) existing.splice(idx, 1);
-        return this;
-    }
-
-    off(event, listener) {
-        return this.removeListener(event, listener);
-    }
-
-    // Alias for `on` — real Node's EventEmitter exposes both names for the same method,
-    // and packages that attach a request handler via `server.addListener("request", ...)`
-    // rather than `.on(...)` (both are equally idiomatic in real Node) would otherwise call
-    // a non-existent method on this minimal, http.mjs-local EventEmitter.
-    addListener(event, listener) {
-        return this.on(event, listener);
-    }
-
-    removeAllListeners(event) {
-        if (event === undefined) {
-            this._events = Object.create(null);
-        } else {
-            delete this._events[event];
-        }
-        return this;
-    }
-
-    emit(event, ...args) {
-        const handlers = this._events[event];
-        if (handlers === undefined) {
-            if (event === "error") {
-                const err = args[0];
-                throw err instanceof Error ? err : new Error(String(err));
-            }
-            return false;
-        }
-        for (const listener of handlers.slice()) listener.apply(this, args);
-        return true;
-    }
-
-    listenerCount(event) {
-        const handlers = this._events[event];
-        return handlers === undefined ? 0 : handlers.length;
-    }
-
-    // Returns each listener with its original callback unwrapped from any `once()`
-    // wrapper (`wrapper.listener` — see `once` above) — needed by packages that snapshot
-    // and later re-attach a server's existing listeners (e.g. engine.io's `attach()`,
-    // which caches `server.listeners("request")` before replacing them with its own
-    // dispatcher, then still invokes the originals for requests it doesn't intercept).
-    listeners(event) {
-        const handlers = this._events[event];
-        if (handlers === undefined) return [];
-        return handlers.map((l) => l.listener || l);
-    }
-
-    eventNames() {
-        return Object.keys(this._events);
-    }
 }
 
 function nextTick(fn) {

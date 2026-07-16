@@ -1,6 +1,20 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-17 (session handoff #3: Node stdlib completion. `dgram` and `cluster` — the
+*Updated 2026-07-17 (session handoff #4: stub audit + Truffle-embedding-JAR visibility fix.
+Silent-wrong-answer stubs (modules that returned plausible-looking but incorrect results
+instead of throwing/erroring) were replaced with real implementations (`253ae14`) following an
+audit of every Node core module's implementation depth: 27 FULL, 20 PARTIAL, 7 STUB, 3 THROWS
+— see "Open threads" below for the remaining stub/throws inventory. Separately, `polyglot` and
+`truffle-api` are now exposed as `api` (not `implementation`) dependencies so the `Engine` type
+is visible to consumers embedding the `library` module (`ecd6c39`) — a Gradle
+visibility/encapsulation fix, not a behavior change. The previously in-flight stream/path
+submodules and `console` module (flagged unconfirmed in the prior handoff) are now confirmed
+committed in `eb0611a`, along with the readline circular-import fix — see the dedicated
+"Stream/path submodules" open-thread entry below, now marked resolved. Roadmap doc updated to
+reflect Node core module parity as complete and Scala.js as resolved (`bb92be9`). See "Open
+threads" for what's newly open this session (Truffle embedding JAR gap, Bun/Deno runtime
+compat, value proposition, stub/throws inventory, and others).* Previous handoff (session
+handoff #3: Node stdlib completion. `dgram` and `cluster` — the
 last two modules with no implementation at all — are now implemented, closing that gap. 14
 niche/deprecated modules landed: `constants`, `domain`, `punycode`, `sys`, `repl`,
 `trace_events`, `v8`, `wasi`, `inspector`, `inspector/promises`, `node:test`,
@@ -321,9 +335,8 @@ the fundamental native-addon reason above.
    `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types`, `dgram`,
    `cluster`, and all 14 niche/deprecated modules below (52 dynamic parity tests total). No
    longer a test-coverage gap.
-3. Console output could be improved beyond GraalJS's defaults — a real `console` module is
-   in flight (see "Open threads" below) but not yet confirmed landed as of this update; deeper
-   formatting fidelity beyond module-surface parity remains open regardless.
+3. A real `console` module landed (`eb0611a`) — no longer relying on GraalJS's built-in
+   console. Deeper formatting fidelity beyond module-surface parity remains open regardless.
 
 ### Missing Node stdlib modules — NONE remain unimplemented (this session)
 `dgram` and `cluster` — the last two modules with no implementation at all — are now
@@ -335,9 +348,9 @@ implemented, closing that gap entirely. Everything previously tracked here — `
 `inspector/promises`, `node:test`, `node:test/reporters`, `node:sea`, `node:sqlite`. Total:
 50+ core modules (up from ~30; see `library/src/main/resources/node-stdlib/*.mjs`).
 
-**In flight, not yet confirmed committed as of this update**: `stream/promises`,
-`stream/consumers`, `stream/web`, `path/posix`, `path/win32` submodules and a real `console`
-module — see "Open threads" below.
+`stream/promises`, `stream/consumers`, `stream/web`, `path/posix`, `path/win32` submodules and
+a real `console` module also landed (`eb0611a`) — see "Open threads" below for the
+readline-circular-import fix that shipped alongside them.
 
 ## Language support status
 
@@ -479,19 +492,14 @@ workflow publishes (verified against the real GitHub release asset list), with W
 `.zip` instead. `scala-cli version --offline` is used to validate the resolved binary's version
 against a project's own constraint, same as every other `ToolResolver`-mediated tool.
 
-### Stream/path submodules + console module, and the readline circular-import fix — IN FLIGHT
-As of this update: `stream/promises`, `stream/consumers`, `stream/web` (stream submodules),
-`path/posix`, `path/win32` (path submodules), and a real `console` module (not just relying on
-GraalJS's built-in console) were being added, alongside a fix for a `readline`/
-`readline-promises` circular-import issue (GraalJS, like V8, fails to evaluate a module cycle
-where a binding is imported before it's initialized — same class of bug the earlier
-`node:`-vs-bare-specifier dual-cache issue was adjacent to, but a distinct root cause here:
-`readline-promises.mjs` was trying to subclass `Interface` from `readline.mjs` while
-`readline.mjs` imported back from `readline-promises.mjs` to expose `readline.promises`).
-**Status as of this doc update: in progress, not confirmed landed or committed.** Verify by
-checking for `stream-promises.mjs`/`stream-consumers.mjs`/`stream-web.mjs`/`path-posix.mjs`/
-`path-win32.mjs`/`console.mjs` under `library/src/main/resources/node-stdlib/`, and whether
-`git status` shows them committed vs. still untracked/modified, before treating this as done.
+### Stream/path submodules + console module, and the readline circular-import fix — RESOLVED
+Landed in `eb0611a` (confirmed via `git log` on the files and a clean `git status`):
+`stream-promises.mjs`, `stream-consumers.mjs`, `stream-web.mjs`, `path-posix.mjs`,
+`path-win32.mjs`, `console.mjs` all exist under `library/src/main/resources/node-stdlib/` and
+are committed. The `readline`/`readline-promises` circular-import fix (GraalJS failing to
+evaluate a module cycle where a binding is imported before it's initialized —
+`readline-promises.mjs` subclassing `Interface` from `readline.mjs` while `readline.mjs`
+imported back from `readline-promises.mjs`) landed in the same commit.
 
 ### Fable (F# → JS) — closest remaining compile-to-JS candidate, still blocked
 `@fable-org/fable-compiler-js` needs no .NET runtime, but its npm `bin` is a plain JS file that
@@ -538,6 +546,71 @@ right tool for these specifically because (a) they need Java interop for I/O (fi
 sockets, etc.) and (b) they need to express Node's callback/event semantics (`EventEmitter`,
 stream backpressure, etc.), which are naturally JS-shaped. This item is closed — no action
 needed, listed here only so a future session doesn't reopen it as if it were an oversight.
+
+### Truffle language embedding JAR gap — unresearched
+TruffleRuby and Sulong (LLVM) Maven artifacts stopped being published past 25.0.0. TruffleRuby
+itself is alive upstream (release 34.0.1), Oracle just stopped publishing embedding JARs for
+it. FastR (R) never had Maven artifacts and is effectively abandoned (see dedicated FastR
+thread below). Open question: can Mycelium build TruffleRuby/Sulong from source against
+current Truffle APIs and publish its own embedding JARs? If the Truffle SPI is stable across
+versions, this could be straightforward packaging; if unstable, it's an ongoing maintenance
+burden. This is the practical ceiling on the GraalVM version bump (see "GraalVM version"
+above) — matters because it blocks moving off 25.0.0 for as long as it's unresolved.
+
+### Bun/Deno runtime compat — confirmed goal, not started
+Confirmed as an actual goal ("you have code? we run code"), not just a nice-to-have. Detection
+should be import-based, not just lockfile-based: `bun:`-prefixed imports imply Bun, URL imports
+imply Deno, cross-runtime branching code should fall through to the Node path (safest, most-
+tested fallback) — see "Bun/Deno Compatibility Strategy" above for the fuller detection-order
+rationale already agreed on. The API surface for `Bun.*`/`Deno.*` globals is well-documented
+upstream but large. No implementation work started yet.
+
+### Value proposition — still unclear, worth sitting with
+Genuinely unclear beyond "it's funny." Candidates discussed: universal *host* (as opposed to
+WASM's universal *target* — WASM strips a package out of its ecosystem, Mycelium preserves
+it), cross-ecosystem package reuse, "you have code, we run code." None felt definitive as of
+this session. Matters because it shapes which open threads are worth prioritizing next.
+
+### GraalJS vs V8 throughput — settled, not open, noted for context
+Structural ~1.5-2x gap, conceded (see "Distribution architecture — RESOLVED" above for the
+numbers). JS execution speed is not the value proposition; polyglot interop is. Listed here
+only so a future session doesn't reopen it as if unresolved.
+
+### Stub/throws inventory — known remainder after this session's fixes
+Full-codebase audit found 27 FULL, 20 PARTIAL, 7 STUB, 3 THROWS implementations across Node
+core modules. Silent-wrong-answer cases (stubs that returned plausible but incorrect results)
+were fixed this session (`253ae14`). Remaining known gaps: STUB-level modules `inspector`,
+`repl`, `test-reporters`, `trace_events`, `tty`, `cluster`; THROWS-level modules `sea`,
+`sqlite`, `wasi` (these throw explicitly rather than silently misbehaving, which is considered
+acceptable for now). Open question: `sqlite` might warrant a real implementation via
+`sqlite-jdbc` as an optional JAR dependency rather than staying a throw — unevaluated.
+
+### Kotlin/JS in-process compiler — unchanged, not started
+See "Kotlin/JS as an in-process JVM library call" above — still just a subprocess call to
+`kotlinc-js`, could be a direct JVM library call to save process-spawn overhead. Not started
+this session either.
+
+### Fable (F# → JS) — unchanged, still blocked
+See "Fable" entries above — blocked on needing a real `node` binary for its `bin` shebang. Not
+attempted this session; the GraalJS-as-node-substitute idea remains the proposed unblock.
+
+### Round 5 npm acid test — not started
+Next tier up from the 27/28-pass Round 1-4 acid tests: webpack, prisma, next.js. Significant
+difficulty step up from prior rounds (build tooling, ORM/native-binding-adjacent code, and a
+full framework, respectively). Not started this session.
+
+### Ruby cross-language import UX — open question, unchanged
+Cross-language `.rb` imports work but require explicit `public :method_name` and a trailing
+`self` in `.rb` files to expose methods across the language boundary — this could be
+surprising to users coming from plain Ruby. Open question: should Mycelium infer/handle this
+automatically instead of requiring it explicitly? Not investigated this session.
+
+### FastR (R support) — effectively abandoned upstream, alternatives unevaluated
+FastR never had Maven artifacts, was removed from GraalVM's own docs, and its last real
+upstream activity was 2023 — effectively abandoned as a path to R support. Alternative paths
+discussed but not investigated: Renjin (pure-Java R implementation, published on Maven
+Central), R-to-WASM, or a subprocess call to a real `Rscript` binary (same category of
+tradeoff as the Fable/`node` situation). None investigated this session.
 
 ## User preferences (for future sessions)
 

@@ -34,13 +34,49 @@ object CompileToJsDispatcher {
 
         CompilerCache.get(languageId, spec.defaultVersion, sourceHash)?.let { return it }
 
-        val compiled = if (spec.npmPackageName == null) {
-            esbuildBackend.compile(sourceText, sourcePath, spec.compileOptions)
-        } else {
-            val moduleResolutionDir =
-                resolveCompilerLocation(languageId, spec.npmPackageName, spec.defaultVersion, sourcePath)
-            val backend = NpmJsApiBackend(context, spec.compileFunction, moduleResolutionDir, spec.outputIsObject)
-            backend.compile(sourceText, sourcePath, spec.compileOptions)
+        val compiled = when (spec.backendType) {
+            BackendType.BUNDLED ->
+                esbuildBackend.compile(sourceText, sourcePath, spec.compileOptions)
+            BackendType.JS_API -> {
+                val npmPackageName = spec.npmPackageName
+                    ?: throw MyceliumException(
+                        "mycelium: compiler spec for '$languageId' is JS_API but has no npmPackageName"
+                    )
+                val moduleResolutionDir =
+                    resolveCompilerLocation(languageId, npmPackageName, spec.defaultVersion, sourcePath)
+                val backend = NpmJsApiBackend(context, spec.compileFunction, moduleResolutionDir, spec.outputIsObject)
+                backend.compile(sourceText, sourcePath, spec.compileOptions)
+            }
+            BackendType.SUBPROCESS -> {
+                val npmPackageName = spec.npmPackageName
+                    ?: throw MyceliumException(
+                        "mycelium: compiler spec for '$languageId' is SUBPROCESS but has no npmPackageName"
+                    )
+                val resolveBinaryPath = spec.subprocessBinaryPath
+                    ?: throw MyceliumException(
+                        "mycelium: compiler spec for '$languageId' is SUBPROCESS but has no subprocessBinaryPath"
+                    )
+                val compileArgs = spec.compileArgs
+                    ?: throw MyceliumException(
+                        "mycelium: compiler spec for '$languageId' is SUBPROCESS but has no compileArgs"
+                    )
+                val moduleResolutionDir =
+                    resolveCompilerLocation(languageId, npmPackageName, spec.defaultVersion, sourcePath)
+                val packageDir = moduleResolutionDir.resolve("node_modules").resolve(npmPackageName)
+                val binaryPath = resolveBinaryPath(packageDir)
+                // The npm/PackageCache download pipeline hardlinks a package's files as-is
+                // rather than re-running npm's own install-time chmod-the-bin-files step, so
+                // a downloaded compiler binary can land without its executable bit set —
+                // make sure it's set before ProcessBuilder ever tries to run it.
+                binaryPath.toFile().setExecutable(true)
+                val backend = SubprocessBackend(
+                    binaryPath = binaryPath,
+                    compileArgs = compileArgs,
+                    outputMode = spec.subprocessOutputMode,
+                    locateOutput = spec.locateOutput,
+                )
+                backend.compile(sourceText, sourcePath, spec.compileOptions)
+            }
         }
         CompilerCache.put(languageId, spec.defaultVersion, sourceHash, compiled)
         return compiled

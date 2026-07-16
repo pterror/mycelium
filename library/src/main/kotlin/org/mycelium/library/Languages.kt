@@ -70,6 +70,39 @@ object LiveScriptSupport : LanguageSupport by JsSupport {
     override val jsCompilerId = "livescript"
 }
 
+// Elm, compiled to plain JS via SubprocessBackend (backed by the real `elm` npm package's
+// installed native binary, not a JS API — see CompilerRegistry's "elm" registration for the
+// elm.json-scaffolding workaround and its single-file-compilation caveats). See
+// CoffeeSupport's own doc comment for why delegation (`by JsSupport`) is enough here despite
+// Elm being subprocess-backed rather than npm-JS-API-backed: from GraalJS's perspective, the
+// compiled output is just another ES module either way.
+object ElmSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("elm")
+    override val jsCompilerId = "elm"
+}
+
+// PureScript, likewise compiled via SubprocessBackend (backed by the real `purescript` npm
+// package's installed native `purs` binary) — see CoffeeSupport's own doc comment for why
+// delegation (`by JsSupport`) is enough here, and CompilerRegistry's "purescript"
+// registration for the `purs compile`/`output/<Module>/index.js` workflow and its
+// single-file (no cross-module imports) caveat.
+object PureScriptSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("purs")
+    override val jsCompilerId = "purescript"
+}
+
+// ReScript, likewise compiled via SubprocessBackend (backed by the real `rescript` npm
+// package's installed native, platform-specific `bsc` binary) — see CoffeeSupport's own doc
+// comment for why delegation (`by JsSupport`) is enough here, and CompilerRegistry's
+// "rescript" registration for the standalone `bsc <file>` stdout-based workflow. `.resi`
+// (ReScript's interface-file extension, mirroring OCaml's `.mli`) is routed through the same
+// compiler: `bsc` accepts either extension, and an interface file alone has no runtime
+// exports of its own to speak of, but there's no harm in Mycelium being willing to try.
+object ReScriptSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("res", "resi")
+    override val jsCompilerId = "rescript"
+}
+
 object RubySupport : LanguageSupport {
     override val languageId = "ruby"
     override val extensions = listOf("rb")

@@ -1,7 +1,9 @@
 # Mycelium Roadmap
 
-*Last updated 2026-07-16 (test-gating fix + compile-to-JS/package-infrastructure docs pass).
-This is the forward-looking companion to `TODO.md` — `TODO.md`
+*Last updated 2026-07-16 (compile-to-JS expanded to 12 languages, pure-Kotlin registry
+infrastructure, content-addressable store, version-aware tool resolution — session handoff;
+see "Open threads" below for what's next). This is the forward-looking companion to
+`TODO.md` — `TODO.md`
 is the detailed, ground-truth session log (architecture decisions, gotchas, exact test
 names); this file is the higher-altitude "what's next and in what order" view. When the
 two disagree, trust `TODO.md` and fix this file.*
@@ -116,10 +118,23 @@ following — all pure Kotlin, talking directly to each registry's HTTP API
   `MyceliumIntegrationTest.kt`'s `manifestInstallRunsNpmInstall`/`yoloAutoInstallsMissingPackage`,
   no longer gated on npm being present.
 - **`ToolResolver` + composable `ToolSource`** — ecosystem-agnostic "find me a tool binary"
-  chain (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload`), extracted
-  out of what used to be inline logic in `CompileToJsDispatcher`. Used today for PureScript's
-  separately-versioned `spago`; the natural extension point for any future non-npm tool
-  resolution.
+  chain (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload` →
+  `GitHubRelease` → `DartSdkDownload`), extracted out of what used to be inline logic in
+  `CompileToJsDispatcher`. Used for PureScript's separately-versioned `spago`, Gleam's
+  GitHub-released binary, and Dart's SDK download; the natural extension point for any future
+  non-npm tool resolution. Now version-aware (validates a candidate against a project's
+  `package.json` constraint) with stat+mtime-based resolution caching.
+- **Content-addressable store (CAS)** — per-file SHA-256 dedup layered under `PackageCache`,
+  so identical files shared across different package versions/ecosystems are stored once on
+  disk (hardlinked out to each consumer) instead of once per archive extraction.
+- **`HttpMetadataCache`** — ETag/conditional-GET (`If-None-Match`) caching wired into every
+  registry client (npm, RubyGems, PyPI, crates.io, Go proxy), so repeated metadata fetches
+  (version lists, package.json-equivalents) return `304 Not Modified` instead of
+  re-downloading unchanged JSON on every resolution.
+- **Pure Kotlin npm registry client** — HTTP/2, streaming tarball extraction, hardlink-based
+  install, and system-aware tuning (concurrency/buffer sizing based on available
+  cores/memory), so npm installs don't require shelling out to `npm`/`pnpm` even for the
+  "cold cache, real install" path, not just metadata resolution.
 
 ---
 
@@ -168,13 +183,30 @@ Only genuinely open items remain below.*
 - JSR registry support for Deno packages — not started.
 - Strategic framing: Node compat is the trojan horse; polyglot is the payload.
 
-### Distribution Architecture
+### Distribution Architecture — THE big open decision (see "Open threads" below for the live question)
 
 **Native-image vs JVM tradeoffs:**
-- **Native-image**: fast startup (~10ms), single binary, but cannot dynamically load Truffle languages at runtime. All languages must be compiled in at build time. Currently ~887MB with all languages (`native-image` peaks ~17GB RAM during build, capped at `-J-Xmx8g`).
+- **Native-image (current)**: fast startup (~10ms), single binary, but cannot dynamically load Truffle languages at runtime. All languages must be compiled in at build time. Currently ~887MB with all languages on GraalVM CE (`native-image` peaks ~17GB RAM during build, capped at `-J-Xmx8g`). CE's peak throughput is slower than Oracle GraalVM's.
 - **JVM mode**: slower startup (~200-500ms), requires JRE, but can dynamically load Truffle language JARs on demand. Enables lazy language loading and aligns better with the "every language on demand" vision.
 - **Native-image has no dylib/shared-library support** for Truffle languages — it's monolithic AOT.
 - **JVM is the more tractable path** for true on-demand language loading.
+- **Key licensing insight (this session)**: Oracle GraalVM (not just GraalVM CE) is free to use
+  under the GFTC (GraalVM Free Terms and Conditions) license, and is reported ~1.55x faster at
+  peak throughput than CE. This reopens native-image as a viable path if the throughput gap
+  was the main reason to prefer JVM mode.
+- **Experimental idea worth investigating**: GraalVM native-image with *runtime* JIT
+  compilation enabled (an experimental native-image feature) — would give a V8-like model in a
+  single native binary: fast (~10ms) startup *and* JIT-quality peak performance, rather than
+  having to choose one or the other. V8 and LuaJIT both achieve "fast startup + peak perf"
+  without this kind of tradeoff at all; GraalVM should in principle be able to match that, and
+  this is the concrete mechanism to test.
+- **Alternative**: Oracle GraalVM in JDK mode with dynamic Truffle-language loading — smaller
+  binary than native-image (languages loaded as JARs on demand, not baked in), best peak
+  performance of the options considered, but back to JVM-class startup (~4-5s observed, worse
+  than the 200-500ms cited above for a minimal JVM cold start — needs re-measurement).
+- **What actually blocks a decision**: binary size, startup time, peak throughput, and GFTC
+  license compatibility with Mycelium's own distribution — none benchmarked yet this session,
+  all four need real numbers before picking a lane.
 
 **Startup optimization (JVM path):**
 - CRaC (Coordinated Restore at Checkpoint) — snapshot running JVM, restore instantly.
@@ -209,7 +241,7 @@ get exercised.
 crate. A Ruby gem calls a Go function. A TypeScript file uses a Scala library. All in one
 process, no FFI, no serialization, no microservices.
 
-### Compile-to-JS languages — framework DONE, 7 languages supported
+### Compile-to-JS languages — framework DONE, 12 languages supported
 Built as a generalized compile-to-JS pipeline, not one-off wiring per language:
 `CompileToJsDispatcher` (`library/src/main/kotlin/org/mycelium/library/compiler/`) resolves a
 `CompilerSpec` (from `CompilerRegistry`) for the importing file's extension, then routes
@@ -222,22 +254,34 @@ through one of three `CompileToJsBackend` implementations depending on `BackendT
   `compile(source, options)`, `require()`'d into the shared GraalJS Context and called
   directly. CoffeeScript, Civet, LiveScript.
 - **`SUBPROCESS`** (`SubprocessBackend`) — the only interface is a native compiler binary
-  (no JS API at all). Elm (`elm make`), PureScript (`purs compile`), ReScript (`bsc`).
+  (no JS API at all). Elm (`elm make`), PureScript (`purs compile`), ReScript (`bsc`),
+  Imba, Gleam, Dart (`dart2js`), Kotlin/JS (`kotlinc-js`), Scala.js.
 
-**Supported languages (7):** TypeScript (bundled), CoffeeScript, Civet, LiveScript
-(JS_API), Elm, PureScript, ReScript (SUBPROCESS, with project-aware whole-project builds —
-see below). All registered in `CompilerRegistry`, all covered by
-`MyceliumIntegrationTest.kt`/dedicated project-aware tests.
+**Supported languages (12):** TypeScript (bundled); CoffeeScript, Civet, LiveScript
+(JS_API); Elm, PureScript, ReScript, Imba, Gleam, Dart, Kotlin/JS, Scala.js (SUBPROCESS,
+several with project-aware whole-project builds — see below). All registered in
+`CompilerRegistry`, all covered by `MyceliumIntegrationTest.kt`/dedicated project-aware tests.
 
-**Investigated, not added** (see `CompilerRegistry.kt`'s own comment for full detail):
-Imba (compiler's return shape doesn't fit `NpmJsApiBackend`'s `outputIsObject` contract, plus
-only alpha releases), Gleam (compiler isn't published to npm at all — it's a Rust binary via
-GitHub releases/Hex), Dart/dart2js (no self-contained npm package; needs the full Dart SDK),
-Kotlin/JS (needs a full classpath + stdlib jars, not a single binary/JS-function call),
-Scala.js (needs scala-cli/sbt + linker + library jars), Fable (closest candidate —
-`@fable-org/fable-compiler-js` needs no .NET, but its npm `bin` is a plain JS file that only
-runs via its own `#!/usr/bin/env node` shebang, i.e. requires a real external `node`
-installation — the one thing every other compile-to-JS language here avoids).
+What changed each of the languages previously listed as "investigated, not added" (see
+`CompilerRegistry.kt`'s own history/comments for the exact unblock per language):
+- **Imba** — routed through `SubprocessBackend` instead of `NpmJsApiBackend`, sidestepping the
+  `outputIsObject` contract mismatch that blocked it originally.
+- **Gleam** — compiler binary fetched via a new `GitHubRelease` `ToolSource` (Gleam ships a Rust
+  binary via GitHub releases, not npm) instead of requiring an npm package.
+- **Dart** — resolved via a new `DartSdkDownload` `ToolSource` that fetches the Dart SDK
+  directly (no npm package needed) and runs `dart2js`.
+- **Kotlin/JS**, **Scala.js** — both resolved as subprocess tools (`kotlinc-js`, scala-cli/sbt
+  + linker) via `ToolResolver` rather than requiring a single JS-callable npm package.
+
+**Fable (F#) remains the one open candidate** — see "Open threads" below.
+
+**Version-aware tool resolution**: `ToolResolver`'s `ToolSource` chain
+(`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload` → `GitHubRelease` →
+`DartSdkDownload`) now validates a resolved candidate binary's actual version against a
+project's own `package.json` constraint (`findPackageJsonConstraint`) before accepting it,
+not just "first thing found on PATH." Resolution results are cached keyed by
+stat+mtime, so repeated compiles of the same project don't re-probe every `ToolSource` in
+the chain each time.
 
 **Resolution order actually implemented** (`CompileToJsDispatcher.compile`,
 `CompilerDownloader`, `ToolResolver`):
@@ -354,6 +398,35 @@ new libraries, (2) most high-value npm packages that truly require native code a
 - LSP/IDE support: jump-to-definition across language boundaries.
 
 ---
+
+## Open threads (this session's handoff)
+
+1. **Distribution architecture — THE big decision.** See "Distribution Architecture" above for
+   the full writeup. Summary: currently native-image on GraalVM CE (887MB, ~10ms startup,
+   slower peak perf than the alternatives). Oracle GraalVM is free (GFTC) and ~1.55x faster
+   than CE at peak throughput. Two directions to investigate next session: (a) GraalVM
+   native-image with experimental runtime JIT compilation, which could give V8-like
+   fast-startup-plus-peak-perf in one native binary; (b) Oracle GraalVM JDK mode with dynamic
+   Truffle-language loading — smaller binary, best peak perf, but ~4-5s startup. Need real
+   benchmarks on binary size, startup time, peak performance, and to confirm GFTC license
+   compatibility before picking a lane.
+2. **Rust/Go auto-install** — `CratesIoClient`/`GoProxyClient` registry clients exist and can
+   resolve/download, but there's no linking stage for compiled output yet; `RustSupport`/
+   `TinyGoSupport` each compile a single source file straight to one standalone unit with no
+   multi-unit/dependency linking, so there's no seam an auto-fetched crate/module's compiled
+   output could plug into today. Architecture gap, not a registry-client gap.
+3. **Scala.js auto-download** — resolved via `SystemPath` only right now; no download
+   `ToolSource` (no GitHub-release or SDK-download equivalent wired up) for Scala.js yet, unlike
+   Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`).
+4. **Fable (F# → JS)** — the closest remaining compile-to-JS candidate, still blocked because
+   `@fable-org/fable-compiler-js`'s npm `bin` only runs via its own `#!/usr/bin/env node`
+   shebang, requiring a real external Node install (the one thing every other compile-to-JS
+   language here avoids). Possible unblock to explore: run Fable's compiler on GraalJS itself
+   instead of shelling out to a real `node` binary.
+5. **Kotlin/JS as an in-process JVM library call** — currently invoked as a `SUBPROCESS`
+   (`kotlinc-js`), but since Mycelium is itself a Kotlin/JVM application, it may be possible to
+   invoke the Kotlin/JS compiler as an in-process library call instead of shelling out, saving
+   process-spawn overhead per compile.
 
 ## Open design questions
 

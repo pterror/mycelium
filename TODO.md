@@ -1,6 +1,12 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-16 (test-gating fix session: stale npm `assumeTrue` gates removed, compile-to-JS/package-infrastructure docs brought current, Gleam/Dart/Kotlin-JS/Scala.js/Fable investigated and not added). This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
+*Updated 2026-07-16 (session handoff: compile-to-JS grew from 7 to 12 languages — Gleam,
+Imba, Dart, Kotlin/JS, Scala.js all landed, no longer "investigated, not added"; pure-Kotlin
+registry infrastructure gained a content-addressable store, `HttpMetadataCache`
+ETag/conditional-GET, version-aware `ToolResolver` with resolution caching; distribution
+architecture explored in depth — see "Open threads" at the end). This file is the project's
+institutional memory — written to survive context compaction. Treat as reliable background,
+but verify against code before relying on specifics that could have drifted.*
 
 ## Vision
 
@@ -36,6 +42,20 @@ Mycelium's purpose: make every language's package ecosystem available to every o
   - `RubyModuleResolver.kt` (46 lines) — `$LOAD_PATH` resolution.
   - `ShimGenerator.kt` (34 lines) — cross-language ESM shim generation.
   - **Any older note (including elsewhere in this file) that says "`InterceptingFileSystem.kt`" for entry-point/conditional-exports resolution logic predates this split.**
+- **Content-addressable store (CAS) for package installs**: `PackageCache` now dedups at the
+  per-file level (SHA-256 of file contents), not just per-archive — identical files shared
+  across different package versions or even different ecosystems are stored once on disk and
+  hardlinked out to each consumer, instead of once per extracted archive.
+- **`HttpMetadataCache`**: ETag/conditional-GET (`If-None-Match`) caching layered onto every
+  registry client (npm, RubyGems, PyPI, crates.io, Go proxy) — a metadata re-fetch (e.g.
+  re-resolving the same version range on a later run) returns `304 Not Modified` instead of
+  re-downloading unchanged JSON, shared by all five clients rather than implemented per-client.
+- **`ToolResolver` gained two more `ToolSource` implementations**: `GitHubRelease` (downloads a
+  compiler distributed as a GitHub release binary rather than an npm/registry package — used
+  for Gleam) and `DartSdkDownload` (fetches the Dart SDK directly — used for Dart/dart2js).
+  Both slot into the same composable chain (`ProjectLocalBin` → `SystemPath` →
+  `CachedPackage` → `RegistryDownload` → `GitHubRelease` → `DartSdkDownload`) as the
+  pre-existing sources, no special-casing needed in `CompileToJsDispatcher` itself.
 - **DIP-compliant composition root**: `Mycelium` (the class, in `Mycelium.kt`) constructs every
   collaborator its object graph needs — one `PackageIndex` per ecosystem (`NpmRegistryClient`,
   `RubyGemsClient`, `PyPIClient`, `CratesIoClient`, `GoProxyClient`), each paired with its own
@@ -162,36 +182,48 @@ implemented (~30 core modules total; see `library/src/main/resources/node-stdlib
 ### JavaScript / TypeScript — working
 Core language. TypeScript (`.ts`/`.mts`, routed to `js` via `JsSupport.extensions`) transpiles through `TsCompiler` (`library/src/main/kotlin/org/mycelium/library/TsCompiler.kt`) using `io.mvnpm:esbuild-java:1.5.1`. `InterceptingFileSystem.newByteChannel` intercepts `.ts`/`.mts` reads before any other routing and hands GraalJS the transpiled JS. Output cached on disk by source-content hash (`~/.cache/mycelium/ts`, same pattern as `Compiler.compile`'s LLVM cache) since esbuild spawns a subprocess and downloads a platform binary on first use (network required once; ~5s cold, near-instant cached). esbuild hashes output filenames unpredictably, so `TsCompiler` picks the lone `.js` file in the esbuild dist dir (safe since each transpile is a single non-bundled entry point). Covered by `jsImportsTypeScript` in `MyceliumIntegrationTest.kt`.
 
-### Compile-to-JS languages (CoffeeScript, Civet, LiveScript, Elm, PureScript, ReScript) — working
+### Compile-to-JS languages (12: TypeScript, CoffeeScript, Civet, LiveScript, Elm, PureScript, ReScript, Imba, Gleam, Dart, Kotlin/JS, Scala.js) — working
 Generalized pipeline, not one-off wiring: `CompileToJsDispatcher` resolves a `CompilerSpec`
 (`CompilerRegistry`) per extension and routes through one of three `CompileToJsBackend`s —
 `EsbuildBackend` (`BUNDLED`, TypeScript only), `NpmJsApiBackend` (`JS_API`, CoffeeScript/
 Civet/LiveScript — `require()`'d into the shared GraalJS Context), `SubprocessBackend`
-(`SUBPROCESS`, Elm/PureScript/ReScript — no JS-callable compile function at all). Elm/
-PureScript/ReScript additionally get project-aware whole-project builds (`elm.json`/
-`spago.yaml`,`spago.dhall`/`rescript.json`,`bsconfig.json` found walking up from the source
-file) via `ProjectBuildRunner`, falling back to single-file compilation with documented
-limitations when no project file exists.
+(`SUBPROCESS`, Elm/PureScript/ReScript/Imba/Gleam/Dart/Kotlin-JS/Scala.js — no JS-callable
+compile function at all). Elm/PureScript/ReScript additionally get project-aware whole-project
+builds (`elm.json`/`spago.yaml`,`spago.dhall`/`rescript.json`,`bsconfig.json` found walking up
+from the source file) via `ProjectBuildRunner`, falling back to single-file compilation with
+documented limitations when no project file exists. Dart/Kotlin/Scala also get project-aware
+resolution against `tsconfig.json`-adjacent project markers where applicable.
 
 Compiler packages are resolved/downloaded via the pure-Kotlin `CompilerDownloader` (backed by
 `NpmRegistryClient` + `PackageCache`) — no `npm`/`node` subprocess needed to fetch them.
-PureScript's `spago` (a separate npm package from `purescript`/`purs`) is resolved
+PureScript's `spago` (a separate npm package from `purescript`/`purs`), Gleam's compiler
+binary (via GitHub releases, not npm — Gleam isn't published there at all), and the Dart SDK
+(via a dedicated `DartSdkDownload` `ToolSource`, not an npm package) are each resolved
 independently via `ToolResolver`/composable `ToolSource`s (project `node_modules/.bin` →
-system PATH → Mycelium's own cache → auto-download).
+system PATH → Mycelium's own cache → registry download → GitHub release → Dart SDK download).
+`ToolResolver` is now version-aware: it validates a resolved candidate binary's real version
+against a project's `package.json` constraint (`findPackageJsonConstraint`) before accepting
+it, and caches resolution results (stat+mtime-keyed) so repeated compiles skip re-probing the
+whole `ToolSource` chain.
 
 `jsImportsCoffeeScript`/`jsImportsCivet` in `MyceliumIntegrationTest.kt` were still gated on
 `npm` being on PATH from when this was first built with an actual `npm install` fallback path
-— that gate was stale (removed this session): `CompilerDownloader` never shells out to `npm`
+— that gate was stale (removed earlier session): `CompilerDownloader` never shells out to `npm`
 at all, only to the npm *registry* over HTTP, so both tests now run unconditionally (still
 need real network access to the registry the first time, cached thereafter).
 
-Investigated for addition, not added (see `CompilerRegistry.kt`'s own comment): Gleam (compiler
-isn't published to npm — it's a Rust binary via GitHub releases/Hex), Dart/dart2js (no
-self-contained npm package, needs the full Dart SDK), Kotlin/JS (needs a full classpath +
-stdlib jars), Scala.js (needs scala-cli/sbt + linker + library jars), Fable
-(`@fable-org/fable-compiler-js` needs no .NET, but its npm `bin` is a plain JS file relying on
-its own `#!/usr/bin/env node` shebang — would be the first compile-to-JS language requiring an
-external `node` install, which every other one here avoids).
+**Previously "investigated, not added" — all since landed** (see `CompilerRegistry.kt`'s own
+comment/history for the exact unblock per language): Imba (moved off `NpmJsApiBackend`'s
+`outputIsObject` contract onto `SubprocessBackend`), Gleam (`GitHubRelease` `ToolSource` instead
+of requiring an npm package), Dart/dart2js (`DartSdkDownload` `ToolSource` fetches the SDK
+directly), Kotlin/JS and Scala.js (both resolved as subprocess tools via `ToolResolver` rather
+than requiring a single JS-callable npm package).
+
+**Fable is now the only remaining "investigated, not added" candidate**:
+`@fable-org/fable-compiler-js` needs no .NET, but its npm `bin` is a plain JS file relying on
+its own `#!/usr/bin/env node` shebang — the first compile-to-JS language here that would
+require an external `node` install. Possible unblock for next session: run Fable's compiler on
+GraalJS itself instead of shelling out to a real `node` binary.
 
 ### Go — working (WASM only)
 `TinyGoSupport` (Go → WASM via `tinygo build -target=wasi`, languageId = `"wasm"`) is wired into Mycelium's default language list. `tinygo` is in `flake.nix`'s devShell. Go→LLVM was investigated and ruled out (see doc comment on `TinyGoSupport` in `Languages.kt`). `LanguageSupport` has an `outputExtension` property so the compiled-import branch keys off it instead of hardcoding `"llvm"`; Go overrides it to `"wasm"`.
@@ -295,6 +327,55 @@ implemented): don't bundle *any* Truffle language runtime or compiler in the cor
 fetch and cache them on demand per-language, JVM-mode only (native-image can't dynamically
 load Truffle languages post-build — see ROADMAP.md's "Distribution Architecture" section for
 the full native-image-vs-JVM tradeoff writeup).
+
+### Distribution architecture — THE big open decision for next session
+Current state: native-image on GraalVM CE, ~887MB binary, ~10ms startup, but slower peak
+throughput than the alternatives below. Key insight surfaced this session: **Oracle GraalVM
+(not just CE) is free to use under the GFTC license**, and is reported ~1.55x faster than CE
+at peak performance — this reopens native-image as a serious option if throughput was the
+main reason to lean toward JVM mode. Two directions to investigate next:
+1. **GraalVM native-image with runtime JIT compilation** (an experimental native-image
+   feature) — would give a V8-like model in a single native binary: fast (~10ms) startup *and*
+   JIT-quality peak performance, rather than forcing a choice between the two. V8 and LuaJIT
+   both achieve fast-startup-plus-peak-perf trivially; GraalVM should in principle be able to
+   match this, and this is the concrete mechanism to test.
+2. **Oracle GraalVM in JDK mode with dynamic Truffle-language loading** — smaller binary
+   (languages loaded as JARs on demand instead of baked in AOT), best peak performance of the
+   options considered, but JVM-class startup (~4-5s observed — needs re-measurement against a
+   properly warmed/tuned JVM cold start).
+
+Nothing here is benchmarked yet — binary size, startup time, peak throughput, and GFTC license
+compatibility with Mycelium's own distribution model all need real numbers before picking a
+lane. See ROADMAP.md's "Distribution Architecture" and "Open threads" sections for the
+longer writeup.
+
+### Rust/Go auto-install — architecture gap, not a registry-client gap
+`CratesIoClient`/`GoProxyClient` (pure-Kotlin `PackageIndex` implementations, same shape as
+the npm/RubyGems/PyPI clients) are constructed and fully able to resolve/download, but neither
+is consulted by any automatic bare-specifier resolution yet. The actual blocker:
+`RustSupport`/`TinyGoSupport` each compile a single source file straight to one standalone
+LLVM-bitcode/WASM unit (`Compiler.compile`), with no dependency-graph resolution or multi-unit
+linking step at all — there's no compile-time seam an auto-fetched crate/module's compiled
+output could plug into today without that linking architecture existing first.
+
+### Scala.js auto-download — no download `ToolSource` yet
+Scala.js currently resolves via `SystemPath` only (must already be on the user's PATH via
+scala-cli/sbt). Unlike Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`), there's no
+download-based `ToolSource` wired up for it yet — the natural next step, following the same
+pattern those two used.
+
+### Fable (F# → JS) — closest remaining compile-to-JS candidate, still blocked
+`@fable-org/fable-compiler-js` needs no .NET runtime, but its npm `bin` is a plain JS file that
+only runs via its own `#!/usr/bin/env node` shebang — the one thing every other compile-to-JS
+language in this project avoids needing. Possible unblock to try next session: run Fable's
+compiler on GraalJS itself (Mycelium's own JS engine) instead of shelling out to a real `node`
+binary.
+
+### Kotlin/JS as an in-process JVM library call
+Currently invoked as a `SUBPROCESS` backend (`kotlinc-js`). Since Mycelium is itself a
+Kotlin/JVM application, it may be possible to invoke the Kotlin/JS compiler in-process as a
+library call instead of shelling out to a separate `kotlinc-js` process — would save
+process-spawn overhead on every compile. Not yet investigated in depth.
 
 ## User preferences (for future sessions)
 

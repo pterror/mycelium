@@ -26,8 +26,6 @@ val graalVersion = "25.0.0"
 // into exactly the language jars it wants:
 //   - `:app:jvmRun` (JVM mode, see app/build.gradle.kts) defaults to JS and adds packs
 //     requested via `-Planguages=js,ruby,python,...`.
-//   - the native-image build (unaffected by any of this — see graalvmNative's `classpath(...)`
-//     wiring in app/build.gradle.kts) still bakes every language in, exactly as before.
 // `testImplementation` below still pulls in every pack unconditionally so the existing test
 // suite (which exercises JS/Ruby/Python/LLVM/WASM directly) keeps working unchanged.
 val jsLang: Configuration by configurations.creating { isCanBeConsumed = false }

@@ -1,9 +1,14 @@
 # Mycelium Roadmap
 
-*Last updated 2026-07-16 (compile-to-JS expanded to 12 languages, pure-Kotlin registry
-infrastructure, content-addressable store, version-aware tool resolution — session handoff;
-see "Open threads" below for what's next). This is the forward-looking companion to
-`TODO.md` — `TODO.md`
+*Last updated 2026-07-17 (distribution architecture — the roadmap's long-standing "big open
+decision" — resolved this session with real benchmarks: GraalJS guest JIT confirmed
+already-on in native image, JS-vs-V8 and native-image-vs-JVM-mode throughput gaps measured,
+the "Oracle GraalVM 1.55x faster than CE" claim corrected, and the 887MB-binary problem
+solved by splitting languages into on-demand Gradle configurations. Net direction: JVM mode,
+not native-image; a daemon architecture is now the open follow-on question. See "Distribution
+Architecture" and "Open threads" below.) Previous update (2026-07-16): compile-to-JS expanded
+to 12 languages, pure-Kotlin registry infrastructure, content-addressable store, version-aware
+tool resolution. This is the forward-looking companion to `TODO.md` — `TODO.md`
 is the detailed, ground-truth session log (architecture decisions, gotchas, exact test
 names); this file is the higher-altitude "what's next and in what order" view. When the
 two disagree, trust `TODO.md` and fix this file.*
@@ -183,42 +188,92 @@ Only genuinely open items remain below.*
 - JSR registry support for Deno packages — not started.
 - Strategic framing: Node compat is the trojan horse; polyglot is the payload.
 
-### Distribution Architecture — THE big open decision (see "Open threads" below for the live question)
+### Distribution Architecture — RESOLVED this session; JVM mode is the direction
 
-**Native-image vs JVM tradeoffs:**
-- **Native-image (current)**: fast startup (~10ms), single binary, but cannot dynamically load Truffle languages at runtime. All languages must be compiled in at build time. Currently ~887MB with all languages on GraalVM CE (`native-image` peaks ~17GB RAM during build, capped at `-J-Xmx8g`). CE's peak throughput is slower than Oracle GraalVM's.
-- **JVM mode**: slower startup (~200-500ms), requires JRE, but can dynamically load Truffle language JARs on demand. Enables lazy language loading and aligns better with the "every language on demand" vision.
-- **Native-image has no dylib/shared-library support** for Truffle languages — it's monolithic AOT.
-- **JVM is the more tractable path** for true on-demand language loading.
-- **Key licensing insight (this session)**: Oracle GraalVM (not just GraalVM CE) is free to use
-  under the GFTC (GraalVM Free Terms and Conditions) license, and is reported ~1.55x faster at
-  peak throughput than CE. This reopens native-image as a viable path if the throughput gap
-  was the main reason to prefer JVM mode.
-- **Experimental idea worth investigating**: GraalVM native-image with *runtime* JIT
-  compilation enabled (an experimental native-image feature) — would give a V8-like model in a
-  single native binary: fast (~10ms) startup *and* JIT-quality peak performance, rather than
-  having to choose one or the other. V8 and LuaJIT both achieve "fast startup + peak perf"
-  without this kind of tradeoff at all; GraalVM should in principle be able to match that, and
-  this is the concrete mechanism to test.
-- **Alternative**: Oracle GraalVM in JDK mode with dynamic Truffle-language loading — smaller
-  binary than native-image (languages loaded as JARs on demand, not baked in), best peak
-  performance of the options considered, but back to JVM-class startup (~4-5s observed, worse
-  than the 200-500ms cited above for a minimal JVM cold start — needs re-measurement).
-- **What actually blocks a decision**: binary size, startup time, peak throughput, and GFTC
-  license compatibility with Mycelium's own distribution — none benchmarked yet this session,
-  all four need real numbers before picking a lane.
+This was the roadmap's long-standing "big open decision." All four numbers the previous
+session flagged as blocking (binary size, startup time, peak throughput, native-image vs JVM
+mode) are now measured, and one claim carried over from the previous session (Oracle GraalVM
+"~1.55x faster than CE") has been traced to a bad comparison and corrected. Full detail and
+sourcing in `TODO.md`'s "Open threads → Distribution architecture" section; summary here:
 
-**Startup optimization (JVM path):**
-- CRaC (Coordinated Restore at Checkpoint) — snapshot running JVM, restore instantly.
-- GraalVM `--engine.CacheStore` — persist compiled Truffle code across runs.
-- AppCDS (Application Class Data Sharing) — pre-cache class loading.
-- **Open question**: how mature are these for polyglot contexts? Need benchmarking.
+- **GraalJS guest JIT is already the default in native image, not an experimental feature to
+  investigate.** The Graal compiler is statically linked into the native image and JITs hot JS
+  at runtime via partial evaluation — the exact "V8-like fast-startup-plus-peak-perf in one
+  binary" mechanism the previous session hoped to unlock by *enabling* runtime JIT. There is
+  nothing left to turn on; this closes that investigation.
+- **GraalJS is structurally ~1.5-2x slower than V8 in aggregate** (Octane: V8 39,145 vs
+  GraalJS 22,350), and the gap can blow out to 80x on non-loop-heavy workloads (tight numeric
+  loops are the exception, where GraalJS can win — e.g. RayTrace). This doesn't change with
+  native-image vs JVM mode or any JIT-tuning flag — it's the engine, not the packaging.
+  **JS performance is conceded**; the polyglot story (every ecosystem, one process, no FFI) is
+  the value proposition Mycelium is actually selling.
+- **Native-image has lower peak throughput than JVM mode even after guest JIT warmup** —
+  confirmed, not assumed. Root cause: Substrate VM's simpler GC, no compressed OOPs, and
+  general HotSpot maturity Substrate VM hasn't matched. TruffleRuby's own docs recommend
+  `--jvm` over native-image for throughput-sensitive production use, independently confirming
+  the same conclusion Mycelium reached by benchmarking.
+- **Correction: the "Oracle GraalVM ~1.55x faster than CE" claim from the previous session was
+  wrong.** That number was Oracle GraalVM in *JVM mode* vs *OpenJDK 8* on Renaissance
+  (geomean) — not Oracle **native image** vs CE **native image**, which is the comparison that
+  would actually have mattered here. There is no confirmed Oracle-vs-CE native-image
+  throughput multiplier. Any surviving reference elsewhere to "1.55x faster than CE" is this
+  same error and should be treated as retracted.
+- **The 887MB binary-size problem is solved**, independent of the native-image-vs-JVM question:
+  languages are now split into per-language Gradle configurations rather than baked into one
+  binary. Core runtime is **22MB** (19 JARs) with **zero** languages included. GraalJS alone
+  adds 47MB (8 JARs). Full polyglot (every language) is 709MB across 71 JARs — same ballpark
+  as before, but now opt-in per deployment (`-Planguages=js,ruby,python`) rather than forced.
+- **`./gradlew :app:jvmRun` already works** — confirmed this session, ~0.9s cold startup. This
+  is JVM mode, already functional, and is the vehicle the on-demand per-language JAR loading
+  above depends on (native-image cannot dynamically load a Truffle language at runtime — see
+  below — so on-demand loading is JVM-mode-only by construction).
 
-**Binary size strategy:**
-- Do NOT bundle any Truffle language runtimes OR compilers in the core binary.
-- Core binary = Mycelium runtime (Kotlin/JVM) + InterceptingFileSystem + module resolution + CLI.
-- ALL languages (including JS) fetched and cached on demand when first encountered.
-- Target: core binary dramatically smaller than current ~887MB.
+**Net direction:** JVM mode, not native-image. The open follow-on is startup-cost amortization
+for CLI-style single-shot invocations, now scoped as an optional daemon — see "Open threads"
+below.
+
+**Follow-up (this session): native-image build config physically removed.** The
+`org.graalvm.buildtools.native` plugin and `graalvmNative { }` block are gone from
+`app/build.gradle.kts` — it wasn't just de-emphasized, it no longer exists. `./gradlew
+:app:jvmRun` (and plain `:app:run` for the bare core) are now the only run paths; see
+`TODO.md`'s "Native-image removed" section for the detail.
+
+**Structural facts that don't change with the above** (native-image vs JVM tradeoffs, for
+reference):
+- **Native-image**: fast startup (~10ms cited previously, not re-measured against the new
+  split-JAR core this session), single binary, but cannot dynamically load Truffle languages
+  at runtime — languages must be compiled in at build time. No dylib/shared-library support
+  for Truffle languages; it's monolithic AOT.
+- **JVM mode**: ~0.9s cold startup (measured this session via `:app:jvmRun`), requires a JRE,
+  but can dynamically load Truffle language JARs on demand — the split-JAR
+  `-Planguages=...` mechanism above is built on this. This is now the chosen path.
+
+**Startup optimization (JVM path, still open — daemon is now the leading direction):**
+- **Daemon mode** — new leading candidate this session; see "Open threads" below for the scoping
+  notes (XDG config, project-level overrides, optional not forced, G1 tuning for memory
+  reclamation). Not yet implemented.
+- CRaC (Coordinated Restore at Checkpoint) — snapshot running JVM, restore instantly. Not
+  investigated this session; still an option if a daemon proves insufficient or undesirable.
+- GraalVM `--engine.CacheStore` — persist compiled Truffle code across runs. Not investigated.
+- AppCDS (Application Class Data Sharing) — pre-cache class loading. Not investigated.
+
+**Memory reclamation (benchmarked this session, feeds daemon-mode tuning):**
+G1 GC with `-XX:+UseG1GC -XX:G1PeriodicGCInterval=1000 -XX:MinHeapFreeRatio=10
+-XX:MaxHeapFreeRatio=20` reclaims aggressively after a load spike — peak 1914MB → 187MB idle
+within 30s. Default (untuned) G1 holds onto memory, similar to how Gradle's daemon behaves.
+ZGC was tried and was surprisingly *worse* for this workload (held more memory) — a negative
+result worth remembering before reaching for ZGC as the obvious "give memory back" choice.
+
+**Binary size strategy — DONE (see above):**
+- No Truffle language runtimes or compilers in the core binary — implemented via per-language
+  Gradle configurations, not just a stated intent.
+- Core binary = Mycelium runtime (Kotlin/JVM) + InterceptingFileSystem + module resolution +
+  CLI — measured at 22MB.
+- Languages (including JS) loaded on demand via `-Planguages=...`, not fetched-and-cached at
+  first encounter as originally envisioned — the mechanism landed as a build-time
+  configuration choice rather than a runtime fetch; runtime on-demand fetching of a language
+  runtime itself (as opposed to a language's *packages*) is not implemented and not currently
+  planned to be — worth flagging if that distinction matters for a future session.
 
 ### Python support — blocked on upstream
 GraalPython crashes (`SystemError: Unable to set dict of object of type foreign`, now a host
@@ -377,13 +432,23 @@ new libraries, (2) most high-value npm packages that truly require native code a
 ### Distribution
 - Nix flake — **current**, but flake-only is explicitly considered unacceptable as the sole
   distribution channel.
-- Native image — **current**, ~887MB, self-contained but oversized.
-- JVM fat jar (`installDist`) — **current fallback**, ~709MB, needs a JRE.
+- **Native image — removed this session.** ~887MB with everything baked in, confirmed lower
+  peak throughput than JVM mode even after guest JIT warmup, and incompatible with the
+  on-demand per-language-JAR loading architecture (see "Distribution Architecture" above). The
+  build config (`org.graalvm.buildtools.native` plugin, `graalvmNative { }`) is gone from
+  `app/build.gradle.kts`, not just de-prioritized.
+- **JVM mode (`installDist` / `:app:jvmRun`) — now the chosen direction.** Split into a 22MB
+  core (zero languages) plus per-language Gradle configurations loaded via
+  `-Planguages=js,ruby,python,...` (GraalJS alone: 47MB); full polyglot is 709MB, same as the
+  old fat-jar figure but now opt-in rather than forced. Needs a JRE. ~0.9s cold startup
+  confirmed via `:app:jvmRun`; a daemon mode (see Open threads) is the planned way to amortize
+  that further for CLI-style usage.
 - Homebrew formula — planned.
 - Docker image — planned.
 - npm global install (`npx mycelium run app.js`) — planned; the irony is intentional.
-- Standalone per-platform binary (Linux/macOS/Windows) — the actual goal; neither current
-  option (native-image size, fat-jar's JRE dependency) is fully satisfying yet.
+- Standalone per-platform binary (Linux/macOS/Windows) — still the long-run goal for a
+  single-file artifact; the split-JAR JVM-mode approach above is the near-term answer to "how
+  do I not ship 887MB," not a substitute for eventually having one.
 
 ---
 
@@ -401,29 +466,49 @@ new libraries, (2) most high-value npm packages that truly require native code a
 
 ## Open threads (this session's handoff)
 
-1. **Distribution architecture — THE big decision.** See "Distribution Architecture" above for
-   the full writeup. Summary: currently native-image on GraalVM CE (887MB, ~10ms startup,
-   slower peak perf than the alternatives). Oracle GraalVM is free (GFTC) and ~1.55x faster
-   than CE at peak throughput. Two directions to investigate next session: (a) GraalVM
-   native-image with experimental runtime JIT compilation, which could give V8-like
-   fast-startup-plus-peak-perf in one native binary; (b) Oracle GraalVM JDK mode with dynamic
-   Truffle-language loading — smaller binary, best peak perf, but ~4-5s startup. Need real
-   benchmarks on binary size, startup time, peak performance, and to confirm GFTC license
-   compatibility before picking a lane.
-2. **Rust/Go auto-install** — `CratesIoClient`/`GoProxyClient` registry clients exist and can
+1. **Distribution architecture — RESOLVED this session.** See "Distribution Architecture"
+   above for the full writeup. Net direction: JVM mode, not native-image (native-image's peak
+   throughput trails JVM mode even with guest JIT warmed up; GraalJS itself trails V8 by a
+   structural, unfixable-by-packaging 1.5-2x in aggregate, so JS performance is conceded and
+   the polyglot story is the value prop). The 887MB binary problem is solved independently via
+   per-language Gradle configurations (22MB core, languages on demand). The "Oracle GraalVM
+   1.55x faster than CE" claim from the prior session was a bad comparison (JVM-mode-vs-OpenJDK-8,
+   not native-image-vs-native-image) and is retracted. **What replaces this as the open
+   question**: see "Daemon architecture" below — JVM mode's ~0.9s cold start is now the
+   remaining cost to amortize for CLI-style usage.
+2. **Daemon architecture — new this session, unresolved.** With JVM mode as the chosen
+   direction, an optional long-lived daemon process (amortizing JVM/Context startup across
+   invocations, à la the Gradle daemon or nailgun) is the natural next step for CLI-style
+   single-shot usage. Must work with or without the daemon (user's choice, never forced);
+   config should be XDG-compliant (`~/.config/mycelium/`) with project-local overrides taking
+   precedence; the G1 GC tuning flags benchmarked this session
+   (`-XX:+UseG1GC -XX:G1PeriodicGCInterval=1000 -XX:MinHeapFreeRatio=10
+   -XX:MaxHeapFreeRatio=20`, reclaiming 1914MB peak → 187MB idle in 30s) are the starting
+   point for keeping a long-lived daemon's memory footprint down. IPC transport, request
+   framing, and process lifecycle (start/stop/idle-timeout) are all undesigned — this is a
+   scoping note, not a plan yet.
+3. **Inter-core-module import problem — new this session, architecture gap.** Node core
+   modules (`stream.mjs`, `http.mjs`, etc.) are loaded as standalone synthetic ESM resources
+   and cannot `import` each other. Concretely: `EventEmitter` is duplicated inline in every
+   core module that needs it rather than shared via import. Works today because the
+   duplication is small, but any `EventEmitter` behavioral fix has to be applied in every
+   copy, and this gets worse as more core modules need to share logic. Needs a fix in the
+   core-module loader (`CoreModuleRegistry.kt`/`InterceptingFileSystem.kt`) to let one
+   synthetic `.mjs` shim import another by core-module specifier. Not started.
+4. **Rust/Go auto-install** — `CratesIoClient`/`GoProxyClient` registry clients exist and can
    resolve/download, but there's no linking stage for compiled output yet; `RustSupport`/
    `TinyGoSupport` each compile a single source file straight to one standalone unit with no
    multi-unit/dependency linking, so there's no seam an auto-fetched crate/module's compiled
    output could plug into today. Architecture gap, not a registry-client gap.
-3. **Scala.js auto-download** — resolved via `SystemPath` only right now; no download
+5. **Scala.js auto-download** — resolved via `SystemPath` only right now; no download
    `ToolSource` (no GitHub-release or SDK-download equivalent wired up) for Scala.js yet, unlike
    Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`).
-4. **Fable (F# → JS)** — the closest remaining compile-to-JS candidate, still blocked because
+6. **Fable (F# → JS)** — the closest remaining compile-to-JS candidate, still blocked because
    `@fable-org/fable-compiler-js`'s npm `bin` only runs via its own `#!/usr/bin/env node`
    shebang, requiring a real external Node install (the one thing every other compile-to-JS
    language here avoids). Possible unblock to explore: run Fable's compiler on GraalJS itself
    instead of shelling out to a real `node` binary.
-5. **Kotlin/JS as an in-process JVM library call** — currently invoked as a `SUBPROCESS`
+7. **Kotlin/JS as an in-process JVM library call** — currently invoked as a `SUBPROCESS`
    (`kotlinc-js`), but since Mycelium is itself a Kotlin/JVM application, it may be possible to
    invoke the Kotlin/JS compiler as an in-process library call instead of shelling out, saving
    process-spawn overhead per compile.
@@ -438,9 +523,13 @@ These don't have an owner or a target yet — tracked so they aren't lost.
   marked deprecated upstream ("retained only for Maven compatibility"), so this ceiling may
   become a forced migration rather than a choice. Revisit when upstream either publishes
   matching 25.1.x Ruby/LLVM artifacts or confirms they're gone for good.
-- **Distribution weight**: is GraalVM's ~700–900MB footprint simply the acceptable cost of
-  the polyglot architecture, or is a trimming strategy (e.g. a smaller native-image profile,
-  module exclusion) worth investing in before pursuing Homebrew/Docker/npm distribution?
+- **Distribution weight — largely resolved this session.** The ~700-900MB footprint is not an
+  acceptable-cost-of-polyglot fact of life after all: splitting into a 22MB core plus
+  per-language Gradle configurations (`-Planguages=...`) means most deployments never pay the
+  full weight — only an intentional full-polyglot build does. What's still open: whether to
+  also pursue trimming *within* a single language's JAR set (e.g. GraalJS's own 47MB), and
+  whether Homebrew/Docker/npm distribution should ship the slim core with languages fetched
+  on first use, or a few pre-bundled "common languages" variants — not decided yet.
 
 ---
 

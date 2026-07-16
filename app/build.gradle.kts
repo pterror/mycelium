@@ -1,13 +1,11 @@
 plugins {
     id("buildlogic.kotlin-application-conventions")
-    id("org.graalvm.buildtools.native") version "0.10.4"
 }
 
 // Forces :library's build.gradle.kts to be evaluated before this file finishes configuring
 // — needed so the `project(":library").configurations.getByName("rubyLang")` (etc.) lookups
-// below, both in the `jvmRun` task and in the `graalvmNative` block, can find the
-// per-language-pack Configurations :library declares, rather than racing Gradle's default
-// (unspecified) cross-project configuration order.
+// in the `jvmRun` task below can find the per-language-pack Configurations :library declares,
+// rather than racing Gradle's default (unspecified) cross-project configuration order.
 evaluationDependsOn(":library")
 
 dependencies {
@@ -28,6 +26,8 @@ application {
 // runtimeClasspath — now carries only the language-agnostic Truffle/polyglot framework
 // with NO languages at all. This task is therefore the "bare core" execution path;
 // use `jvmRun` below (which defaults to JS) for actual script execution.
+//
+// `jvmRun` (JVM mode) is the primary way to run Mycelium — see its doc comment below.
 tasks.named<JavaExec>("run") {
     workingDir = rootDir
 }
@@ -75,25 +75,5 @@ val jvmRun by tasks.registering(JavaExec::class) {
                     languagePackConfigNames.keys.sorted().joinToString(", ")
             )
         classpath += project(":library").configurations.getByName(configName)
-    }
-}
-
-graalvmNative {
-    binaries {
-        named("main") {
-            mainClass.set("org.mycelium.app.AppKt")
-            imageName.set("mycelium")
-            buildArgs.add("--initialize-at-build-time")
-            buildArgs.add("-H:+ReportExceptionStackTraces")
-            buildArgs.add("-J-Xmx8g")
-            // The native-image build path is unaffected by the compileOnly split above —
-            // it still bakes in every language, exactly as before that split — by
-            // explicitly adding each language pack Configuration to the native-image
-            // classpath here (they no longer arrive transitively via `implementation` now
-            // that library/build.gradle.kts moved them to `compileOnly`).
-            for (configName in languagePackConfigNames.values) {
-                classpath(project(":library").configurations.getByName(configName))
-            }
-        }
     }
 }

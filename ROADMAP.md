@@ -96,10 +96,25 @@ the acid-test punch list above — new ones surface via Round 4.
 - JSR registry support for Deno packages — not started.
 - Strategic framing: Node compat is the trojan horse; polyglot is the payload.
 
-### Native-image binary size reduction
-Currently ~887MB (`native-image` peaks ~17GB RAM during build, capped at `-J-Xmx8g`). No
-concrete plan yet — open question whether GraalVM's weight is simply the cost of admission
-or a lighter packaging path exists.
+### Distribution Architecture
+
+**Native-image vs JVM tradeoffs:**
+- **Native-image**: fast startup (~10ms), single binary, but cannot dynamically load Truffle languages at runtime. All languages must be compiled in at build time. Currently ~887MB with all languages (`native-image` peaks ~17GB RAM during build, capped at `-J-Xmx8g`).
+- **JVM mode**: slower startup (~200-500ms), requires JRE, but can dynamically load Truffle language JARs on demand. Enables lazy language loading and aligns better with the "every language on demand" vision.
+- **Native-image has no dylib/shared-library support** for Truffle languages — it's monolithic AOT.
+- **JVM is the more tractable path** for true on-demand language loading.
+
+**Startup optimization (JVM path):**
+- CRaC (Coordinated Restore at Checkpoint) — snapshot running JVM, restore instantly.
+- GraalVM `--engine.CacheStore` — persist compiled Truffle code across runs.
+- AppCDS (Application Class Data Sharing) — pre-cache class loading.
+- **Open question**: how mature are these for polyglot contexts? Need benchmarking.
+
+**Binary size strategy:**
+- Do NOT bundle any Truffle language runtimes OR compilers in the core binary.
+- Core binary = Mycelium runtime (Kotlin/JVM) + InterceptingFileSystem + module resolution + CLI.
+- ALL languages (including JS) fetched and cached on demand when first encountered.
+- Target: core binary dramatically smaller than current ~887MB.
 
 ### Python support — blocked on upstream
 GraalPython crashes (`SystemError: Unable to set dict of object of type foreign`, now a host
@@ -127,10 +142,23 @@ Any language that compiles to JS runs on Mycelium today via the existing esbuild
 TS pipeline pattern, and gets full JS-ecosystem access plus every other language Mycelium
 supports.
 
+**Compiler Resolution Strategy:**
+- **Version resolution**: Resolve compiler version from project config (`package.json`, `mycelium.toml`, etc.).
+- **Prebuilt download**: Download prebuilt from appropriate registry (npm, crates.io, PyPI, etc.).
+- **Caching**: Cache in `XDG_CACHE_HOME/mycelium/compilers/<lang>/<version>/`.
+- **Git as fallback only**: Git clone for compilers not published to registries — NOT the default. Git requires build from source (slow, needs build deps) and full clone may exceed individual release tarball size.
+- **Lazy loading model**: First time a file extension is encountered, fetch the appropriate compiler/runtime. Cache persists across runs — subsequent runs are offline. Users can eagerly pre-fetch via `mycelium install-language ruby` or similar.
+- **Resolution flow**: Extension mapping → language → compiler resolution → fetch → cache → compile.
+
+**Open question: Is Mycelium a CLI tool or a runtime?**
+- CLI tool: startup time matters (native-image wins).
+- Runtime/server: throughput matters (JVM is competitive, within 10-20% of C).
+- Likely both — JVM with startup optimizations may be the pragmatic answer.
+
 **Note**: Potentially more tractable than FFI work, but NOT as simple as just wiring in a
 compiler command — significant design decisions pending around: module resolution semantics
 per language, source-map fidelity for cross-language debugging, error attribution, and
-per-language build-cache strategies. **Mark as needing design discussion before implementation.**
+per-language build-cache strategies.
 
 - TypeScript — **done**.
 - CoffeeScript, Civet — planned.

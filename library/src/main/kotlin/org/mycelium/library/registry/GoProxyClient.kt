@@ -1,10 +1,7 @@
 package org.mycelium.library.registry
 
 import org.json.JSONObject
-import java.net.URI
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 
 // Go module proxy client — mirrors rhizone's Go index (normalize-package-index/src/index/go.rs):
@@ -28,22 +25,29 @@ class GoProxyClient(
     private fun encodeModulePath(module: String): String =
         module.map { c -> if (c.isUpperCase()) "!${c.lowercaseChar()}" else c.toString() }.joinToString("")
 
-    private fun get(path: String): HttpResponse<String> {
-        val request = HttpRequest.newBuilder(URI.create("$proxyBase$path"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "mycelium (pure-kotlin go proxy client)")
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build()
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-    }
+    // Same freshness window as the other registry clients — see NpmRegistryClient.metadataMaxAge.
+    private val metadataMaxAge: Duration = Duration.ofMinutes(5)
+
+    // Metadata documents (@latest/@v/*.info JSON, the @v/list plain-text version list, and
+    // @v/*.mod go.mod text) are cached to disk via HttpMetadataCache, keyed by ecosystem
+    // ("go") + request path, with conditional revalidation on cache misses/expiry. The
+    // module source .zip archives are handled separately by PackageCache and never go
+    // through this cache.
+    private fun get(path: String): HttpMetadataCache.Result =
+        HttpMetadataCache.fetch(
+            httpClient = httpClient,
+            ecosystem = ecosystem,
+            cacheKey = path,
+            url = "$proxyBase$path",
+            maxAge = metadataMaxAge,
+        )
 
     override fun fetchMeta(name: String, version: String?): PackageMeta {
         val encoded = encodeModulePath(name)
         val path = if (version == null || version == "latest") "/$encoded/@latest" else "/$encoded/@v/$version.info"
         val response = get(path)
-        if (response.statusCode() == 404 || response.statusCode() == 410) throw PackageNotFoundException(name, version)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404 || response.statusCode == 410) throw PackageNotFoundException(name, version)
+        val doc = JSONObject(response.body)
         val resolvedVersion = doc.optString("Version").takeIf { it.isNotEmpty() }
             ?: throw PackageNotFoundException(name, version)
 
@@ -62,8 +66,8 @@ class GoProxyClient(
     override fun fetchVersions(name: String): List<VersionMeta> {
         val encoded = encodeModulePath(name)
         val response = get("/$encoded/@v/list")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val versions = response.body().lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val versions = response.body.lines().map { it.trim() }.filter { it.isNotEmpty() }
         if (versions.isEmpty()) throw PackageNotFoundException(name)
         return versions.map { VersionMeta(version = it) }
     }
@@ -74,10 +78,10 @@ class GoProxyClient(
     // not ranges, so the "range" half of PackageMeta.dependencies is just that version string).
     private fun fetchDependencies(encodedModule: String, version: String): Map<String, String> {
         val response = get("/$encodedModule/@v/$version.mod")
-        if (response.statusCode() != 200) return emptyMap()
+        if (response.statusCode != 200) return emptyMap()
         val deps = LinkedHashMap<String, String>()
         var inBlock = false
-        for (rawLine in response.body().lines()) {
+        for (rawLine in response.body.lines()) {
             val line = rawLine.substringBefore("//").trim()
             if (line.isEmpty()) continue
             if (line == "require (") {

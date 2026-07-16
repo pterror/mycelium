@@ -2,10 +2,7 @@ package org.mycelium.library.registry
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 
 // RubyGems client — mirrors rhizone's Gem index (normalize-package-index/src/index/gem.rs):
@@ -22,15 +19,21 @@ class RubyGemsClient(
 ) : PackageIndex {
     override val ecosystem: String = "rubygems"
 
-    private fun get(path: String, base: String = apiBase): HttpResponse<String> {
-        val request = HttpRequest.newBuilder(URI.create("$base$path"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "mycelium (pure-kotlin rubygems client)")
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build()
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-    }
+    // Same freshness window as the other registry clients — see NpmRegistryClient.metadataMaxAge.
+    private val metadataMaxAge: Duration = Duration.ofMinutes(5)
+
+    // Metadata documents (gem info/version-list JSON) are cached to disk via
+    // HttpMetadataCache, keyed by ecosystem ("rubygems") + request path, with conditional
+    // revalidation on cache misses/expiry. Tarball (.gem) downloads are handled separately
+    // by PackageCache and never go through this cache.
+    private fun get(path: String, base: String = apiBase): HttpMetadataCache.Result =
+        HttpMetadataCache.fetch(
+            httpClient = httpClient,
+            ecosystem = ecosystem,
+            cacheKey = path,
+            url = "$base$path",
+            maxAge = metadataMaxAge,
+        )
 
     override fun fetchMeta(name: String, version: String?): PackageMeta {
         // /api/v1/gems/{name}.json always describes the current (latest non-prerelease)
@@ -39,8 +42,8 @@ class RubyGemsClient(
         // override the version-specific fields (tarball URL, checksum) when an older/other
         // version was explicitly requested.
         val response = get("/gems/$name.json")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val doc = JSONObject(response.body)
         val latestVersion = doc.optString("version").takeIf { it.isNotEmpty() }
             ?: throw PackageNotFoundException(name)
 
@@ -55,8 +58,8 @@ class RubyGemsClient(
             // gems.json only describes the latest version; look up the requested version's
             // checksum (and confirm it actually exists) in the version-history endpoint.
             val versionsResponse = get("/versions/$name.json")
-            if (versionsResponse.statusCode() == 404) throw PackageNotFoundException(name, resolvedVersion)
-            val versions = JSONArray(versionsResponse.body())
+            if (versionsResponse.statusCode == 404) throw PackageNotFoundException(name, resolvedVersion)
+            val versions = JSONArray(versionsResponse.body)
             val match = (0 until versions.length())
                 .map { versions.getJSONObject(it) }
                 .firstOrNull { it.optString("number") == resolvedVersion }
@@ -84,8 +87,8 @@ class RubyGemsClient(
 
     override fun fetchVersions(name: String): List<VersionMeta> {
         val response = get("/versions/$name.json")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val versions = JSONArray(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val versions = JSONArray(response.body)
         return (0 until versions.length()).map { i ->
             val v = versions.getJSONObject(i)
             VersionMeta(

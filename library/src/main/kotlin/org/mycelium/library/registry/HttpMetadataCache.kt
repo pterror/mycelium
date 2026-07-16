@@ -59,7 +59,12 @@ object HttpMetadataCache {
         file.writeText(json.toString())
     }
 
-    data class Result(val body: String, val fromCache: Boolean)
+    // `statusCode` is the *logical* status the caller should act on: a real cache hit (fresh
+    // within `maxAge`, or revalidated via a 304) is reported as 200 even though no live
+    // response (or a bodiless 304) actually came back, so callers can branch on
+    // `result.statusCode == 404` exactly as they would on a raw HttpResponse without having
+    // to know whether the cache served the answer.
+    data class Result(val body: String, val fromCache: Boolean, val statusCode: Int)
 
     // Fetches `url`, using a locally cached copy when it's fresh (`maxAge`), or validating
     // it with a conditional request (304 -> reuse cached body) otherwise. Falls back to an
@@ -78,7 +83,7 @@ object HttpMetadataCache {
         if (meta != null && dataFile.isFile) {
             val age = Instant.now().epochSecond - meta.cachedAt
             if (age in 0..maxAge.seconds) {
-                return Result(dataFile.readText(), fromCache = true)
+                return Result(dataFile.readText(), fromCache = true, statusCode = 200)
             }
         }
 
@@ -86,7 +91,10 @@ object HttpMetadataCache {
             .header("Accept", "application/json")
             .header("User-Agent", "mycelium (pure-kotlin package index client)")
             .timeout(Duration.ofSeconds(30))
-        extraHeaders.forEach { (k, v) -> requestBuilder.header(k, v) }
+        // setHeader (not header) so an ecosystem-specific override — e.g. crates.io's
+        // required descriptive User-Agent — replaces this method's default value instead of
+        // being sent as a second, additional header line of the same name.
+        extraHeaders.forEach { (k, v) -> requestBuilder.setHeader(k, v) }
         if (meta?.etag != null) requestBuilder.header("If-None-Match", meta.etag)
         if (meta?.lastModified != null) requestBuilder.header("If-Modified-Since", meta.lastModified)
 
@@ -94,7 +102,7 @@ object HttpMetadataCache {
 
         if (response.statusCode() == 304 && dataFile.isFile) {
             writeMeta(ecosystem, cacheKey, meta!!.copy(cachedAt = Instant.now().epochSecond))
-            return Result(dataFile.readText(), fromCache = true)
+            return Result(dataFile.readText(), fromCache = true, statusCode = 200)
         }
 
         val body = response.body()
@@ -111,6 +119,6 @@ object HttpMetadataCache {
                 ),
             )
         }
-        return Result(body, fromCache = false)
+        return Result(body, fromCache = false, statusCode = response.statusCode())
     }
 }

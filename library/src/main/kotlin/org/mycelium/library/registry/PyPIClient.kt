@@ -2,10 +2,7 @@ package org.mycelium.library.registry
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 
 // PyPI client — mirrors rhizone's PipIndex (normalize-package-index/src/index/pip.rs): GET
@@ -22,21 +19,27 @@ class PyPIClient(
 ) : PackageIndex {
     override val ecosystem: String = "pypi"
 
-    private fun get(path: String): HttpResponse<String> {
-        val request = HttpRequest.newBuilder(URI.create("$apiBase$path"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "mycelium (pure-kotlin pypi client)")
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build()
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-    }
+    // Same freshness window as the other registry clients — see NpmRegistryClient.metadataMaxAge.
+    private val metadataMaxAge: Duration = Duration.ofMinutes(5)
+
+    // Metadata documents (package/version JSON) are cached to disk via HttpMetadataCache,
+    // keyed by ecosystem ("pypi") + request path, with conditional revalidation on cache
+    // misses/expiry. Distribution file downloads are handled separately by PackageCache and
+    // never go through this cache.
+    private fun get(path: String): HttpMetadataCache.Result =
+        HttpMetadataCache.fetch(
+            httpClient = httpClient,
+            ecosystem = ecosystem,
+            cacheKey = path,
+            url = "$apiBase$path",
+            maxAge = metadataMaxAge,
+        )
 
     override fun fetchMeta(name: String, version: String?): PackageMeta {
         val path = if (version == null || version == "latest") "/$name/json" else "/$name/$version/json"
         val response = get(path)
-        if (response.statusCode() == 404) throw PackageNotFoundException(name, version)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name, version)
+        val doc = JSONObject(response.body)
         val info = doc.optJSONObject("info") ?: throw PackageNotFoundException(name, version)
         val resolvedVersion = info.optString("version").takeIf { it.isNotEmpty() }
             ?: version ?: throw PackageNotFoundException(name, version)
@@ -67,8 +70,8 @@ class PyPIClient(
 
     override fun fetchVersions(name: String): List<VersionMeta> {
         val response = get("/$name/json")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val doc = JSONObject(response.body)
         val releases = doc.optJSONObject("releases") ?: throw PackageNotFoundException(name)
         return releases.keySet().map { v ->
             val files = releases.optJSONArray(v)

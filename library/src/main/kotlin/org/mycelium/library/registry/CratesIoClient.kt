@@ -2,10 +2,7 @@ package org.mycelium.library.registry
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 
 // crates.io client — mirrors rhizone's CargoIndex (normalize-package-index/src/index/cargo.rs):
@@ -21,20 +18,30 @@ class CratesIoClient(
 ) : PackageIndex {
     override val ecosystem: String = "crates"
 
-    private fun get(path: String): HttpResponse<String> {
-        val request = HttpRequest.newBuilder(URI.create("$apiBase$path"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "mycelium (pure-kotlin crates.io client; https://github.com/mycelium)")
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build()
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-    }
+    // Same freshness window as the other registry clients — see NpmRegistryClient.metadataMaxAge.
+    private val metadataMaxAge: Duration = Duration.ofMinutes(5)
+
+    // Metadata documents (crate/version/dependency JSON) are cached to disk via
+    // HttpMetadataCache, keyed by ecosystem ("crates") + request path, with conditional
+    // revalidation on cache misses/expiry (crates.io's descriptive User-Agent requirement
+    // still applies to the underlying request HttpMetadataCache issues). Crate downloads
+    // are handled separately by PackageCache and never go through this cache.
+    private fun get(path: String): HttpMetadataCache.Result =
+        HttpMetadataCache.fetch(
+            httpClient = httpClient,
+            ecosystem = ecosystem,
+            cacheKey = path,
+            url = "$apiBase$path",
+            maxAge = metadataMaxAge,
+            extraHeaders = mapOf(
+                "User-Agent" to "mycelium (pure-kotlin crates.io client; https://github.com/mycelium)",
+            ),
+        )
 
     override fun fetchMeta(name: String, version: String?): PackageMeta {
         val response = get("/crates/$name")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val doc = JSONObject(response.body)
         val crate = doc.optJSONObject("crate") ?: throw PackageNotFoundException(name)
         val versions = doc.optJSONArray("versions") ?: JSONArray()
 
@@ -69,8 +76,8 @@ class CratesIoClient(
 
     override fun fetchVersions(name: String): List<VersionMeta> {
         val response = get("/crates/$name")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val doc = JSONObject(response.body())
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val doc = JSONObject(response.body)
         val versions = doc.optJSONArray("versions") ?: throw PackageNotFoundException(name)
         return (0 until versions.length()).map { i ->
             val v = versions.getJSONObject(i)
@@ -87,8 +94,8 @@ class CratesIoClient(
     // semver "req" range like npm's package.json dependency ranges).
     private fun fetchDependencies(name: String, version: String): Map<String, String> {
         val response = get("/crates/$name/$version/dependencies")
-        if (response.statusCode() != 200) return emptyMap()
-        val deps = JSONObject(response.body()).optJSONArray("dependencies") ?: return emptyMap()
+        if (response.statusCode != 200) return emptyMap()
+        val deps = JSONObject(response.body).optJSONArray("dependencies") ?: return emptyMap()
         return (0 until deps.length())
             .map { deps.getJSONObject(it) }
             .filter { it.optString("kind") == "normal" }

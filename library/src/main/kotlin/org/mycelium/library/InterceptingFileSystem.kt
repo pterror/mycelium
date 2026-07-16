@@ -272,8 +272,7 @@ class InterceptingFileSystem : FileSystem {
     internal fun computeRubySearchPaths(): List<Path> = rubyModuleResolver.computeRubySearchPaths()
 
     // `--yolo` support: when a bare specifier can't be found in any node_modules tree,
-    // shell out to `npm install <packageName>` (falling back to `pnpm install` if npm
-    // isn't on PATH) in the entry file's own directory, then let the caller retry
+    // install `packageName` in the entry file's own directory, then let the caller retry
     // resolution. The install directory is the *topmost* entry on the source-directory
     // stack (i.e. the running file's own directory, not whichever nested file happens to
     // be importing the missing package) so packages always land in the project root's
@@ -281,9 +280,28 @@ class InterceptingFileSystem : FileSystem {
     // install` is normally invoked from a project's root. Falls back to the process's
     // cwd if the stack is empty (e.g. installing while evaluating inline code rather than
     // a file via runFile).
+    //
+    // Tries the pure-Kotlin path first (PackageInstaller, backed by NpmRegistryClient +
+    // PackageCache — no subprocess) and only falls back to shelling out to `npm
+    // install`/`pnpm install` if that fails (e.g. a semver-range edge case the
+    // pure-Kotlin path's simplified version resolution can't handle — see
+    // PackageInstaller's TODO(semver) — or any other network/registry hiccup), so
+    // installing a single missing package no longer requires npm/pnpm to be present at
+    // all in the common case.
     private fun yoloInstall(packageName: String) {
         val installDir = (sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()).toFile()
         System.err.println("mycelium: installing $packageName...")
+        try {
+            org.mycelium.library.registry.PackageInstaller.installPackageTree(
+                packageName, null, installDir.toPath().resolve("node_modules")
+            )
+            return
+        } catch (e: Exception) {
+            System.err.println(
+                "mycelium: pure-Kotlin install of '$packageName' failed (${e.message ?: e}), " +
+                    "falling back to npm/pnpm..."
+            )
+        }
         val exitCode = runInstallCommand(listOf("npm", "install", packageName), installDir)
             ?: runInstallCommand(listOf("pnpm", "install", packageName), installDir)
             ?: throw MyceliumException("mycelium: --yolo requires npm or pnpm to be installed")

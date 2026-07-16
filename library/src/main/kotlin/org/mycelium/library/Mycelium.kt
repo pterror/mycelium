@@ -7,7 +7,7 @@ import org.graalvm.polyglot.io.IOAccess
 
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
-        JsSupport, CoffeeSupport, CivetSupport, RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport
+        JsSupport, CoffeeSupport, CivetSupport, LiveScriptSupport, RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport
     ),
     // When true, a bare specifier that can't be resolved against any existing
     // node_modules tree triggers an automatic `npm install`/`pnpm install` of the
@@ -182,12 +182,22 @@ class Mycelium(
 
     // The declarative counterpart to `--yolo`: before running a file, check whether the
     // nearest ancestor `package.json` declares any dependencies and, if so, whether
-    // `node_modules` is missing or empty there. If both hold, run `npm install` (falling
-    // back to `pnpm install`) in that directory so the declared dependencies are present
-    // before the entry file's own imports get a chance to fail. Runs unconditionally
-    // (irrespective of `--yolo`) unless `autoInstall` is false (the app's `--no-install`
-    // flag) — installing exactly what a manifest already declares doesn't carry the same
-    // "install whatever a bare import happens to resolve to" risk `--yolo` does.
+    // `node_modules` is missing or empty there. If both hold, install the declared
+    // dependencies in that directory so they're present before the entry file's own
+    // imports get a chance to fail. Runs unconditionally (irrespective of `--yolo`)
+    // unless `autoInstall` is false (the app's `--no-install` flag) — installing exactly
+    // what a manifest already declares doesn't carry the same "install whatever a bare
+    // import happens to resolve to" risk `--yolo` does.
+    //
+    // Tries the pure-Kotlin path first (PackageInstaller, backed by NpmRegistryClient +
+    // PackageCache — no subprocess), resolving `dependencies` and `devDependencies`
+    // (merged, "dependencies" taking priority on name collisions) and their own
+    // transitive dependencies recursively, hardlinked into `node_modules`. Falls back to
+    // shelling out to `npm install`/`pnpm install` only if that fails (e.g. a
+    // semver-range edge case the pure-Kotlin path's simplified version resolution can't
+    // handle — see PackageInstaller's TODO(semver) — or any other network/registry
+    // hiccup), so a plain `package.json`-driven install no longer requires npm/pnpm to
+    // be present at all in the common case.
     private fun maybeInstallDependencies(startDir: File) {
         val pkgDir = findPackageJsonDir(startDir) ?: return
         val pkgJsonFile = File(pkgDir, "package.json")
@@ -204,6 +214,17 @@ class Mycelium(
         if (!nodeModulesIsEmpty) return
 
         System.err.println("mycelium: installing dependencies from package.json...")
+        try {
+            val dependencies = packageJsonDependencies(pkgJsonText)
+            org.mycelium.library.registry.PackageInstaller.installDependencies(dependencies, nodeModules.toPath())
+            return
+        } catch (e: Exception) {
+            System.err.println(
+                "mycelium: pure-Kotlin dependency install failed (${e.message ?: e}), " +
+                    "falling back to npm/pnpm..."
+            )
+        }
+
         val exitCode = runInstallCommand(listOf("npm", "install"), pkgDir)
             ?: runInstallCommand(listOf("pnpm", "install"), pkgDir)
             ?: throw MyceliumException(
@@ -238,6 +259,22 @@ class Mycelium(
     private fun packageJsonDeclaresDependencies(json: String): Boolean =
         context.eval("js", PACKAGE_DEPS_CHECK).execute(json).asBoolean()
 
+    // Parses `package.json` text and returns its `dependencies` merged with its
+    // `devDependencies` (name -> version spec), with "dependencies" taking priority over
+    // "devDependencies" on name collisions — this is what actually drives the
+    // pure-Kotlin (PackageInstaller) manifest-based install. Same GraalJS-JSON.parse
+    // approach as packageJsonDeclaresDependencies above (this codebase reads
+    // package.json fields through the shared JS Context rather than a JVM JSON library);
+    // the merged map itself is round-tripped out as a JSON string and decoded with
+    // org.json.JSONObject, matching how NpmRegistryClient already decodes registry JSON.
+    // Malformed JSON yields an empty map, matching packageJsonDeclaresDependencies'
+    // "nothing to install" treatment of the same case.
+    private fun packageJsonDependencies(json: String): Map<String, String> {
+        val mergedJson = context.eval("js", PACKAGE_DEPS_MERGE).execute(json).asString()
+        val obj = org.json.JSONObject(mergedJson)
+        return obj.keySet().associateWith { obj.optString(it) }
+    }
+
     companion object {
         private val PACKAGE_DEPS_CHECK = """
             (function (json) {
@@ -250,6 +287,22 @@ class Mycelium(
                     return hasDeps || hasDevDeps;
                 } catch (e) {
                     return false;
+                }
+            })
+        """.trimIndent()
+
+        private val PACKAGE_DEPS_MERGE = """
+            (function (json) {
+                try {
+                    var pkg = JSON.parse(json);
+                    var merged = {};
+                    var devDeps = pkg.devDependencies || {};
+                    var deps = pkg.dependencies || {};
+                    for (var k in devDeps) merged[k] = devDeps[k];
+                    for (var k in deps) merged[k] = deps[k];
+                    return JSON.stringify(merged);
+                } catch (e) {
+                    return "{}";
                 }
             })
         """.trimIndent()

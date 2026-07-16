@@ -62,6 +62,14 @@ object CivetSupport : LanguageSupport by JsSupport {
     override val jsCompilerId = "civet"
 }
 
+// LiveScript, likewise compiled to plain JS via NpmJsApiBackend (backed by the real
+// `livescript` npm package) — see CoffeeSupport's own doc comment for why delegation
+// (`by JsSupport`) is enough here.
+object LiveScriptSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("ls")
+    override val jsCompilerId = "livescript"
+}
+
 object RubySupport : LanguageSupport {
     override val languageId = "ruby"
     override val extensions = listOf("rb")

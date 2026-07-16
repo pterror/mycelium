@@ -1,10 +1,7 @@
 package org.mycelium.library.registry
 
 import org.json.JSONObject
-import java.net.URI
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 
 // Pure-Kotlin npm registry client — no `npm`/`pnpm`/`node` subprocess required. Mirrors
@@ -24,6 +21,12 @@ class NpmRegistryClient(
     private val httpClient: HttpClient = defaultHttpClient(),
 ) : PackageIndex {
     override val ecosystem: String = "npm"
+
+    // How long a cached metadata document is trusted without even a conditional
+    // (If-None-Match/If-Modified-Since) revalidation request — short enough that a build
+    // resolving the same package repeatedly (e.g. across a monorepo's workspaces) within one
+    // sitting sees fresh-enough data, long enough to avoid hammering the registry.
+    private val metadataMaxAge: Duration = Duration.ofMinutes(5)
 
     companion object {
         fun defaultHttpClient(): HttpClient =
@@ -51,21 +54,24 @@ class NpmRegistryClient(
             name
         }
 
-    private fun get(path: String): HttpResponse<String> {
-        val request = HttpRequest.newBuilder(URI.create("$registryBase$path"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "mycelium (pure-kotlin npm client)")
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build()
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-    }
+    // Metadata documents (package-info/version-list JSON) are cached to disk via
+    // HttpMetadataCache, keyed by ecosystem ("npm") + request path, with conditional
+    // revalidation (ETag/Last-Modified) on cache misses/expiry. Tarball downloads are a
+    // separate concern already handled by PackageCache and never go through this cache.
+    private fun getMetadata(path: String): HttpMetadataCache.Result =
+        HttpMetadataCache.fetch(
+            httpClient = httpClient,
+            ecosystem = ecosystem,
+            cacheKey = path,
+            url = "$registryBase$path",
+            maxAge = metadataMaxAge,
+        )
 
     override fun fetchMeta(name: String, version: String?): PackageMeta {
         if (version == null || version == "latest") {
-            val response = get("/${encodedName(name)}")
-            if (response.statusCode() == 404) throw PackageNotFoundException(name)
-            val doc = JSONObject(response.body())
+            val response = getMetadata("/${encodedName(name)}")
+            if (response.statusCode == 404) throw PackageNotFoundException(name)
+            val doc = JSONObject(response.body)
             val latestVersion = doc.optJSONObject("dist-tags")?.optString("latest")
                 ?: throw PackageNotFoundException(name)
             val versionDoc = doc.optJSONObject("versions")?.optJSONObject(latestVersion)
@@ -76,16 +82,16 @@ class NpmRegistryClient(
         // The single-version endpoint (GET /{name}/{version}) returns just that version's
         // package.json-shaped document directly — avoids downloading every other published
         // version's metadata just to pick out one.
-        val response = get("/${encodedName(name)}/$version")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name, version)
-        val versionDoc = JSONObject(response.body())
+        val response = getMetadata("/${encodedName(name)}/$version")
+        if (response.statusCode == 404) throw PackageNotFoundException(name, version)
+        val versionDoc = JSONObject(response.body)
         return parseVersion(name, version, versionDoc)
     }
 
     override fun fetchVersions(name: String): List<VersionMeta> {
-        val response = get("/${encodedName(name)}")
-        if (response.statusCode() == 404) throw PackageNotFoundException(name)
-        val doc = JSONObject(response.body())
+        val response = getMetadata("/${encodedName(name)}")
+        if (response.statusCode == 404) throw PackageNotFoundException(name)
+        val doc = JSONObject(response.body)
         val versions = doc.optJSONObject("versions") ?: throw PackageNotFoundException(name)
         val time = doc.optJSONObject("time")
         return versions.keySet().map { v ->

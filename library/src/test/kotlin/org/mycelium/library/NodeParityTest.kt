@@ -51,7 +51,12 @@ class NodeParityTest {
             "string_decoder", "tls", "tty", "url", "util", "zlib",
             "dns", "dns/promises", "worker_threads", "readline", "readline/promises",
             "node:module", "perf_hooks", "timers", "timers/promises", "util/types",
-            "dgram", "cluster"
+            "dgram", "cluster",
+            "constants", "domain", "punycode", "sys", "repl", "trace_events", "v8", "wasi",
+            "inspector", "inspector/promises", "node:test", "node:test/reporters",
+            "node:sea", "node:sqlite",
+            "stream/promises", "stream/consumers", "stream/web", "path/posix", "path/win32",
+            "console"
         )
 
         private var resolvedNodeCommand: List<String>? = null

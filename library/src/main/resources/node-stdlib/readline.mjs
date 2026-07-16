@@ -269,22 +269,49 @@ export function moveCursor(_stream, _dx, _dy, callback) {
 
 export { Interface, normalizeCreateInterfaceArgs as _normalizeCreateInterfaceArgs };
 
-// NOTE: Node also exposes the promise-returning API under `readline.promises` (same
-// object `require('readline/promises')` returns directly) — deliberately NOT added here.
-// readline-promises.mjs subclasses this module's `Interface` at its own top level (`class
-// Interface extends CallbackInterface`), so importing "readline/promises" back from this
-// module forms a true ESM import cycle: readline/promises needs this module's `Interface`
-// binding initialized before this module has finished evaluating it, which GraalJS (like
-// V8) fails with an evaluation error, breaking readline entirely. Routing through the
-// synchronous `__mycelium_require__` CJS-style bridge instead (module.mjs's
-// `createRequire()` uses that same bridge) doesn't fix it — requireCoreModule/
-// requireEsmModule still evaluate readline-promises.mjs's static ESM `import ... from
-// "readline"`, hitting the identical cycle one layer down. Fixing this for real requires
-// restructuring readline-promises.mjs to not depend on this module's `Interface` at its
-// own top level (e.g. moving the promise-Interface class into readline.mjs itself, mirroring
-// how dns.mjs/fs.mjs build their own `promises` object inline rather than importing it
-// back from a sibling module — see fs.mjs's `promises` export and fs-promises.mjs's
-// `import { promises } from "fs"`).
+// --- promises namespace ---
+//
+// Node also exposes a promise-returning API under `readline.promises` (the same object
+// `require('readline/promises')` returns directly). An earlier version of this had
+// readline-promises.mjs subclass `Interface` (above) at *its own* top level (`class
+// Interface extends CallbackInterface`) — that forms a true ESM import cycle as soon as
+// this module tries to import anything back from readline-promises.mjs (e.g. to expose
+// `readline.promises`): GraalJS (like V8) fails to evaluate a cycle where a binding is
+// needed before the module exporting it has finished evaluating.
+//
+// Fixed the same way dns.mjs/fs.mjs avoid the equivalent cycle: the promise-based
+// `Interface` subclass lives right here, inline, alongside the callback `Interface` it
+// extends — no separate module, no cycle. readline-promises.mjs (see that file) now just
+// re-exports these bindings instead of defining its own subclass.
+class PromiseInterface extends Interface {
+    question(query, options) {
+        return new Promise((resolve) => {
+            super.question(query, options, resolve);
+        });
+    }
+}
+
+function createPromiseInterface(...args) {
+    const options = normalizeCreateInterfaceArgs(args);
+    return new PromiseInterface(options);
+}
+
+const promises = {
+    createInterface: createPromiseInterface,
+    Interface: PromiseInterface,
+    emitKeypressEvents,
+    clearLine,
+    clearScreenDown,
+    cursorTo,
+    moveCursor,
+};
+
+export {
+    promises,
+    createPromiseInterface as _createPromiseInterface,
+    PromiseInterface as _PromiseInterface,
+};
+
 export default {
-    createInterface, Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor,
+    createInterface, Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor, promises,
 };

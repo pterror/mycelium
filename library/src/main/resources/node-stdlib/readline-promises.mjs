@@ -1,29 +1,19 @@
 // Minimal Node.js-compatible `readline/promises` module, served by Mycelium as the
 // synthetic core module resolved for `import ... from "readline/promises"` /
-// `"node:readline/promises"`. Same underlying line-reading machinery as `readline.mjs`
-// (imported below via the "readline" specifier — see fs-promises.mjs for the precedent of
-// one core module importing another this way) — the only difference from the callback API
-// is that `question()` returns a Promise instead of taking a callback.
-
+// `"node:readline/promises"`. Same underlying line-reading machinery as `readline.mjs` —
+// the promise-based `Interface` subclass (whose only difference from the callback API is
+// that `question()` returns a Promise instead of taking a callback) is defined *inside*
+// readline.mjs itself and just re-exported here under this module's expected names.
+//
+// This indirection (rather than defining the subclass here, at this module's own top
+// level) is deliberate: see readline.mjs's "promises namespace" section for why defining
+// it here instead forms an unresolvable ESM import cycle with readline.mjs.
 import {
-    Interface as CallbackInterface,
+    _createPromiseInterface as createInterface,
+    _PromiseInterface as Interface,
     emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor,
-    _normalizeCreateInterfaceArgs as normalizeCreateInterfaceArgs,
 } from "readline";
 
-class Interface extends CallbackInterface {
-    question(query, options) {
-        return new Promise((resolve) => {
-            super.question(query, options, resolve);
-        });
-    }
-}
-
-export function createInterface(...args) {
-    const options = normalizeCreateInterfaceArgs(args);
-    return new Interface(options);
-}
-
-export { Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor };
+export { createInterface, Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor };
 
 export default { createInterface, Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor };

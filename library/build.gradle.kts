@@ -34,6 +34,7 @@ val pythonLang: Configuration by configurations.creating { isCanBeConsumed = fal
 val javaLang: Configuration by configurations.creating { isCanBeConsumed = false }
 val llvmLang: Configuration by configurations.creating { isCanBeConsumed = false }
 val wasmLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val insightTool: Configuration by configurations.creating { isCanBeConsumed = false }
 
 dependencies {
   api("org.graalvm.truffle:truffle-api:$graalVersion")
@@ -47,6 +48,7 @@ dependencies {
   compileOnly("org.graalvm.polyglot:llvm:$graalVersion")
   compileOnly("org.graalvm.polyglot:llvm-native:$graalVersion")
   compileOnly("org.graalvm.ruby:ruby:$graalVersion")
+  compileOnly("org.graalvm.tools:insight-tool:$graalVersion")
 
   jsLang("org.graalvm.polyglot:js:$graalVersion")
   pythonLang("org.graalvm.polyglot:python:$graalVersion")
@@ -56,6 +58,7 @@ dependencies {
   llvmLang("org.graalvm.polyglot:llvm:$graalVersion")
   llvmLang("org.graalvm.polyglot:llvm-native:$graalVersion")
   wasmLang("org.graalvm.polyglot:wasm:$graalVersion")
+  insightTool("org.graalvm.tools:insight-tool:$graalVersion")
 
   implementation("io.mvnpm:esbuild-java:1.5.1")
 
@@ -74,4 +77,4 @@ dependencies {
 // (Configuration instances can no longer be passed directly to `dependencies { }` as of
 // Gradle 8 — `extendsFrom` is the supported way to fold one Configuration's dependencies
 // into another).
-configurations.testImplementation.get().extendsFrom(jsLang, rubyLang, pythonLang, javaLang, llvmLang, wasmLang)
+configurations.testImplementation.get().extendsFrom(jsLang, rubyLang, pythonLang, javaLang, llvmLang, wasmLang, insightTool)

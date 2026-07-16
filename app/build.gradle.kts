@@ -59,7 +59,11 @@ val jvmRun by tasks.registering(JavaExec::class) {
     description = "Run Mycelium in JVM mode. Pass -Planguages=js,ruby,python,java,llvm,wasm to select language packs (default: js)."
     mainClass.set("org.mycelium.app.AppKt")
     workingDir = rootDir
-    classpath = sourceSets.main.get().runtimeClasspath
+    // insightTool is added unconditionally (not gated behind -Planguages, since it's an
+    // instrument rather than a language pack) so the GraalVM Insight instrument is always
+    // on jvmRun's classpath — needed for Mycelium.insightHandle's Engine#instruments["insight"]
+    // lookup to find anything when a caller passes --insight=<script>.
+    classpath = sourceSets.main.get().runtimeClasspath + project(":library").configurations.getByName("insightTool")
 
     val languageProp = project.findProperty("languages") as String?
     val requested = when {

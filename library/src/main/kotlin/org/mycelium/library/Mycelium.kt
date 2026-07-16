@@ -67,6 +67,11 @@ class Mycelium(
     // `process.env` (see PROCESS_INIT_SCRIPT's `__mycelium_env__` binding below).
     private val cwd: String? = null,
     private val env: Map<String, String>? = null,
+    // Path to a GraalVM Insight instrumentation script (`--insight=<path>` on the CLI) to
+    // attach to the Context below. Left null for the normal path, where no instrumentation
+    // is attached. A no-op if the insight-tool jar isn't on the classpath — see
+    // `insightAvailable`.
+    private val insightScript: String? = null,
 ) {
     // JVM-mode support: library/build.gradle.kts splits the GraalVM language runtimes
     // (ruby/python/java/llvm/wasm) into separate, non-transitive Gradle Configurations
@@ -88,7 +93,12 @@ class Mycelium(
     // on. A second, throwaway Engine here costs one extra (and, since GraalVM CE has no
     // libgraal on a stock JDK, textually near-identical) startup warning printed to
     // stderr — not worth the sharing restriction to avoid.
-    private val availableLanguageIds: Set<String> = Engine.create().languages.keys
+    // The same throwaway probe also reports which *instruments* (as opposed to languages)
+    // are on the classpath — used below to gate Insight activation the same way
+    // `availableLanguageIds` gates language-specific Context options.
+    private val probeEngine = Engine.create()
+    private val availableLanguageIds: Set<String> = probeEngine.languages.keys
+    private val insightAvailable = "insight" in probeEngine.instruments.keys
 
     // `requestedLanguages` filtered down to what's actually usable in this process: a
     // LanguageSupport whose `languageId` isn't in `availableLanguageIds` (e.g. RubySupport
@@ -227,6 +237,25 @@ class Mycelium(
         }
         builder.build()
     }
+
+    // GraalVM Insight — only activated when the insight-tool jar is on the classpath
+    // (`insightAvailable`) and the user actually passed `--insight=<script>`
+    // (`insightScript`). Unlike ordinary `js.*`/engine options, Insight cannot be turned on
+    // via `Context.Builder#option("insight", path)` in newer GraalVM versions — that form
+    // silently fails to attach the instrumentation. Instead the Instrument must be looked
+    // up on the already-built Context's Engine and activated via its `Function<Source,
+    // AutoCloseable>` lookup API, which is why this happens *after* `context` above rather
+    // than inside the builder block. The returned AutoCloseable (kept alive for the
+    // lifetime of this Mycelium instance) detaches the instrumentation when closed; nothing
+    // currently closes it explicitly, matching the rest of this class's lifecycle (the
+    // Context itself is likewise never explicitly closed on the normal CLI path).
+    private val insightHandle: AutoCloseable? = if (insightScript != null && insightAvailable) {
+        val instrument = context.engine.instruments["insight"]
+        @Suppress("UNCHECKED_CAST")
+        val access = instrument?.lookup(java.util.function.Function::class.java)
+            as? java.util.function.Function<Source, AutoCloseable>
+        access?.apply(Source.newBuilder("js", File(insightScript)).build())
+    } else null
 
     private val extensionMap: Map<String, LanguageSupport> =
         languages.flatMap { lang -> lang.extensions.map { it to lang } }.toMap()

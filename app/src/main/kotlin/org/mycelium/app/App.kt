@@ -26,17 +26,27 @@ private val compilerRegistry = CompilerRegistry()
 // of `rest` before the remaining positional arguments are dispatched on below. Exposed
 // (internal, not private) so it can be exercised directly by a parse-only test without
 // spinning up a Mycelium/GraalVM Context.
-internal data class ParsedArgs(val yolo: Boolean, val noInstall: Boolean, val rest: List<String>)
+internal data class ParsedArgs(
+    val yolo: Boolean,
+    val noInstall: Boolean,
+    val insightScript: String?,
+    val rest: List<String>,
+)
 
 internal fun parseArgs(args: Array<String>): ParsedArgs {
     val yolo = args.contains("--yolo")
     val noInstall = args.contains("--no-install")
-    val rest = args.filterNot { it == "--yolo" || it == "--no-install" }
-    return ParsedArgs(yolo, noInstall, rest)
+    val insightScript = args.firstOrNull { it.startsWith("--insight=") }?.removePrefix("--insight=")
+    val rest = args.filterNot { it == "--yolo" || it == "--no-install" || it.startsWith("--insight=") }
+    return ParsedArgs(yolo, noInstall, insightScript, rest)
 }
 
 fun main(args: Array<String>) {
-    val (yolo, noInstall, rest) = parseArgs(args)
+    val parsed = parseArgs(args)
+    val yolo = parsed.yolo
+    val noInstall = parsed.noInstall
+    val insightScript = parsed.insightScript
+    val rest = parsed.rest
 
     if (rest.isEmpty()) {
         printUsage()
@@ -51,7 +61,7 @@ fun main(args: Array<String>) {
                 System.exit(1)
                 return
             }
-            runFile(rest[1], yolo, noInstall)
+            runFile(rest[1], yolo, noInstall, insightScript)
         }
         "version" -> println("mycelium 0.1.0-dev")
         "compiler" -> runCompilerCommand(rest.drop(1))
@@ -60,7 +70,7 @@ fun main(args: Array<String>) {
         else -> {
             // If it looks like a file path, treat it as implicit `run`
             if (rest[0].contains('.')) {
-                runFile(rest[0], yolo, noInstall)
+                runFile(rest[0], yolo, noInstall, insightScript)
             } else {
                 System.err.println("mycelium: unknown command '${rest[0]}'")
                 printUsage()
@@ -70,7 +80,7 @@ fun main(args: Array<String>) {
     }
 }
 
-private fun runFile(path: String, yolo: Boolean, noInstall: Boolean) {
+private fun runFile(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
     val config = Config.load()
     val absolutePath = File(path).absolutePath
     val exitCode = tryRunViaDaemon(config.daemon, absolutePath, yolo, noInstall)
@@ -78,12 +88,12 @@ private fun runFile(path: String, yolo: Boolean, noInstall: Boolean) {
         if (exitCode != 0) System.exit(exitCode)
         return
     }
-    runFileInProcess(path, yolo, noInstall)
+    runFileInProcess(path, yolo, noInstall, insightScript)
 }
 
-private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean) {
+private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
     try {
-        val vm = Mycelium(yolo = yolo, autoInstall = !noInstall)
+        val vm = Mycelium(yolo = yolo, autoInstall = !noInstall, insightScript = insightScript)
         vm.runFile(path)
     } catch (e: MyceliumException) {
         System.err.println(e.message)
@@ -135,6 +145,7 @@ private fun printUsage() {
         flags:
           --yolo                 Auto-install missing npm packages on import
           --no-install           Skip auto-installing dependencies declared in package.json
+          --insight=<script>     Attach a GraalVM Insight instrumentation script
 
         `mycelium run`/`mycelium <file>` auto-start a background daemon on first use
         (amortizes JVM/GraalVM startup across runs) unless disabled via

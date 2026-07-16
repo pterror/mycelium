@@ -14,11 +14,32 @@ import java.nio.file.*
 import kotlin.io.path.extension
 import kotlin.io.path.readText
 
+// GraalVM FileSystem implementation that's the seam for all of Mycelium's cross-language
+// and cross-ecosystem import support. This class itself is a thin orchestrator — it holds
+// the state a GraalVM FileSystem needs to expose (the source-directory stack, the shared
+// Context/Mycelium references) and coordinates between the focused pieces that do the
+// actual resolution/loading work:
+//   - NodeModuleResolver: node_modules walk, package.json exports/main resolution, CJS/ESM
+//     file-kind detection.
+//   - PythonModuleResolver / RubyModuleResolver: sys.path / $LOAD_PATH bare-specifier
+//     resolution for cross-language Python/Ruby imports.
+//   - CjsRuntime: `require()`, the CJS module cache, and the CJS->ESM interop shim.
+//   - ShimGenerator: the cross-language (LLVM/WASM/other-guest-language) ESM shim GraalJS
+//     is handed when a module's own language differs from its importer's.
+//   - CoreModuleRegistry: Node stdlib modules shipped as bundled synthetic resources.
+//   - Compiler: LLVM/WASM compilation and WASM export loading.
 class InterceptingFileSystem : FileSystem {
     private var context: Context? = null
     private var mycelium: Mycelium? = null
     private var yolo: Boolean = false
     private val delegate = FileSystem.newDefaultFileSystem()
+
+    private val nodeModuleResolver = NodeModuleResolver { context!! }
+    private val pythonModuleResolver = PythonModuleResolver()
+    private val rubyModuleResolver = RubyModuleResolver()
+    private val cjsRuntime = CjsRuntime({ context!! }, nodeModuleResolver)
+    private val shimGenerator = ShimGenerator { context!! }
+
     private val sourceDirectoryStack = ThreadLocal.withInitial { ArrayDeque<Path>() }
 
     // The directory of the most recently read real project file, kept around *after*
@@ -60,16 +81,6 @@ class InterceptingFileSystem : FileSystem {
         lastReadModuleDir.get()
             ?: sourceDirectoryStack.get().firstOrNull()
             ?: Path.of("").toAbsolutePath()
-
-    // `require()`d CommonJS modules, keyed by resolved absolute path (as a string). Each
-    // cached Value is the module's Node-style module object — `{ exports, id, filename,
-    // loaded }` — not just its exports, and is inserted into the cache *before* the
-    // module body runs (see requireCjsModule). That's what makes a circular require (A
-    // requires B while B is still in the middle of requiring A) return the same,
-    // possibly-still-partial `module.exports` object reference instead of recursively
-    // re-evaluating A and stack-overflowing — and what makes `require(x) === require(x)`
-    // true and top-level module side effects run exactly once.
-    private val cjsModuleCache = mutableMapOf<String, org.graalvm.polyglot.Value>()
 
     fun init(context: Context, mycelium: Mycelium, yolo: Boolean = false) {
         this.context = context
@@ -121,8 +132,8 @@ class InterceptingFileSystem : FileSystem {
             // an absolute URI rather than a bare specifier, routing it here instead of
             // parsePath(String) — so the "node:"-prefixed core module form has to be
             // handled in this overload too.
-            uri.scheme == "node" -> coreModules["node:${uri.schemeSpecificPart}"]
-                ?.let { syntheticCoreModulePath(it) }
+            uri.scheme == "node" -> CoreModuleRegistry.coreModules["node:${uri.schemeSpecificPart}"]
+                ?.let { CoreModuleRegistry.syntheticCoreModulePath(it) }
                 ?: throw MyceliumException("mycelium: unknown core module 'node:${uri.schemeSpecificPart}'")
             else -> Path.of("/.mycelium/$uri")
         }
@@ -142,14 +153,14 @@ class InterceptingFileSystem : FileSystem {
         // treat a missing package as an error worth surfacing.
         if (path.startsWith("#")) {
             val fromDir = currentResolutionDir()
-            resolveSubpathImport(path, fromDir)?.let { return it }
+            nodeModuleResolver.resolveSubpathImport(path, fromDir)?.let { return it }
             throw MyceliumException(
                 "mycelium: cannot find module '$path' — no matching \"imports\" entry found in any " +
                     "ancestor package.json from '$fromDir'"
             )
         }
         if (isBareSpecifier(path)) {
-            coreModules[path]?.let { return syntheticCoreModulePath(it) }
+            CoreModuleRegistry.coreModules[path]?.let { return CoreModuleRegistry.syntheticCoreModulePath(it) }
             val fromDir = currentResolutionDir()
             val hostLang = detectHostLanguageFromCallStack()
 
@@ -162,19 +173,19 @@ class InterceptingFileSystem : FileSystem {
             // cross-language JS package — and whichever of gem/site-packages resolution
             // wasn't already tried up front is attempted last, as a final fallback.
             if (hostLang?.languageId == "ruby") {
-                resolveRubyGem(path)?.let { return it }
+                rubyModuleResolver.resolveRubyGem(path)?.let { return it }
             } else if (hostLang?.languageId == "python") {
-                resolvePythonPackage(path)?.let { return it }
+                pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
             }
 
-            when (val resolution = resolveNodeModule(path, fromDir)) {
-                is NodeModuleResolution.Found -> return resolution.path
-                is NodeModuleResolution.PackageNotFound -> {
+            when (val resolution = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
+                is NodeModuleResolver.Resolution.Found -> return resolution.path
+                is NodeModuleResolver.Resolution.PackageNotFound -> {
                     if (yolo) {
-                        val (packageName, _) = splitSpecifier(path)
+                        val (packageName, _) = nodeModuleResolver.splitSpecifier(path)
                         yoloInstall(packageName)
-                        when (val retry = resolveNodeModule(path, fromDir)) {
-                            is NodeModuleResolution.Found -> return retry.path
+                        when (val retry = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
+                            is NodeModuleResolver.Resolution.Found -> return retry.path
                             else -> {}
                         }
                     }
@@ -183,14 +194,14 @@ class InterceptingFileSystem : FileSystem {
                             "'$fromDir' or any parent directory"
                     )
                 }
-                NodeModuleResolution.NoNodeModulesTree -> {}
+                NodeModuleResolver.Resolution.NoNodeModulesTree -> {}
             }
 
             if (hostLang?.languageId != "ruby") {
-                resolveRubyGem(path)?.let { return it }
+                rubyModuleResolver.resolveRubyGem(path)?.let { return it }
             }
             if (hostLang?.languageId != "python") {
-                resolvePythonPackage(path)?.let { return it }
+                pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
             }
         }
         return Path.of(path)
@@ -234,137 +245,30 @@ class InterceptingFileSystem : FileSystem {
             !path.startsWith("http:") &&
             !path.startsWith("https:")
 
-    private sealed class NodeModuleResolution {
-        data class Found(val path: Path) : NodeModuleResolution()
-        object PackageNotFound : NodeModuleResolution()
-        object NoNodeModulesTree : NodeModuleResolution()
-    }
+    // Resolves a bare specifier against Python's search path — exposed here (rather than
+    // requiring callers to reach into PythonModuleResolver themselves) purely so tests can
+    // exercise it against a fake site-packages layout via an explicit `searchPaths`
+    // override, without needing a real Python installation. Two overloads (rather than a
+    // default parameter) so an explicitly-empty `searchPaths` list — "search nothing" — is
+    // distinguishable from "use the real subprocess-derived default".
+    internal fun resolvePythonPackage(specifier: String): Path? =
+        pythonModuleResolver.resolvePythonPackage(specifier)
 
-    // Implements (a subset of) Node.js's node_modules resolution algorithm: starting from
-    // `fromDir`, check `node_modules/<packageName>` in that directory and each of its
-    // ancestors in turn (not just the nearest `node_modules` directory — a package may
-    // live in a higher-level `node_modules` even if a closer one exists without it),
-    // stopping at the first match.
-    // `preferRequire` distinguishes a CJS `require()` resolution from an ESM `import`
-    // resolution — both funnel through this same node_modules walk, but a dual-mode
-    // package's `exports` map can declare sibling `"import"`/`"require"` conditions with no
-    // enclosing `"default"` (e.g. `ws`'s `{".": {"import": "./wrapper.mjs", "require":
-    // "./index.js"}}`), and picking the wrong one hands back a module built for the wrong
-    // module system. See resolvePackageEntryPoint/resolveSubpathExport, which thread this
-    // through to the condition-priority list.
-    private fun resolveNodeModule(specifier: String, fromDir: Path, preferRequire: Boolean = false): NodeModuleResolution {
-        val (packageName, subPath) = splitSpecifier(specifier)
-        var dir: Path? = fromDir.toAbsolutePath().normalize()
-        var sawNodeModulesTree = false
-        while (dir != null) {
-            val nodeModules = dir.resolve("node_modules")
-            if (Files.isDirectory(nodeModules)) {
-                sawNodeModulesTree = true
-                val packageDir = nodeModules.resolve(packageName)
-                if (Files.isDirectory(packageDir)) {
-                    val resolved = if (subPath != null) {
-                        resolveSubpathExport(packageDir, subPath, preferRequire)
-                            ?: resolveExtensionlessPath(packageDir.resolve(subPath)).let { candidate ->
-                                // isRegularFile, not exists: a subpath that names an existing
-                                // directory with no usable index.* falls through
-                                // resolveExtensionlessPath unresolved (it returns the
-                                // directory itself) — Files.exists would still be true for
-                                // that directory and wrongly report it as "found", handing
-                                // the caller a directory path that later chokes with an
-                                // unqualified "Is a directory" IOException (same class of bug
-                                // fixed in resolveExtensionlessPath/resolveRequireTarget).
-                                if (!Files.isRegularFile(candidate)) return NodeModuleResolution.PackageNotFound
-                                candidate
-                            }
-                    } else {
-                        resolvePackageEntryPoint(packageDir, preferRequire)
-                    }
-                    return NodeModuleResolution.Found(resolved)
-                }
-            }
-            dir = dir.parent
-        }
-        return if (sawNodeModulesTree) NodeModuleResolution.PackageNotFound else NodeModuleResolution.NoNodeModulesTree
-    }
+    internal fun resolvePythonPackage(specifier: String, searchPaths: List<Path>): Path? =
+        pythonModuleResolver.resolvePythonPackage(specifier, searchPaths)
 
-    // Python's `sys.path` (site-packages directories plus the stdlib's own library dirs),
-    // discovered once by shelling out to `python3` and cached for the process's lifetime —
-    // mirrors the "run once at startup" approach the task called for, just done lazily
-    // (on first bare-specifier resolution that needs it) rather than eagerly at
-    // InterceptingFileSystem construction, so paying the subprocess cost is skipped
-    // entirely for JS-only or Ruby-only projects that never touch Python. Falls back to
-    // an empty list (rather than throwing) when python3 isn't on PATH, so Python package
-    // resolution just always misses in that case instead of breaking every other import.
-    private val pythonSitePackages: List<Path> by lazy { computePythonSearchPaths() }
+    internal fun computePythonSearchPaths(): List<Path> = pythonModuleResolver.computePythonSearchPaths()
 
-    internal fun computePythonSearchPaths(): List<Path> =
-        try {
-            val process = ProcessBuilder(
-                "python3", "-c", "import sys; print('\\n'.join(sys.path))"
-            ).redirectErrorStream(false).start()
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor()
-            output.lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .map { Path.of(it) }
-                .filter { Files.isDirectory(it) }
-                .toList()
-        } catch (e: java.io.IOException) {
-            emptyList()
-        }
+    // Resolves a bare specifier against Ruby's load path — see resolvePythonPackage's own
+    // comment for why this is exposed as a thin pass-through rather than requiring tests to
+    // construct a RubyModuleResolver directly.
+    internal fun resolveRubyGem(specifier: String): Path? =
+        rubyModuleResolver.resolveRubyGem(specifier)
 
-    // Resolves a bare specifier (e.g. "numpy" or "pkg/submodule") against Python's search
-    // path: a package directory with an `__init__.py`, or a plain `<specifier>.py` module
-    // file. `searchPaths` defaults to the real, subprocess-derived `sys.path` but can be
-    // overridden by tests to point at a fake site-packages layout without needing a real
-    // Python installation.
-    internal fun resolvePythonPackage(specifier: String, searchPaths: List<Path> = pythonSitePackages): Path? {
-        for (dir in searchPaths) {
-            val initPy = dir.resolve(specifier).resolve("__init__.py")
-            if (Files.isRegularFile(initPy)) return initPy
-            val moduleFile = dir.resolve("$specifier.py")
-            if (Files.isRegularFile(moduleFile)) return moduleFile
-        }
-        return null
-    }
+    internal fun resolveRubyGem(specifier: String, searchPaths: List<Path>): Path? =
+        rubyModuleResolver.resolveRubyGem(specifier, searchPaths)
 
-    // Ruby's `$LOAD_PATH` (covers both installed gems' `lib/` directories and the
-    // interpreter's own stdlib), discovered once by shelling out to `ruby` and cached —
-    // same lazy-on-first-use, empty-list-on-missing-binary approach as
-    // pythonSitePackages/computePythonSearchPaths above.
-    private val rubyLoadPaths: List<Path> by lazy { computeRubySearchPaths() }
-
-    internal fun computeRubySearchPaths(): List<Path> =
-        try {
-            val process = ProcessBuilder("ruby", "-e", "puts \$LOAD_PATH")
-                .redirectErrorStream(false).start()
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor()
-            output.lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .map { Path.of(it) }
-                .filter { Files.isDirectory(it) }
-                .toList()
-        } catch (e: java.io.IOException) {
-            emptyList()
-        }
-
-    // Resolves a bare specifier against Ruby's load path: either `<specifier>.rb` directly
-    // in a load-path directory, or the conventional `<specifier>/<specifier>.rb` layout
-    // gems use for their main entry file. `searchPaths` defaults to the real,
-    // subprocess-derived `$LOAD_PATH` but can be overridden by tests to point at a fake
-    // gem directory layout without needing a real Ruby installation.
-    internal fun resolveRubyGem(specifier: String, searchPaths: List<Path> = rubyLoadPaths): Path? {
-        for (dir in searchPaths) {
-            val direct = dir.resolve("$specifier.rb")
-            if (Files.isRegularFile(direct)) return direct
-            val nested = dir.resolve(specifier).resolve("$specifier.rb")
-            if (Files.isRegularFile(nested)) return nested
-        }
-        return null
-    }
+    internal fun computeRubySearchPaths(): List<Path> = rubyModuleResolver.computeRubySearchPaths()
 
     // `--yolo` support: when a bare specifier can't be found in any node_modules tree,
     // shell out to `npm install <packageName>` (falling back to `pnpm install` if npm
@@ -400,724 +304,23 @@ class InterceptingFileSystem : FileSystem {
             null
         }
 
-    // Splits a bare specifier into its package name and an optional subpath, honoring
-    // scoped packages (`@scope/name[/subpath]`) as well as plain ones (`name[/subpath]`).
-    private fun splitSpecifier(specifier: String): Pair<String, String?> {
-        val segments = specifier.split("/")
-        return if (specifier.startsWith("@") && segments.size >= 2) {
-            val packageName = "${segments[0]}/${segments[1]}"
-            val rest = segments.drop(2).joinToString("/")
-            packageName to rest.ifEmpty { null }
-        } else {
-            val packageName = segments[0]
-            val rest = segments.drop(1).joinToString("/")
-            packageName to rest.ifEmpty { null }
-        }
-    }
+    // Backs the `require` shim InterceptingFileSystem prepends to every transpiled CJS
+    // module — see CjsRuntime.requireModule / newByteChannel's CJS branch.
+    fun requireModule(specifier: String, fromDirStr: String): org.graalvm.polyglot.Value =
+        cjsRuntime.requireModule(specifier, fromDirStr)
 
-    // Reads `package.json` and resolves it to a concrete entry-point file, preferring the
-    // `exports` field (`exports["."].import`/`.require` per `preferRequire`, or `.default`)
-    // and falling back to `main`, then finally to the conventional `index.js`. `preferRequire`
-    // is `true` when this resolution is for a CJS `require()` (see resolveRequireTarget) and
-    // `false` for an ESM `import` (see parsePath) — see resolveNodeModule's own comment for
-    // why the distinction matters.
-    private fun resolvePackageEntryPoint(packageDir: Path, preferRequire: Boolean = false): Path {
-        val packageJson = packageDir.resolve("package.json")
-        val entry = if (Files.exists(packageJson)) {
-            val json = packageJson.readText()
-            try {
-                context!!.eval("js", ENTRY_POINT_RESOLVER).execute(json, preferRequire).asString()
-            } catch (e: Exception) {
-                throw MyceliumException(
-                    "mycelium: failed to parse '$packageJson' — ${e.message}", e
-                )
-            }
-        } else {
-            "index.js"
-        }
-        return resolveExtensionlessPath(packageDir.resolve(entry).normalize())
-    }
+    // Backs `require.resolve(specifier)` / `require.resolve.paths(specifier)` — see
+    // CjsRuntime.resolveRequireSpecifier(Paths).
+    fun resolveRequireSpecifier(specifier: String, fromDirStr: String): String =
+        cjsRuntime.resolveRequireSpecifier(specifier, fromDirStr)
 
-    // Resolves a package-relative subpath specifier (e.g. `es-errors/eval` -> subPath
-    // `eval`) against that package's own `package.json` `"exports"` map, per Node's subpath
-    // exports resolution — distinct from (and consulted before falling back to) a literal
-    // `packageDir.resolve(subPath)` file check, since modern packages increasingly ship an
-    // `"exports"` map whose subpath keys don't correspond 1:1 with files on disk (e.g.
-    // `es-errors`'s `"./eval": "./eval.js"`, where the exports *key* omits the extension
-    // the file actually has). Supports both exact subpath keys and single-`*`-wildcard
-    // pattern keys (e.g. `"./features/*": "./src/features/*.js"`), matching Node's own
-    // subpath pattern matching. Returns null (falling back to the caller's literal-path
-    // check) when there's no `"exports"` field, no `package.json`, or no matching entry.
-    // `preferRequire` has the same meaning as on resolvePackageEntryPoint/resolveNodeModule
-    // — `true` for a CJS `require()` resolution, `false` for an ESM `import`.
-    private fun resolveSubpathExport(packageDir: Path, subPath: String, preferRequire: Boolean = false): Path? {
-        val packageJson = packageDir.resolve("package.json")
-        if (!Files.exists(packageJson)) return null
-        val json = packageJson.readText()
-        val resolved = try {
-            context!!.eval("js", SUBPATH_EXPORT_RESOLVER).execute(json, subPath, preferRequire).let {
-                if (it.isString) it.asString() else null
-            }
-        } catch (e: Exception) {
-            null
-        } ?: return null
-        return resolveExtensionlessPath(packageDir.resolve(resolved).normalize())
-    }
-
-    // Mirrors Node's extension/directory-index probing for a path that doesn't resolve to
-    // an existing *file* as-is — e.g. a package.json `"main": "./index"` field with no file
-    // extension, a `require`/`import` specifier written without one, or (the directory case)
-    // a specifier like `require("./transports")` that names a directory containing its own
-    // `index.js`. If `path` names an existing regular file, it's returned unchanged;
-    // otherwise this tries, in order, `<path>.js`, `<path>.mjs`, `<path>.cjs`, `<path>.json`,
-    // then the same four extensions under `<path>/index.*`. Returns `path` itself if none of
-    // the probed candidates exist, leaving the caller to surface Node's usual "cannot find
-    // module" error against the original specifier.
-    //
-    // Deliberately checks `Files.isRegularFile` rather than `Files.exists` for the
-    // fast-path/unchanged-return case: `Files.exists` is also true for directories, so a
-    // specifier that happens to name an existing directory (e.g. engine.io's
-    // `require("./transports")`, where `./transports` is a directory whose real entry point
-    // is `./transports/index.js`) used to be returned as-is instead of falling through to the
-    // `<path>/index.*` probing below — the directory path was then handed straight to
-    // `Files.newByteChannel`/`Path.readText()`, which throw an unqualified "Is a directory"
-    // IOException with no guest-code stack frame (see NpmCompatibilityTest's socket.io/
-    // mongoose findings). A package.json `"exports"`/`"main"` field or wildcard subpath export
-    // that maps directly to a directory (rather than a file) hits this same fixed path, since
-    // every caller of this function funnels through here.
-    private fun resolveExtensionlessPath(path: Path): Path {
-        if (Files.isRegularFile(path)) return path
-        val extensions = listOf("js", "mjs", "cjs", "json")
-        for (ext in extensions) {
-            val withExt = Path.of("$path.$ext")
-            if (Files.isRegularFile(withExt)) return withExt
-        }
-        for (ext in extensions) {
-            val indexWithExt = path.resolve("index.$ext")
-            if (Files.isRegularFile(indexWithExt)) return indexWithExt
-        }
-        return path
-    }
-
-    // Resolves a `#`-prefixed "subpath import" specifier (e.g. `#ansi-styles`) against the
-    // nearest ancestor `package.json`'s `"imports"` field, per Node's subpath-imports
-    // resolution — a private-to-the-package specifier-remapping mechanism distinct from
-    // `"exports"`. Walks up from `fromDir` looking for the first `package.json` that both
-    // exists and declares an `"imports"` entry for `specifier`; returns null (letting the
-    // caller report a "cannot find module" error) if none is found. The resolved value is
-    // returned as an absolute path relative to that package.json's own directory.
-    private fun resolveSubpathImport(specifier: String, fromDir: Path): Path? {
-        var dir: Path? = fromDir.toAbsolutePath().normalize()
-        while (dir != null) {
-            val packageJson = dir.resolve("package.json")
-            if (Files.exists(packageJson)) {
-                val json = packageJson.readText()
-                val resolved = try {
-                    context!!.eval("js", IMPORTS_RESOLVER).execute(json, specifier).let {
-                        if (it.isString) it.asString() else null
-                    }
-                } catch (e: Exception) {
-                    null
-                }
-                if (resolved != null) return dir.resolve(resolved).normalize()
-                // A package.json with no matching (or no) "imports" entry stops the walk —
-                // subpath imports are private to the *nearest* package boundary, mirroring
-                // Node's own behavior of not searching past the first package.json found.
-                return null
-            }
-            dir = dir.parent
-        }
-        return null
-    }
-
-    // Node stdlib modules Mycelium ships as synthetic ESM resources rather than resolving
-    // through node_modules — see library/src/main/resources/node-stdlib/. Both the bare
-    // ("path") and "node:"-prefixed forms are accepted, per Node's own convention.
-    private val coreModules = mapOf(
-        "path" to "path.mjs",
-        "node:path" to "path.mjs",
-        "events" to "events.mjs",
-        "node:events" to "events.mjs",
-        "util" to "util.mjs",
-        "node:util" to "util.mjs",
-        "util/types" to "util-types.mjs",
-        "node:util/types" to "util-types.mjs",
-        "os" to "os.mjs",
-        "node:os" to "os.mjs",
-        "fs" to "fs.mjs",
-        "node:fs" to "fs.mjs",
-        "fs/promises" to "fs-promises.mjs",
-        "node:fs/promises" to "fs-promises.mjs",
-        "buffer" to "buffer.mjs",
-        "node:buffer" to "buffer.mjs",
-        "url" to "url.mjs",
-        "node:url" to "url.mjs",
-        "stream" to "stream.mjs",
-        "node:stream" to "stream.mjs",
-        "crypto" to "crypto.mjs",
-        "node:crypto" to "crypto.mjs",
-        "process" to "process.mjs",
-        "node:process" to "process.mjs",
-        "assert" to "assert.mjs",
-        "node:assert" to "assert.mjs",
-        "assert/strict" to "assert.mjs",
-        "node:assert/strict" to "assert.mjs",
-        "querystring" to "querystring.mjs",
-        "node:querystring" to "querystring.mjs",
-        "string_decoder" to "string_decoder.mjs",
-        "node:string_decoder" to "string_decoder.mjs",
-        "zlib" to "zlib.mjs",
-        "node:zlib" to "zlib.mjs",
-        "http" to "http.mjs",
-        "node:http" to "http.mjs",
-        "https" to "https.mjs",
-        "node:https" to "https.mjs",
-        "tty" to "tty.mjs",
-        "node:tty" to "tty.mjs",
-        "http2" to "http2.mjs",
-        "node:http2" to "http2.mjs",
-        "net" to "net.mjs",
-        "node:net" to "net.mjs",
-        "tls" to "tls.mjs",
-        "node:tls" to "tls.mjs",
-        "child_process" to "child_process.mjs",
-        "node:child_process" to "child_process.mjs",
-        "diagnostics_channel" to "diagnostics_channel.mjs",
-        "node:diagnostics_channel" to "diagnostics_channel.mjs",
-        "async_hooks" to "async_hooks.mjs",
-        "node:async_hooks" to "async_hooks.mjs",
-        "readline" to "readline.mjs",
-        "node:readline" to "readline.mjs",
-        "readline/promises" to "readline-promises.mjs",
-        "node:readline/promises" to "readline-promises.mjs",
-        "worker_threads" to "worker_threads.mjs",
-        "node:worker_threads" to "worker_threads.mjs",
-        "module" to "module.mjs",
-        "node:module" to "module.mjs",
-        "dns" to "dns.mjs",
-        "node:dns" to "dns.mjs",
-        "dns/promises" to "dns-promises.mjs",
-        "node:dns/promises" to "dns-promises.mjs",
-        "timers" to "timers.mjs",
-        "node:timers" to "timers.mjs",
-        "timers/promises" to "timers-promises.mjs",
-        "node:timers/promises" to "timers-promises.mjs",
-        "perf_hooks" to "perf_hooks.mjs",
-        "node:perf_hooks" to "perf_hooks.mjs",
-    )
-
-    private fun syntheticCoreModulePath(resourceFile: String): Path =
-        Path.of("$CORE_MODULE_PREFIX$resourceFile")
-
-    private fun readCoreModule(path: Path): SeekableByteChannel {
-        val resourceName = path.toString().removePrefix(CORE_MODULE_PREFIX)
-        val stream = javaClass.classLoader.getResourceAsStream("node-stdlib/$resourceName")
-            ?: throw MyceliumException("mycelium: unknown core module resource '$resourceName'")
-        val content = stream.use { it.readBytes() }.toString(StandardCharsets.UTF_8)
-        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
-    }
-
-    // Decides whether a `.js`/`.cjs` file should be treated as CommonJS (and therefore
-    // transpiled to ESM before GraalJS sees it). `.mjs` is always ESM, `.cjs` is always
-    // CommonJS; for plain `.js`, Node's own rule applies — walk up to the nearest ancestor
-    // `package.json` and check its `"type"` field, defaulting to CommonJS when absent
-    // (either because there's no package.json at all, or it doesn't say `"type": "module"`).
-    private fun isCjsFile(path: Path): Boolean {
-        when (path.extension) {
-            "mjs" -> return false
-            "cjs" -> return true
-            "js" -> {}
-            else -> return false
-        }
-        var dir = path.parent
-        while (dir != null) {
-            val packageJson = dir.resolve("package.json")
-            if (Files.exists(packageJson)) {
-                return try {
-                    val json = packageJson.readText()
-                    context!!.eval("js", PACKAGE_TYPE_RESOLVER).execute(json).asString() != "module"
-                } catch (e: Exception) {
-                    true
-                }
-            }
-            dir = dir.parent
-        }
-        return true
-    }
-
-    // Backs the `require` shim InterceptingFileSystem prepends to transpiled CJS output
-    // (see the CJS branch of newByteChannel) — wired up as the JS global
-    // `__mycelium_require__` in Mycelium.init. `fromDirStr` is the requiring file's own
-    // directory, captured at transpile time (not the source-directory stack, which has
-    // already been popped by the time the transpiled module's top-level code — including
-    // its `require(...)` calls — actually runs).
-    fun requireModule(specifier: String, fromDirStr: String): org.graalvm.polyglot.Value {
-        val fromDir = Path.of(fromDirStr)
-        val resolved = resolveRequireTarget(specifier, fromDir)
-        // Mycelium has no real N-API/native-addon loader (no dlopen, no Node-API host
-        // bridge) — a `.node` file can never actually be `require()`d, whether or not it
-        // exists on disk. Reporting it the same way Node reports a genuinely-missing
-        // module (MODULE_NOT_FOUND, rather than e.g. attempting to read the binary as JS
-        // source and letting GraalJS's parser choke on it with a `.code`-less SyntaxError)
-        // is what lets packages with a graceful "no prebuilt binary for this platform"
-        // fallback path — like sharp's own `errors.push(err)`-per-candidate loop in
-        // dist/sharp.mjs — actually take it instead of crashing on a missing `.code`. See
-        // throwModuleNotFound and NpmCompatibilityTest.sharpFailsGracefullyWithNodeShapedError.
-        if (!resolved.startsWith(CORE_MODULE_PREFIX) && resolved.extension == "node") {
-            throwModuleNotFound(specifier, fromDir)
-        }
-        val cacheKey = resolved.toString()
-
-        cjsModuleCache[cacheKey]?.let { return it.getMember("exports") }
-
-        return if (resolved.startsWith(CORE_MODULE_PREFIX)) {
-            requireCoreModule(resolved, cacheKey)
-        } else {
-            requireCjsModule(resolved, cacheKey)
-        }
-    }
-
-    // Backs `require.resolve(specifier)` — wired up as the JS global
-    // `__mycelium_require_resolve__` in Mycelium.init. Runs the exact same resolution
-    // logic `require()` itself uses (relative paths, core modules, node_modules walk) but
-    // hands back the resolved path/specifier without ever loading the module. Core modules
-    // resolve back to their bare specifier (e.g. "fs"), matching Node's own
-    // `require.resolve('fs') === 'fs'` behavior, rather than exposing Mycelium's internal
-    // synthetic resource path.
-    fun resolveRequireSpecifier(specifier: String, fromDirStr: String): String {
-        val fromDir = Path.of(fromDirStr)
-        if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
-            coreModules[specifier]?.let { return specifier }
-        }
-        val resolved = resolveRequireTarget(specifier, fromDir)
-        if (resolved.startsWith(CORE_MODULE_PREFIX)) return specifier
-        return resolved.toString()
-    }
-
-    // Backs `require.resolve.paths(specifier)` — the list of `node_modules` directories
-    // that would be searched for `specifier` starting from `fromDirStr`, in search order.
-    // Returns an empty array for relative/absolute specifiers and core modules (Node
-    // returns `null` for core modules; an empty array is close enough for the common
-    // "does resolution work" use case and avoids modeling a nullable return through the
-    // polyglot boundary).
-    fun resolveRequireSpecifierPaths(specifier: String, fromDirStr: String): Array<String> {
-        if (specifier.startsWith(".") || specifier.startsWith("/")) return emptyArray()
-        if (coreModules.containsKey(specifier)) return emptyArray()
-        val result = mutableListOf<String>()
-        var dir: Path? = Path.of(fromDirStr).toAbsolutePath().normalize()
-        while (dir != null) {
-            result.add(dir.resolve("node_modules").toString())
-            dir = dir.parent
-        }
-        return result.toTypedArray()
-    }
-
-    // Node's stdlib shims (path, events, ...) are shipped as genuine ESM sources rather
-    // than CommonJS (see node-stdlib/ resources), so they're evaluated as an ES module
-    // directly instead of being run through the Node-style CJS wrapper requireCjsModule
-    // uses. Still cached under the same `{ exports, loaded }` shape as CJS modules so the
-    // cache-lookup fast path in requireModule works uniformly regardless of which kind of
-    // module was loaded.
-    private fun requireCoreModule(resolved: Path, cacheKey: String): org.graalvm.polyglot.Value {
-        val content = readChannelToString(readCoreModule(resolved))
-        // Core modules live at a synthetic path with no real parent directory on disk (and
-        // have no relative imports of their own to resolve), so their temp file goes in
-        // the system temp dir rather than alongside a nonexistent "resolved.parent".
-        return requireEsmModule(content, cacheKey, tmpFileDir = null)
-    }
-
-    // Evaluates `content` as a genuine ES module (rather than through the Node-style CJS
-    // wrapper requireCjsModule uses) and caches the result the same way, for callers that
-    // determined the target isn't actually CommonJS — core stdlib modules, and `.js` files
-    // that are nominally CommonJS by Node's package.json rule but contain genuine ESM
-    // syntax anyway (see looksLikeEsm).
-    private fun requireEsmModule(content: String, cacheKey: String, tmpFileDir: File?): org.graalvm.polyglot.Value {
-        // Mirrors Mycelium.evalModule: writing to a real, `.mjs`-suffixed temp file
-        // (rather than an in-memory CharSequence Source) is what actually makes GraalJS
-        // both parse it as a module *and* hand context.eval() back the module's namespace
-        // object instead of `undefined` — a bare `.mimeType(...)` hint on a CharSequence
-        // Source was tried and evaluated fine but returned an empty namespace. The temp
-        // file is created alongside the source's own directory (when known) so any
-        // relative imports inside `content` keep resolving against the right base
-        // directory.
-        val tmpFile = File.createTempFile("mycelium-require-esm-", ".mjs", tmpFileDir)
-        val moduleValue = try {
-            tmpFile.writeText(content)
-            context!!.eval(Source.newBuilder("js", tmpFile).build())
-        } finally {
-            tmpFile.delete()
-        }
-        // Mirrors Node's CJS/ESM interop: a module with a default export hands that back
-        // verbatim; a module with only named exports hands back its whole namespace
-        // object instead.
-        val exports = if (moduleValue.hasMember("default")) moduleValue.getMember("default") else moduleValue
-        val moduleObj = context!!.eval("js", "({ exports: undefined, loaded: true })")
-        moduleObj.putMember("exports", exports)
-        cjsModuleCache[cacheKey] = moduleObj
-        return exports
-    }
-
-    // Runs `resolved`'s source through Node's own CJS module-wrapping convention —
-    // wrapping it in `(function(exports, require, module, __filename, __dirname) { ... })`
-    // and invoking that function with a fresh `module`/`exports` object — rather than
-    // transpiling to ESM (the previous CjsCompiler/esbuild approach). This is what makes
-    // `module`, `exports`, `require`, `__filename` and `__dirname` all behave exactly as
-    // they do in Node without any static rewriting, and (combined with inserting the
-    // module object into the cache *before* calling the wrapper below) is what makes
-    // circular requires return partial exports instead of stack-overflowing.
-    private fun requireCjsModule(resolved: Path, cacheKey: String): org.graalvm.polyglot.Value {
-        val filename = resolved.toString()
-        val dir = (resolved.parent ?: resolved).toString()
-        val content = resolved.readText()
-
-        // See looksLikeEsm: a file can be *treated* as CommonJS by Node's own
-        // package.json-driven rule while still containing genuine ESM syntax — evaluate
-        // such content as a real ES module instead of wrapping it as CJS (which would be
-        // a syntax error, since `export`/top-level `import` aren't legal inside a
-        // function body).
-        if (looksLikeEsm(content)) {
-            return requireEsmModule(content, cacheKey, tmpFileDir = (resolved.parent ?: resolved).toFile())
-        }
-
-        val moduleObj = context!!.eval(
-            "js",
-            "({ exports: {}, id: ${jsonStringLiteral(filename)}, " +
-                "filename: ${jsonStringLiteral(filename)}, loaded: false })"
-        )
-        // Inserted into the cache *before* the module body runs below — this is what
-        // makes a circular require (A requires B while B is still in the middle of
-        // requiring A) return the same, possibly-still-partial `module.exports` object
-        // reference instead of recursively re-evaluating A and stack-overflowing.
-        cjsModuleCache[cacheKey] = moduleObj
-
-        // A `require("./data.json")` should hand back the parsed JSON value itself (as in
-        // Node), not run JSON source text through the function wrapper below (which would
-        // parse as a syntactically-invalid function body for anything but a bare object
-        // literal statement).
-        if (resolved.extension == "json") {
-            val parsed = context!!.eval("js", "(function(json) { return JSON.parse(json); })").execute(content)
-            moduleObj.putMember("exports", parsed)
-            moduleObj.putMember("loaded", true)
-            return parsed
-        }
-
-        // Each module gets its own `require` function, closing over *that* module's own
-        // directory — not the entry file's — so a relative `require("./x")` inside a
-        // nested module resolves against the directory it actually lives in.
-        val requireForModule = context!!.eval(
-            "js",
-            "(function() {\n" +
-                "    const req = function(id) { return globalThis.__mycelium_require__(id, ${jsonStringLiteral(dir)}); };\n" +
-                "    req.resolve = function(id) { return globalThis.__mycelium_require_resolve__(id, ${jsonStringLiteral(dir)}); };\n" +
-                "    req.resolve.paths = function(id) { return Array.from(globalThis.__mycelium_require_resolve_paths__(id, ${jsonStringLiteral(dir)})); };\n" +
-                "    return req;\n" +
-                "})()"
-        )
-
-        val wrapperSource = "(function(exports, require, module, __filename, __dirname) {\n" +
-            content +
-            "\n})"
-        val wrapperFn = context!!.eval(Source.newBuilder("js", wrapperSource, filename).build())
-
-        wrapperFn.execute(moduleObj.getMember("exports"), requireForModule, moduleObj, filename, dir)
-        moduleObj.putMember("loaded", true)
-        return moduleObj.getMember("exports")
-    }
-
-    // Node's CJS/ESM interop statically analyzes a required CJS module's exports object
-    // (via cjs-module-lexer) and synthesizes a named ES export for each of its own
-    // properties — that's what makes `import { detect } from 'chardet'` work even though
-    // chardet only ever does `module.exports.detect = ...` / `exports.detect = ...`, never
-    // an explicit ESM `export`. Mycelium has no static lexer, so this mirrors that by
-    // actually `require()`-ing the module right now (via requireModule, the exact same
-    // path/cache `__mycelium_require__` uses at runtime — see cjsModuleCache) purely to
-    // discover its own member keys, then bakes a `export const x = _mod.x;` per member
-    // into the generated shim alongside the whole-module default export. Because
-    // requireModule shares cjsModuleCache with `__mycelium_require__`, the module's
-    // top-level code still only runs once: this call runs it (if not already cached), and
-    // the `__mycelium_require__` call embedded in the shim below just replays the cached
-    // `module.exports` when the shim itself is evaluated.
-    private fun buildCjsEsmShim(path: String, dir: String): String {
-        val exportsValue = requireModule(path, dir)
-        val sb = StringBuilder()
-        sb.append("const _mod = globalThis.__mycelium_require__(")
-        sb.append(jsonStringLiteral(path)).append(", ").append(jsonStringLiteral(dir)).append(");\n")
-        sb.append("export default _mod;\n")
-        // `module.exports = function(){...}` (or any other non-object primitive) is a
-        // valid CJS export shape — hasMembers() is false for those (well, functions do
-        // have members, but e.g. a string/number export doesn't), so guard before
-        // enumerating rather than letting memberKeys throw/return garbage.
-        if (exportsValue.hasMembers()) {
-            for (key in exportsValue.memberKeys) {
-                // Node never re-exports "default" as a named binding (it's already the
-                // default export above), and only valid JS identifiers/non-reserved-words
-                // can become `export const <name> = ...;` declarations — anything else
-                // (numeric keys, "foo-bar", etc.) is simply skipped, same as cjs-module-lexer.
-                if (key == "default" || !JsSupport.isValidExportName(key)) continue
-                sb.append("export const ").append(key).append(" = _mod.").append(key).append(";\n")
-            }
-        }
-        return sb.toString()
-    }
-
-    // Escapes `s` as a JS double-quoted string literal, for splicing an arbitrary
-    // filesystem path into generated JS source text.
-    private fun jsonStringLiteral(s: String): String =
-        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-
-    private fun readChannelToString(channel: SeekableByteChannel): String {
-        // Both SeekableByteChannel implementations InterceptingFileSystem hands out
-        // (ReadOnlyBufferChannel, HttpChannel) fill the destination buffer's backing
-        // array directly without advancing its position — relying on `hasRemaining()`
-        // to drive the read loop (as ordinary SeekableByteChannel consumers do) would
-        // spin the buffer's position at 0 forever. Advance it manually from each call's
-        // return value instead.
-        val size = channel.size().toInt()
-        val buffer = java.nio.ByteBuffer.allocate(size)
-        channel.use {
-            var total = 0
-            while (total < size) {
-                val n = it.read(buffer)
-                if (n < 0) break
-                total += n
-                buffer.position(total)
-            }
-        }
-        buffer.flip()
-        return StandardCharsets.UTF_8.decode(buffer).toString()
-    }
-
-    // Resolves a `require()` specifier the same way Node would: relative/absolute paths
-    // resolve against the requiring file's directory (trying a few conventional
-    // extensions if the exact path doesn't exist), core modules resolve to their
-    // synthetic resource path, and everything else resolves via the same node_modules
-    // walk bare ESM imports use.
-    private fun resolveRequireTarget(specifier: String, fromDir: Path): Path {
-        if (specifier.startsWith(".") || specifier.startsWith("/")) {
-            val candidate = fromDir.resolve(specifier).normalize()
-            // Previously short-circuited on `candidate.extension.isNotEmpty()` to skip
-            // extension-probing an already-extensioned candidate — but `Path.extension`
-            // just looks for the last `.` in the filename, which false-positives on
-            // filenames that contain a `.` without it being a real extension separator
-            // (e.g. `require('./Reflect.getPrototypeOf')` resolving to the file
-            // `Reflect.getPrototypeOf.js`: `.getPrototypeOf` reads as a nonempty
-            // "extension" even though the specifier has no real extension at all). Always
-            // falling through to resolveExtensionlessPath when the literal path doesn't
-            // resolve to a regular file is safe either way — it returns `candidate`
-            // unchanged if none of the probed variants exist either, so genuinely-missing
-            // modules still error out exactly as before.
-            //
-            // Checks `isRegularFile`, not `exists` — `exists` is also true for directories,
-            // and a bare `require("./transports")` naming a directory (whose real entry
-            // point is `./transports/index.js`) used to short-circuit here and return the
-            // directory itself, which `requireCjsModule`'s later `resolved.readText()` then
-            // choked on with an unqualified, guest-stack-free "Is a directory" IOException
-            // (see engine.io, a socket.io transitive dependency, in NpmCompatibilityTest).
-            if (Files.isRegularFile(candidate)) return candidate
-            val resolved = resolveExtensionlessPath(candidate)
-            // resolveExtensionlessPath hands back `candidate` itself, unresolved, when none
-            // of the probed variants exist — surface Node's usual "cannot find module"
-            // error here (with a real `.code`, see throwModuleNotFound) rather than letting
-            // the caller's `Path.readText()` blow up with a raw, unqualified
-            // FileSystemException that has no `.code` for guest code to inspect (e.g.
-            // sharp's native-binding loader probes several `require("../src/build/Release/
-            // sharp-*.node")`-shaped relative paths that are never actually shipped in the
-            // npm package, expecting a Node-shaped MODULE_NOT_FOUND it can catch).
-            if (!Files.isRegularFile(resolved)) throwModuleNotFound(specifier, fromDir)
-            return resolved
-        }
-        coreModules[specifier]?.let { return syntheticCoreModulePath(it) }
-        // preferRequire = true: this is a CJS require() target, so a dual-mode package's
-        // exports map should prefer its "require" condition over "import" — see
-        // resolveNodeModule's own comment.
-        return when (val resolution = resolveNodeModule(specifier, fromDir, preferRequire = true)) {
-            is NodeModuleResolution.Found -> resolution.path
-            is NodeModuleResolution.PackageNotFound, NodeModuleResolution.NoNodeModulesTree ->
-                throwModuleNotFound(specifier, fromDir)
-        }
-    }
-
-    // Throws a genuine, guest-catchable JS `Error` shaped like Node's own require()
-    // failure — `code: "MODULE_NOT_FOUND"` and a "Cannot find module '...'" message —
-    // rather than letting a Kotlin `MyceliumException` (or a raw filesystem exception)
-    // cross the polyglot boundary as an opaque host exception. GraalJS surfaces an
-    // uncaught Kotlin/Java exception thrown from a `ProxyExecutable` (the `require()` shim
-    // — see Mycelium.requireFn) to guest `catch` blocks as a value with no `.code`
-    // property at all, which is exactly what used to make sharp's own error-formatting
-    // loop (`err.code.endsWith("MODULE_NOT_FOUND")`) crash with a `TypeError: Cannot read
-    // property 'endsWith' of undefined` instead of reporting its own "no native binding
-    // found" message — see NpmCompatibilityTest.sharpFailsGracefullyWithNodeShapedError. Building the `Error` via
-    // `context.eval` and handing it to `Value.throwException()` (rather than just
-    // `throw MyceliumException(...)`) is what makes it arrive in guest code as a real,
-    // `instanceof Error` object with a working `.code`.
-    private fun throwModuleNotFound(specifier: String, fromDir: Path): Nothing {
-        val errorValue = context!!.eval(
-            "js",
-            "(function (message, code) {\n" +
-                "    var e = new Error(message);\n" +
-                "    e.code = code;\n" +
-                "    return e;\n" +
-                "})"
-        ).execute(
-            "Cannot find module '$specifier'\nRequire stack:\n- $fromDir",
-            "MODULE_NOT_FOUND"
-        )
-        throw errorValue.throwException()
-    }
-
-    // Whether `content`'s top level actually uses ESM `import`/`export` syntax, regardless
-    // of what isCjsFile concluded from the file's extension/package.json — a `.js` file
-    // under a package.json lacking `"type": "module"` is *treated* as CommonJS by Node's
-    // own rule, but some fixtures/packages in the wild (and in this codebase's own tests,
-    // e.g. writeFakePackage) ship genuine ESM source under that configuration anyway.
-    // Wrapping such a file in the CJS `(function(exports, require, module, ...) { ... })`
-    // wrapper would be a syntax error (`export`/top-level `import` aren't legal inside a
-    // function body), so both requireCjsModule and the ESM-import branch of newByteChannel
-    // check this first and fall back to evaluating the content as a genuine ES module.
-    private val esmSyntaxPattern = Regex("(?m)^\\s*(import\\s|import\\{|export\\s|export\\{|export\\*)")
-
-    private fun looksLikeEsm(content: String): Boolean = esmSyntaxPattern.containsMatchIn(content)
-
-    companion object {
-        private const val CORE_MODULE_PREFIX = "/.mycelium-core/"
-
-        private val PACKAGE_TYPE_RESOLVER = """
-            (function (json) {
-                try { return JSON.parse(json).type || "commonjs"; }
-                catch (e) { return "commonjs"; }
-            })
-        """.trimIndent()
-
-        // Resolves a package.json `"exports"` (or `"imports"`) conditions value to a plain
-        // path string. A conditions value isn't necessarily a flat `{import, require,
-        // default}` object with string leaves — packages like axios nest another
-        // conditions object *inside* a condition's own value (e.g. `exports["."].default`
-        // is itself `{require: "...", default: "..."}`), so this recurses into any
-        // condition whose value is an object rather than assuming one level of nesting is
-        // the bottom. `conditions`, in priority order, are the only keys ever descended
-        // into — unlisted keys (`types`, `browser`, `bun`, `react-native`, ...) are
-        // ignored at every level, mirroring how Node only matches conditions it actually
-        // supports rather than falling back to an arbitrary platform-specific one.
-        private val RESOLVE_CONDITIONS_FN = """
-            function resolveConditions(node, conditions) {
-                if (typeof node === "string") return node;
-                if (Array.isArray(node)) {
-                    // Node's array-fallback form for exports/imports targets: try each
-                    // element in declaration order and use the first that resolves to
-                    // something (a string, or an object/nested-array that itself resolves
-                    // via recursion) — e.g. escalade's
-                    // `"./sync": [{"import": "./sync/index.mjs"}, "./sync/index.js"]`.
-                    for (var j = 0; j < node.length; j++) {
-                        var candidate = resolveConditions(node[j], conditions);
-                        if (candidate) return candidate;
-                    }
-                    return null;
-                }
-                if (!node || typeof node !== "object") return null;
-                for (var i = 0; i < conditions.length; i++) {
-                    if (Object.prototype.hasOwnProperty.call(node, conditions[i])) {
-                        var result = resolveConditions(node[conditions[i]], conditions);
-                        if (result) return result;
-                    }
-                }
-                return null;
-            }
-        """.trimIndent()
-
-        // `preferRequire` picks the condition-priority order: a CJS `require()` resolution
-        // (see resolveRequireTarget) prefers the `"require"` condition over `"import"`, and
-        // vice versa for an ESM `import` (see parsePath) — a dual-mode package's `exports`
-        // map can declare sibling `"import"`/`"require"` conditions with no enclosing
-        // `"default"` (e.g. `ws`'s `{".": {"import": "./wrapper.mjs", "require":
-        // "./index.js"}}`), and always preferring `"import"` regardless of which module
-        // system is actually asking hands a `require()` caller an ESM-only module built for
-        // a different module system than the one requesting it.
-        private val ENTRY_POINT_RESOLVER = """
-            (function (json, preferRequire) {
-                $RESOLVE_CONDITIONS_FN
-                var pkg = JSON.parse(json);
-                var exp = pkg.exports;
-                var conditions = preferRequire ? ["node", "require", "default"] : ["node", "import", "default"];
-                if (exp) {
-                    var dot = typeof exp === "string" ? exp : (exp["."] !== undefined ? exp["."] : exp);
-                    var resolved = resolveConditions(dot, conditions);
-                    if (resolved) return resolved;
-                }
-                return pkg.main || "index.js";
-            })
-        """.trimIndent()
-
-        // Resolves a `#`-prefixed subpath-imports specifier against a package.json's
-        // "imports" field. The mapped value can be a plain string, or a conditions object
-        // keyed by environment (e.g. "node", "import", "require", "default") — per Node's
-        // own resolution order, "node" is preferred, then "import", then "default".
-        // Returns null (not a string) when there's no "imports" field or no matching entry,
-        // which the Kotlin caller distinguishes from a real string result via `isString`.
-        private val IMPORTS_RESOLVER = """
-            (function (json, specifier) {
-                $RESOLVE_CONDITIONS_FN
-                try {
-                    var pkg = JSON.parse(json);
-                    var imports = pkg.imports;
-                    if (!imports || typeof imports !== "object") return null;
-                    var entry = imports[specifier];
-                    if (entry === undefined) return null;
-                    return resolveConditions(entry, ["node", "import", "require", "default"]);
-                } catch (e) {
-                    return null;
-                }
-            })
-        """.trimIndent()
-
-        // Resolves a package-relative subpath specifier (the part of `pkg/foo/bar` after
-        // the package name — see resolveSubpathExport) against that package's own
-        // `package.json` `"exports"` map. Tries an exact `"./<subPath>"` key first, then
-        // falls back to a single-`*`-wildcard pattern key (Node requires the wildcard match
-        // to be the *highest-specificity* one, but in practice packages don't define
-        // overlapping patterns, so first-match-in-declaration-order is sufficient here).
-        // Returns null (not a string) when there's no `"exports"` field, `exports` is a bare
-        // string (meaning the package has no subpath exports at all, only a root export),
-        // or no key/pattern matches — which the Kotlin caller distinguishes from a real
-        // string result via `isString`, falling back to a literal on-disk path check.
-        // `preferRequire` has the same meaning as on ENTRY_POINT_RESOLVER above — `true` for
-        // a CJS `require()` resolution, `false` for an ESM `import`.
-        private val SUBPATH_EXPORT_RESOLVER = """
-            (function (json, subPath, preferRequire) {
-                $RESOLVE_CONDITIONS_FN
-                try {
-                    var pkg = JSON.parse(json);
-                    var exp = pkg.exports;
-                    if (!exp || typeof exp !== "object") return null;
-                    var conditions = preferRequire ? ["node", "require", "default"] : ["node", "import", "default"];
-                    var key = "./" + subPath;
-                    if (Object.prototype.hasOwnProperty.call(exp, key)) {
-                        return resolveConditions(exp[key], conditions);
-                    }
-                    var keys = Object.keys(exp);
-                    for (var i = 0; i < keys.length; i++) {
-                        var k = keys[i];
-                        var starIdx = k.indexOf("*");
-                        if (starIdx === -1) continue;
-                        var prefix = k.slice(0, starIdx);
-                        var suffix = k.slice(starIdx + 1);
-                        if (key.indexOf(prefix) === 0 && key.slice(key.length - suffix.length) === suffix) {
-                            var matched = key.slice(prefix.length, key.length - suffix.length);
-                            var target = resolveConditions(exp[k], conditions);
-                            if (typeof target === "string") return target.split("*").join(matched);
-                        }
-                    }
-                    return null;
-                } catch (e) {
-                    return null;
-                }
-            })
-        """.trimIndent()
-    }
+    fun resolveRequireSpecifierPaths(specifier: String, fromDirStr: String): Array<String> =
+        cjsRuntime.resolveRequireSpecifierPaths(specifier, fromDirStr)
 
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) {
         val absolute = toAbsolutePath(path)
-        val probed = if (!absolute.startsWith("/.mycelium/") && !absolute.startsWith(CORE_MODULE_PREFIX)) {
-            resolveExtensionlessPath(absolute)
+        val probed = if (!absolute.startsWith("/.mycelium/") && !absolute.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) {
+            nodeModuleResolver.resolveExtensionlessPath(absolute)
         } else {
             absolute
         }
@@ -1149,13 +352,13 @@ class InterceptingFileSystem : FileSystem {
         val path = if (!options.contains(StandardOpenOption.WRITE) &&
             !options.contains(StandardOpenOption.CREATE) &&
             !resolvedPath.startsWith("/.mycelium/") &&
-            !resolvedPath.startsWith(CORE_MODULE_PREFIX)
+            !resolvedPath.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)
         ) {
-            resolveExtensionlessPath(resolvedPath)
+            nodeModuleResolver.resolveExtensionlessPath(resolvedPath)
         } else {
             resolvedPath
         }
-        val pushed = path.isAbsolute && !path.startsWith("/.mycelium/") && !path.startsWith(CORE_MODULE_PREFIX)
+        val pushed = path.isAbsolute && !path.startsWith("/.mycelium/") && !path.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)
         if (pushed) {
             val parent = path.parent ?: path
             sourceDirectoryStack.get().addFirst(parent)
@@ -1171,9 +374,9 @@ class InterceptingFileSystem : FileSystem {
         }
         try {
             // Node stdlib modules (`path`, ...) are served from bundled resources rather
-            // than the real filesystem — see readCoreModule / the coreModules map above.
-            if (path.startsWith(CORE_MODULE_PREFIX)) {
-                return readCoreModule(path)
+            // than the real filesystem — see CoreModuleRegistry.readCoreModule.
+            if (path.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) {
+                return CoreModuleRegistry.readCoreModule(path)
             }
             // TypeScript is transpiled to plain JS via esbuild before GraalJS ever sees it —
             // GraalJS itself has no TypeScript support. This only strips types/syntax (no
@@ -1192,26 +395,27 @@ class InterceptingFileSystem : FileSystem {
             // `import` machinery asks for the byte content of a CJS file (e.g. a plain
             // `import x from "./foo.js"` where foo.js is CommonJS), a one-line ESM shim
             // is handed back that defers to the exact same Node-style module loader
-            // `require()` itself uses — InterceptingFileSystem.requireModule, via the
+            // `require()` itself uses — CjsRuntime.requireModule, via the
             // `__mycelium_require__` global Mycelium.init wires up. Routing both `import`
             // and `require()` of a CJS file through requireModule means both share its
             // module cache: `import`ing the same CJS file twice, or `require`ing it from
             // two different modules, evaluates its top-level code exactly once and hands
-            // back the same `module.exports` object each time (see cjsModuleCache).
+            // back the same `module.exports` object each time (see CjsRuntime.cjsModuleCache).
             if (!path.startsWith("/.mycelium/") &&
-                isCjsFile(path) &&
+                nodeModuleResolver.isCjsFile(path) &&
                 !options.contains(StandardOpenOption.WRITE) &&
                 !options.contains(StandardOpenOption.CREATE)
             ) {
                 val content = path.readText()
-                // See looksLikeEsm: a `.js` file can be *treated* as CommonJS by Node's
-                // own package.json-driven rule while still containing genuine ESM syntax
-                // — pass such content through unchanged rather than wrapping it as CJS.
-                if (looksLikeEsm(content)) {
+                // See NodeModuleResolver.looksLikeEsm: a `.js` file can be *treated* as
+                // CommonJS by Node's own package.json-driven rule while still containing
+                // genuine ESM syntax — pass such content through unchanged rather than
+                // wrapping it as CJS.
+                if (nodeModuleResolver.looksLikeEsm(content)) {
                     return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(content))
                 }
                 val dir = (path.parent ?: path).toString()
-                val esmShim = buildCjsEsmShim(path.toString(), dir)
+                val esmShim = cjsRuntime.buildCjsEsmShim(path.toString(), dir)
                 return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(esmShim))
             }
             val mc = mycelium!!
@@ -1233,12 +437,12 @@ class InterceptingFileSystem : FileSystem {
                 // "wasm" for Go) keeps this in sync with whatever Compiler.compile actually
                 // wrote to disk.
                 val value = if (targetLang.outputExtension == "wasm") {
-                    loadWasmExports(compiled)
+                    Compiler.loadWasmExports(context!!, compiled)
                 } else {
                     val source = Source.newBuilder("llvm", compiled.toFile()).build()
                     context!!.eval(source)
                 }
-                return generateShim(hostLang, value, path.toString())
+                return shimGenerator.generateCrossLanguageShim(hostLang, value, path.toString())
             }
             if (hostLang.languageId == targetLang?.languageId || targetLang == null) {
                 return if (path.startsWith("/.mycelium/")) {
@@ -1281,91 +485,13 @@ class InterceptingFileSystem : FileSystem {
                     path.readText()
                 }
                 val value = context!!.eval(targetLang.languageId, code)
-                return generateShim(hostLang, value, path.toString())
+                return shimGenerator.generateCrossLanguageShim(hostLang, value, path.toString())
             }
         } finally {
             if (pushed) {
                 sourceDirectoryStack.get().removeFirst()
             }
         }
-    }
-
-    // GraalVM's own "wasm" Truffle language (context.eval("wasm", file)) hands back a
-    // Value with zero memberKeys — there is no supported way to reach a WASM module's
-    // exports through the raw Truffle wasm language directly, which makes it useless for
-    // shim generation (see the CRITICAL BLOCKER note on TinyGoSupport in Languages.kt).
-    // Instead, this loads the module through GraalJS's built-in `WebAssembly` global (the
-    // same JS API browsers/Node expose): compile a `WebAssembly.Module` from the compiled
-    // binary's bytes and instantiate it, then return `instance.exports` — an ordinary JS
-    // object whose memberKeys generateShim can already enumerate exactly like it does for
-    // LLVM-backed exports.
-    //
-    // The compiled bytes are handed to JS via a polyglot binding (a plain Java byte array)
-    // rather than splicing them into JS source text, so this doesn't choke on/slow to a
-    // crawl for larger WASM binaries. tinygo's `-target=wasi` output imports a handful of
-    // WASI preview1 functions even for WASI-oblivious code like `add.go` (its runtime init
-    // pulls them in); those are stubbed out below with harmless no-ops since none of them
-    // are expected to be exercised by cross-language-imported pure functions.
-    private fun loadWasmExports(compiled: Path): org.graalvm.polyglot.Value {
-        val wasmBytes = Files.readAllBytes(compiled)
-        val bindingsKey = "__mycelium_wasm_bytes__${compiled.fileName}__${System.nanoTime()}__"
-        context!!.polyglotBindings.putMember(bindingsKey, wasmBytes)
-        try {
-            return context!!.eval(
-                "js",
-                """
-                (function () {
-                    const bytes = Polyglot.import(${jsonStringLiteral(bindingsKey)});
-                    const u8 = new Uint8Array(bytes.length);
-                    for (let i = 0; i < bytes.length; i++) u8[i] = bytes[i] & 0xFF;
-                    const mod = new WebAssembly.Module(u8);
-                    const memory = new WebAssembly.Memory({ initial: 256 });
-                    const wasi = {
-                        fd_write: () => 0,
-                        fd_close: () => 0,
-                        fd_seek: () => 0,
-                        fd_read: () => 0,
-                        fd_fdstat_get: () => 0,
-                        fd_prestat_get: () => 8,
-                        fd_prestat_dir_name: () => 0,
-                        path_open: () => 0,
-                        proc_exit: () => {},
-                        args_sizes_get: () => 0,
-                        args_get: () => 0,
-                        environ_sizes_get: () => 0,
-                        environ_get: () => 0,
-                        clock_time_get: () => 0,
-                        random_get: () => 0,
-                        sched_yield: () => 0,
-                    };
-                    const inst = new WebAssembly.Instance(mod, {
-                        env: { memory: memory },
-                        wasi_snapshot_preview1: wasi,
-                    });
-                    return inst.exports;
-                })()
-                """.trimIndent()
-            )
-        } finally {
-            context!!.polyglotBindings.removeMember(bindingsKey)
-        }
-    }
-
-    private fun generateShim(
-        hostLang: LanguageSupport,
-        value: org.graalvm.polyglot.Value,
-        modulePath: String
-    ): SeekableByteChannel {
-        val bindings = context!!.polyglotBindings
-        val exports = mutableMapOf<String, String>()
-        for (k in value.memberKeys) {
-            if (!hostLang.isValidExportName(k)) continue
-            val namespacedKey = "$modulePath:$k"
-            bindings.putMember(namespacedKey, value.getMember(k))
-            exports[k] = namespacedKey
-        }
-        val shim = hostLang.generateShim(exports)
-        return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(shim))
     }
 
     override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> =

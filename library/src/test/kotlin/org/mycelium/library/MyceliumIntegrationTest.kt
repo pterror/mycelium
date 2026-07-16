@@ -682,14 +682,16 @@ class MyceliumIntegrationTest {
     // --- CoffeeScript / Civet, via the generalized compile-to-JS pipeline
     // (org.mycelium.library.compiler.CompileToJsDispatcher/NpmJsApiBackend) ---
     //
-    // Both gated on npm being on PATH, like yoloAutoInstallsMissingPackage/
-    // manifestInstallRunsNpmInstall above — CompilerDownloader needs real network access to
-    // the npm registry to fetch the `coffeescript`/`@danielx/civet` compiler packages into
-    // Mycelium's own compiler cache the first time either test runs anywhere on this machine.
+    // No longer gated on npm being on PATH: CompilerDownloader/CompilerRegistry resolve and
+    // fetch the `coffeescript`/`@danielx/civet` compiler packages via the pure-Kotlin
+    // NpmRegistryClient + PackageCache (Mycelium's own compiler cache), not a real `npm`
+    // subprocess — see CompilerDownloader's class doc comment. Real network access to the
+    // npm registry is still required the first time either test runs anywhere on this
+    // machine (subsequent runs hit the on-disk cache), but no npm/pnpm/node binary is ever
+    // shelled out to.
 
     @Test fun jsImportsCoffeeScript() {
         val mc = vm
-        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping CoffeeScript compile-to-JS test")
         val path = testResourcePath("typed.coffee")
         runJsWithImports(mc, """
             import { add } from "$path";
@@ -701,7 +703,6 @@ class MyceliumIntegrationTest {
 
     @Test fun jsImportsCivet() {
         val mc = vm
-        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping Civet compile-to-JS test")
         val path = testResourcePath("typed.civet")
         runJsWithImports(mc, """
             import { add } from "$path";
@@ -906,13 +907,13 @@ class MyceliumIntegrationTest {
 
     // --- --yolo auto-install ---
 
-    // Real network + npm dependent: creates a fresh temp project with no node_modules,
-    // imports a tiny real npm package, and lets --yolo shell out to `npm install` to
-    // fetch it before retrying resolution. Skipped (not failed) wherever npm isn't on
-    // PATH, mirroring jsImportsRust's assumeTrue-gated skip for rustc above.
+    // Real-network dependent (but not npm-dependent): creates a fresh temp project with no
+    // node_modules, imports a tiny real npm package, and lets --yolo install it before
+    // retrying resolution. `yoloInstall` (InterceptingFileSystem.kt) tries the pure-Kotlin
+    // PackageInstaller path (NpmRegistryClient + PackageCache, no subprocess) first and only
+    // falls back to shelling out to `npm install`/`pnpm install` if that fails — so this no
+    // longer needs npm/pnpm on PATH at all, just network access to the npm registry.
     @Test fun yoloAutoInstallsMissingPackage() {
-        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping --yolo network test")
-
         val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-yolo-").toFile()
         tmpDir.deleteOnExit()
 
@@ -1654,9 +1655,14 @@ class MyceliumIntegrationTest {
 
     // --- Manifest-based (package.json) auto-install ---
 
+    // Real-network dependent (but not npm-dependent): Mycelium.maybeInstallDependencies tries
+    // the pure-Kotlin PackageInstaller path first (NpmRegistryClient + PackageCache, no
+    // subprocess) and only falls back to shelling out to `npm install`/`pnpm install` if that
+    // fails — so, like yoloAutoInstallsMissingPackage above, this no longer needs npm/pnpm on
+    // PATH, just network access to the npm registry. Name kept for historical continuity
+    // (this test predates the pure-Kotlin install path) even though it no longer literally
+    // runs `npm install`.
     @Test fun manifestInstallRunsNpmInstall() {
-        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping manifest-install test")
-
         val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-manifest-install-").toFile()
         tmpDir.deleteOnExit()
         File(tmpDir, "package.json").apply {

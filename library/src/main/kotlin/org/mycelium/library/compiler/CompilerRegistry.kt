@@ -44,7 +44,14 @@ class CompilerRegistry {
             CompilerSpec(
                 languageId = "civet",
                 npmPackageName = "@danielx/civet",
-                defaultVersion = "0.9.24",
+                // "0.9.24" (this registration's previous pin) was never actually a
+                // published version — confirmed against the real npm registry, whose
+                // 0.9.x line stops at 0.9.8; discovered when jsImportsCivet's stale
+                // `assumeTrue(npm on PATH)` gate (removed this session, see
+                // MyceliumIntegrationTest.kt) was finally lifted and the test could
+                // actually reach the registry. "0.11.14" is the current "latest" dist-tag
+                // as of this writing.
+                defaultVersion = "0.11.14",
                 compileFunction = "require('@danielx/civet').compile",
                 // `sync: true` is required to get a plain string back synchronously —
                 // without it, civet.compile returns a Promise (it supports async plugins/
@@ -293,6 +300,34 @@ class CompilerRegistry {
         // shipping only alpha prereleases (no stable dist-tag) as of this writing, which
         // would make `defaultVersion` unstable regardless. Left for future work alongside a
         // NpmJsApiBackend enhancement (or a bespoke Imba backend) rather than guessed at here.
+        //
+        // Gleam, Dart, Kotlin/JS, Scala.js, and Fable were also investigated and NOT added —
+        // none has a compile path matching the existing JS_API/SUBPROCESS pattern without
+        // pulling in a dependency Mycelium otherwise avoids entirely:
+        //   - Gleam: the actual compiler is a Rust binary distributed via GitHub
+        //     releases/Hex, not published to npm at all (the `gleam` package on npm is an
+        //     unrelated isomorphic-entities JS library, confirmed by inspecting its registry
+        //     metadata).
+        //   - Dart (dart2js): requires the full Dart SDK; no self-contained npm package
+        //     exists that bundles a working dart2js — wrappers like `dart2jsaas` still
+        //     assume Dart is installed and reachable separately.
+        //   - Kotlin/JS (kotlinc-js): npm wrappers (`@jetbrains/kotlinc-js-api`,
+        //     `kotlin-node`) exist but need a full Kotlin/JS classpath plus stdlib jars
+        //     resolved alongside the compiler itself — the same "more than a single
+        //     binary/JS-function call" complexity class already ruled out for Imba above.
+        //   - Scala.js: needs `scala-cli`/sbt plus the Scala.js linker and library jars; no
+        //     simple single-binary or single-JS-API entry point exists.
+        //   - Fable: closest candidate. `@fable-org/fable-compiler-js` (verified against the
+        //     npm registry: `"bin": {"fable": "index.js"}`, `"type": "module"`) needs no
+        //     .NET SDK. But its `bin` is a plain ESM JS file that only runs via its own
+        //     `#!/usr/bin/env node` shebang — i.e. it requires a real `node` binary on PATH
+        //     to execute at all, since SubprocessBackend execs `binaryPath` directly (no
+        //     `node` prefix, unlike a hypothetical NodeJsApiBackend). That's a dependency
+        //     Mycelium's other compile-to-JS languages (CoffeeScript/Civet/LiveScript via
+        //     NpmJsApiBackend's in-Context `require()`; Elm/PureScript/ReScript's native
+        //     binaries) never need — adding it would be the first compile-to-JS language to
+        //     require an external Node.js installation, undermining the "no external tools
+        //     beyond GraalVM itself" design this whole registry otherwise upholds.
     }
 
     fun resolve(languageId: String): CompilerSpec? = specs[languageId]

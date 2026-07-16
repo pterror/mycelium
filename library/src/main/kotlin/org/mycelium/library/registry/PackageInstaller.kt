@@ -12,12 +12,13 @@ import java.nio.file.Path
 // compile-to-JS compiler packages, just installing into a *project's own* node_modules
 // directory instead of a private per-language cache directory.
 //
-// TODO(semver): like CompilerDownloader, this has no real semver-range resolver yet.
-// Exact versions ("1.2.3") are fetched as-is; anything else (a range, "^"/"~" prefix, a
-// dist-tag, or no version at all) falls back to whatever the registry's "latest"
-// dist-tag currently resolves to. A real range resolver/solver — matching multiple
-// candidate versions against a semver range and picking a maximally-shared set across
-// the whole dependency graph — is future work if this ever proves insufficient.
+// Version specs are resolved via SemverResolver: an exact version ("1.2.3") is fetched
+// as-is; a range ("^1.2.3", "~2.3.0", ">=1.0.0 <2.0.0", "1.x", ...) is resolved against
+// every version the registry has actually published (fetchVersions) and the highest
+// satisfying one is fetched; anything that isn't a parseable semver range at all (a
+// dist-tag like "next"/"beta", or no version specified) is passed straight through to the
+// registry, which resolves dist-tags (and "latest" specifically when no version is given)
+// itself.
 //
 // TODO(dedup): node_modules is kept flat (npm v3+ style) unconditionally: the first time
 // a package name is encountered anywhere in the tree, its version is installed once at
@@ -28,12 +29,31 @@ import java.nio.file.Path
 // implementation would nest the loser under the requiring package's own node_modules,
 // the way real npm/pnpm do.
 class PackageInstaller(private val registry: PackageIndex) {
-    // See CompilerDownloader's own exactVersionOrNull for the rationale: only a plain
-    // "1.2.3"-shaped version is safe to hand to the registry's single-version endpoint;
-    // anything else (including null — "no version specified") falls back to "latest".
     private val exactVersionRegex = Regex("^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$")
-    private fun exactVersionOrNull(versionSpec: String?): String? =
-        versionSpec?.takeIf { exactVersionRegex.matches(it) }
+
+    // Resolves `versionSpec` to the version string that should be handed to
+    // registry.fetchMeta, or null to mean "let the registry pick" (its own "latest"
+    // dist-tag, when no version was specified at all).
+    //
+    // - null (no version specified) -> null (registry's "latest").
+    // - a plain "1.2.3"-shaped version -> itself, unchanged.
+    // - a semver range ("^1.2.3", "~2.3", ">=1.0.0 <2.0.0", "1.x", "1.0.0 - 2.0.0",
+    //   "1.x || >=2.5.0", ...) -> the highest published version (per fetchVersions) that
+    //   satisfies it.
+    // - anything else (doesn't parse as a semver range at all) -> assumed to be an npm
+    //   dist-tag (e.g. "next", "beta") and passed straight through; "latest" itself maps to
+    //   null since that's already the registry's default when no version is given.
+    private fun resolveVersion(name: String, versionSpec: String?): String? {
+        if (versionSpec == null) return null
+        if (exactVersionRegex.matches(versionSpec)) return versionSpec
+        val range = SemverResolver.parseRange(versionSpec)
+        if (range != null) {
+            val versions = registry.fetchVersions(name).map { it.version }
+            return range.maxSatisfying(versions)
+                ?: throw PackageNotFoundException(name, versionSpec)
+        }
+        return if (versionSpec == "latest") null else versionSpec
+    }
 
     // Installs `name`@`versionSpec` (or whatever the registry resolves as "latest" when
     // versionSpec is null, a range, a dist-tag, etc.) plus, recursively, its runtime
@@ -70,7 +90,7 @@ class PackageInstaller(private val registry: PackageIndex) {
         visited: MutableSet<String>,
     ) {
         if (!visited.add(name)) return
-        val meta = registry.fetchMeta(name, exactVersionOrNull(versionSpec))
+        val meta = registry.fetchMeta(name, resolveVersion(name, versionSpec))
         val cacheDir = PackageCache.ensurePackage(registry.ecosystem, meta)
         PackageCache.installInto(cacheDir, nodeModulesDir, name)
         for ((depName, depRange) in meta.dependencies) {

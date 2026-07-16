@@ -41,6 +41,17 @@ class InterceptingFileSystem : FileSystem {
     // PackageInstaller abstractions and can be constructed/tested with fakes of either.
     private var compileToJsDispatcher: CompileToJsDispatcher? = null
     private var packageInstaller: PackageInstaller? = null
+    // Ecosystem-specific counterparts to `packageInstaller` (which is always npm-backed) —
+    // see Mycelium.kt's composition root, which constructs one PackageInstaller per
+    // PackageIndex implementation (RubyGemsClient/PyPIClient/CratesIoClient/GoProxyClient)
+    // and threads each through here. Ruby/Python auto-install (yoloInstallRubyGem/
+    // yoloInstallPyPIPackage below) uses these the same way npm's own yoloInstall uses
+    // `packageInstaller`. Defaulted (rather than required) so existing callers/tests that
+    // construct an InterceptingFileSystem without needing cross-ecosystem auto-install
+    // (e.g. PythonInteropExperimentTest, which only exercises the npm/JS path) don't need
+    // to be updated to pass them.
+    private var rubyGemsInstaller: PackageInstaller? = null
+    private var pyPIInstaller: PackageInstaller? = null
 
     private val nodeModuleResolver = NodeModuleResolver { context!! }
     private val pythonModuleResolver = PythonModuleResolver()
@@ -96,12 +107,16 @@ class InterceptingFileSystem : FileSystem {
         compileToJsDispatcher: CompileToJsDispatcher,
         packageInstaller: PackageInstaller,
         yolo: Boolean = false,
+        rubyGemsInstaller: PackageInstaller? = null,
+        pyPIInstaller: PackageInstaller? = null,
     ) {
         this.context = context
         this.mycelium = mycelium
         this.compileToJsDispatcher = compileToJsDispatcher
         this.packageInstaller = packageInstaller
         this.yolo = yolo
+        this.rubyGemsInstaller = rubyGemsInstaller
+        this.pyPIInstaller = pyPIInstaller
     }
 
     // Seeds the source-directory stack with `dir` for the duration of `block`, so that
@@ -219,6 +234,27 @@ class InterceptingFileSystem : FileSystem {
             if (hostLang?.languageId != "python") {
                 pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
             }
+
+            // `--yolo` support for Ruby/Python, mirroring npm's own yoloInstall above: a
+            // bare specifier that couldn't be resolved against $LOAD_PATH/sys.path (real or
+            // previously auto-installed) is fetched from RubyGems/PyPI and vendored into the
+            // project directory, then resolution is retried once. Gated on `hostLang` (the
+            // guest call stack actually being inside that language) rather than trying both
+            // unconditionally, matching the ordering rationale in the comment above: a
+            // missing specifier while the stack is inside Ruby should try installing a gem,
+            // not guess it might be a PyPI package instead.
+            if (yolo && (hostLang?.languageId == "ruby" || hostLang?.languageId == "python") &&
+                rubyGemsInstaller != null && pyPIInstaller != null
+            ) {
+                val (packageName, _) = nodeModuleResolver.splitSpecifier(path)
+                if (hostLang.languageId == "ruby") {
+                    yoloInstallRubyGem(packageName)
+                    rubyModuleResolver.resolveRubyGem(path)?.let { return it }
+                } else {
+                    yoloInstallPyPIPackage(packageName)
+                    pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
+                }
+            }
         }
         return Path.of(path)
     }
@@ -297,10 +333,9 @@ class InterceptingFileSystem : FileSystem {
     // a file via runFile).
     //
     // Tries the pure-Kotlin path first (PackageInstaller, backed by NpmRegistryClient +
-    // PackageCache — no subprocess) and only falls back to shelling out to `npm
-    // install`/`pnpm install` if that fails (e.g. a semver-range edge case the
-    // pure-Kotlin path's simplified version resolution can't handle — see
-    // PackageInstaller's TODO(semver) — or any other network/registry hiccup), so
+    // PackageCache — no subprocess, resolving version specs via SemverResolver — see
+    // registry/SemverResolver.kt) and only falls back to shelling out to `npm
+    // install`/`pnpm install` if that fails (e.g. a network/registry hiccup), so
     // installing a single missing package no longer requires npm/pnpm to be present at
     // all in the common case.
     private fun yoloInstall(packageName: String) {
@@ -324,6 +359,46 @@ class InterceptingFileSystem : FileSystem {
             throw MyceliumException(
                 "mycelium: --yolo install of '$packageName' failed (exit code $exitCode)"
             )
+        }
+    }
+
+    // `--yolo` support for Ruby: fetches `gemName` from rubygems.org (via the
+    // RubyGemsClient-backed `rubyGemsInstaller`) and PackageCache's on-disk archive cache —
+    // no `gem`/`bundle` subprocess involved, mirroring yoloInstall's own pure-Kotlin-first
+    // approach for npm — into a project-local vendor directory
+    // (".mycelium-vendor/gems/<name>", picked to avoid colliding with any real
+    // "vendor/gems"-style directory a Bundler-managed project might already have), then
+    // registers the extracted gem's own lib/ directory with RubyModuleResolver so the
+    // caller's retried resolveRubyGem call can find it. Unlike npm's yoloInstall, there is
+    // no subprocess (`gem install`) fallback: RubyGems has no equivalent of npm's
+    // registry-agnostic CLI story that's reasonable to shell out to portably here, and a
+    // missing/failed pure-Kotlin install should simply surface as the same "cannot find
+    // module" the caller already reports when nothing resolves.
+    private fun yoloInstallRubyGem(gemName: String) {
+        val installDir = sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()
+        val vendorDir = installDir.resolve(".mycelium-vendor").resolve("gems")
+        System.err.println("mycelium: installing gem '$gemName'...")
+        try {
+            rubyGemsInstaller!!.installPackageTree(gemName, null, vendorDir)
+            rubyModuleResolver.registerInstalledGem(vendorDir.resolve(gemName))
+        } catch (e: Exception) {
+            System.err.println("mycelium: installing gem '$gemName' failed (${e.message ?: e})")
+        }
+    }
+
+    // `--yolo` support for Python — see yoloInstallRubyGem's own comment for the overall
+    // shape (PyPIClient + PackageCache, project-local ".mycelium-vendor/pypi/<name>" vendor
+    // directory to avoid colliding with a real virtualenv's own "pypi" or similarly-named
+    // directory, no pip subprocess fallback).
+    private fun yoloInstallPyPIPackage(packageName: String) {
+        val installDir = sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()
+        val vendorDir = installDir.resolve(".mycelium-vendor").resolve("pypi")
+        System.err.println("mycelium: installing PyPI package '$packageName'...")
+        try {
+            pyPIInstaller!!.installPackageTree(packageName, null, vendorDir)
+            pythonModuleResolver.registerInstalledPackage(vendorDir.resolve(packageName), packageName)
+        } catch (e: Exception) {
+            System.err.println("mycelium: installing PyPI package '$packageName' failed (${e.message ?: e})")
         }
     }
 

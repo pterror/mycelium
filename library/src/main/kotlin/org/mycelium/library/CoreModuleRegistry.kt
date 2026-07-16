@@ -81,6 +81,8 @@ object CoreModuleRegistry {
         "node:timers/promises" to "timers-promises.mjs",
         "perf_hooks" to "perf_hooks.mjs",
         "node:perf_hooks" to "perf_hooks.mjs",
+        "vm" to "vm.mjs",
+        "node:vm" to "vm.mjs",
     )
 
     fun isCoreModule(specifier: String): Boolean = coreModules.containsKey(specifier)

@@ -3,6 +3,8 @@ package org.mycelium.library.compiler
 import org.mycelium.library.MyceliumException
 import org.mycelium.library.registry.PackageCache
 import org.mycelium.library.registry.PackageIndex
+import org.mycelium.library.registry.PackageNotFoundException
+import org.mycelium.library.registry.SemverResolver
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -38,18 +40,29 @@ class CompilerDownloader(private val registry: PackageIndex) {
 
     // A version string counts as "exact" (safe to hand straight to the registry's
     // single-version endpoint) only when it has no semver-range operators — plain
-    // "1.2.3"/"1.2.3-beta.1". Anything else (a range, "^"/"~" prefix, "latest", a dist-tag,
-    // etc.) falls back to whatever NpmRegistryClient.fetchMeta(name, null) resolves as that
-    // package's current default version. This is a deliberate simplification rather than a
-    // full semver range resolver/solver: CompilerSpec.defaultVersion is always either an
-    // exact pin or unset, and dependency ranges declared by third-party package.json files
-    // are, in practice, satisfied by "whatever's currently on the latest dist-tag" the
-    // overwhelming majority of the time. A real range resolver (matching multiple
-    // candidate versions against a semver range) is future work if this ever proves
-    // insufficient in practice.
+    // "1.2.3"/"1.2.3-beta.1". Anything else is resolved via SemverResolver against
+    // registry.fetchVersions(name)'s published versions (a range, "^"/"~" prefix, x-range,
+    // hyphen range, "||"-combined ranges, ...); a version spec that isn't a parseable
+    // semver range at all is assumed to be an npm dist-tag (e.g. "next", "beta") and passed
+    // straight through to the registry, which resolves dist-tags on its single-version
+    // endpoint the same way it resolves exact versions.
     private val exactVersionRegex = Regex("^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$")
     private fun exactVersionOrNull(versionSpec: String): String? =
         if (exactVersionRegex.matches(versionSpec)) versionSpec else null
+
+    // See PackageInstaller's own resolveVersion for the full rationale; this mirrors it
+    // exactly (both classes independently talk to a PackageIndex, so neither depends on the
+    // other, but the resolution policy is identical).
+    private fun resolveVersion(name: String, versionSpec: String): String? {
+        exactVersionOrNull(versionSpec)?.let { return it }
+        val range = SemverResolver.parseRange(versionSpec)
+        if (range != null) {
+            val versions = registry.fetchVersions(name).map { it.version }
+            return range.maxSatisfying(versions)
+                ?: throw PackageNotFoundException(name, versionSpec)
+        }
+        return if (versionSpec == "latest") null else versionSpec
+    }
 
     // Downloads `npmPackageName@version` (plus, transitively, its own runtime dependencies)
     // into cacheDirFor(languageId, version)/node_modules, returning that cache directory
@@ -111,7 +124,7 @@ class CompilerDownloader(private val registry: PackageIndex) {
         visited: MutableSet<String>,
     ) {
         if (!visited.add(name)) return
-        val meta = registry.fetchMeta(name, exactVersionOrNull(versionSpec))
+        val meta = registry.fetchMeta(name, resolveVersion(name, versionSpec))
         val cacheDir = PackageCache.ensurePackage(registry.ecosystem, meta)
         PackageCache.installInto(cacheDir, nodeModulesDir, name)
         for ((depName, depRange) in meta.dependencies) {

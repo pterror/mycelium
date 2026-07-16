@@ -9,8 +9,12 @@ import org.mycelium.library.compiler.CompilerCache
 import org.mycelium.library.compiler.CompilerDownloader
 import org.mycelium.library.compiler.CompilerRegistry
 import org.mycelium.library.compiler.EsbuildBackend
+import org.mycelium.library.registry.CratesIoClient
+import org.mycelium.library.registry.GoProxyClient
 import org.mycelium.library.registry.NpmRegistryClient
 import org.mycelium.library.registry.PackageInstaller
+import org.mycelium.library.registry.PyPIClient
+import org.mycelium.library.registry.RubyGemsClient
 
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
@@ -37,15 +41,35 @@ class Mycelium(
     // constructed here (rather than reached for as a global singleton) and threaded down
     // into whatever actually needs it — CompileToJsDispatcher/InterceptingFileSystem — so
     // each of those depends only on the interfaces/classes it's handed, not on how they're
-    // built. NpmRegistryClient is the only PackageIndex implementation today; a consumer
-    // wanting a different package ecosystem (or a test wanting a fake registry) would swap
-    // it out right here rather than anywhere downstream.
+    // built. Each PackageIndex implementation (one per package ecosystem: npm, RubyGems,
+    // PyPI, crates.io, the Go module proxy) is constructed exactly once here and paired with
+    // its own PackageInstaller; a consumer wanting a different/fake registry for a given
+    // ecosystem (e.g. a test) would swap it out right here rather than anywhere downstream.
     private val registryClient = NpmRegistryClient()
+    private val rubyGemsClient = RubyGemsClient()
+    private val pyPIClient = PyPIClient()
+    // Constructed and available for callers that want to resolve/install a crate or Go
+    // module directly (e.g. a future `mycelium add`-style CLI command, or compiled-language
+    // dependency fetching once Compiler gains a linking step that can combine more than one
+    // compiled unit — see CratesIoClient/GoProxyClient's own doc comments), but not yet
+    // consulted by any *automatic* bare-specifier resolution the way rubyGemsClient/
+    // pyPIClient are (via InterceptingFileSystem's yoloInstallRubyGem/yoloInstallPyPIPackage
+    // below): RustSupport/TinyGoSupport compile a single source file straight to one
+    // standalone LLVM-bitcode/WASM unit (Compiler.compile) with no dependency-graph
+    // resolution or multi-unit linking step at all yet, so there's no compile-time seam an
+    // auto-fetched crate/module's own compiled output could be wired into today without
+    // that architecture existing first.
+    private val cratesIoClient = CratesIoClient()
+    private val goProxyClient = GoProxyClient()
     private val compilerDownloader = CompilerDownloader(registryClient)
     private val compilerRegistry = CompilerRegistry()
     private val compileToJsDispatcher =
         CompileToJsDispatcher(compilerRegistry, compilerDownloader, CompilerCache, EsbuildBackend())
     private val packageInstaller = PackageInstaller(registryClient)
+    private val rubyGemsInstaller = PackageInstaller(rubyGemsClient)
+    private val pyPIInstaller = PackageInstaller(pyPIClient)
+    private val cratesIoInstaller = PackageInstaller(cratesIoClient)
+    private val goProxyInstaller = PackageInstaller(goProxyClient)
 
     // js.commonjs-require was prototyped here and reverted — see TODO.md. Enabling it
     // swaps GraalJS's ES module loader for NpmCompatibleESModuleLoader, which rejects any
@@ -108,7 +132,7 @@ class Mycelium(
     }
 
     init {
-        filesystem.init(context, this, compileToJsDispatcher, packageInstaller, yolo)
+        filesystem.init(context, this, compileToJsDispatcher, packageInstaller, yolo, rubyGemsInstaller, pyPIInstaller)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
@@ -214,12 +238,12 @@ class Mycelium(
     // Tries the pure-Kotlin path first (PackageInstaller, backed by NpmRegistryClient +
     // PackageCache — no subprocess), resolving `dependencies` and `devDependencies`
     // (merged, "dependencies" taking priority on name collisions) and their own
-    // transitive dependencies recursively, hardlinked into `node_modules`. Falls back to
-    // shelling out to `npm install`/`pnpm install` only if that fails (e.g. a
-    // semver-range edge case the pure-Kotlin path's simplified version resolution can't
-    // handle — see PackageInstaller's TODO(semver) — or any other network/registry
-    // hiccup), so a plain `package.json`-driven install no longer requires npm/pnpm to
-    // be present at all in the common case.
+    // transitive dependencies recursively, hardlinked into `node_modules`. Version specs
+    // (exact, ranges, x-ranges, dist-tags, ...) are resolved via SemverResolver — see
+    // registry/SemverResolver.kt. Falls back to shelling out to `npm install`/`pnpm
+    // install` only if that fails (e.g. a network/registry hiccup), so a plain
+    // `package.json`-driven install no longer requires npm/pnpm to be present at all in
+    // the common case.
     private fun maybeInstallDependencies(startDir: File) {
         val pkgDir = findPackageJsonDir(startDir) ?: return
         val pkgJsonFile = File(pkgDir, "package.json")

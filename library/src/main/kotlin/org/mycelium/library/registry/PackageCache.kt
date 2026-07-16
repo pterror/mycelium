@@ -2,6 +2,8 @@ package org.mycelium.library.registry
 
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.json.JSONObject
 import java.io.File
@@ -123,7 +125,7 @@ object PackageCache {
             // Another thread/process may have finished populating `dir` while we were
             // waiting on the semaphore — recheck before paying for a redundant download.
             if (isCached(ecosystem, meta.name, meta.version)) return dir
-            downloadAndExtract(meta, dir)
+            downloadAndExtract(ecosystem, meta, dir)
         } finally {
             downloadSemaphore.release()
         }
@@ -141,13 +143,43 @@ object PackageCache {
         return futures.map { it.join() }
     }
 
-    private fun downloadAndExtract(meta: PackageMeta, dir: Path) {
+    // Which unpacking strategy a downloaded archive needs, keyed off the tarball/dist URL's
+    // own file extension (the one detail every PackageIndex implementation's `tarballUrl`
+    // reliably encodes) plus, for the two ecosystems that both use ZIP containers but lay
+    // them out differently, the ecosystem string itself:
+    //   - npm .tgz, crates.io .crate, and a PyPI sdist .tar.gz are all a gzip'd tarball
+    //     rooted at a single top-level directory ("package/", "{name}-{version}/", ...) —
+    //     TAR_GZ, stripping that one shared ancestor (extractTarGz already does this
+    //     generically, keyed off "everything before the first '/'" rather than any
+    //     hardcoded npm-specific name).
+    //   - A PyPI wheel (.whl) is a plain ZIP with no shared top-level directory at all — its
+    //     entries are already rooted at the final layout PackageCache.installInto should
+    //     produce (e.g. "requests/api.py", "requests-2.31.0.dist-info/METADATA") — so ZIP
+    //     with no stripping.
+    //   - A Go module .zip (from the module proxy) is a ZIP *with* one shared top-level
+    //     directory ("example.com/foo@v1.2.3/") to strip, same shape as TAR_GZ just under a
+    //     different container format.
+    //   - A RubyGems .gem is a plain (uncompressed) outer tar containing metadata.gz,
+    //     checksums.yaml.gz, and — the part PackageCache actually needs — a nested
+    //     data.tar.gz whose own entries are already rooted at the gem's real layout
+    //     ("lib/foo.rb", "exe/foo", ...) with no wrapping directory of their own.
+    private enum class ArchiveFormat { TAR_GZ, ZIP, ZIP_STRIP_TOP, GEM }
+
+    private fun archiveFormatFor(ecosystem: String, url: String): ArchiveFormat = when {
+        url.endsWith(".gem") -> ArchiveFormat.GEM
+        url.endsWith(".whl") -> ArchiveFormat.ZIP
+        url.endsWith(".zip") && ecosystem == "go" -> ArchiveFormat.ZIP_STRIP_TOP
+        url.endsWith(".zip") -> ArchiveFormat.ZIP
+        else -> ArchiveFormat.TAR_GZ
+    }
+
+    private fun downloadAndExtract(ecosystem: String, meta: PackageMeta, dir: Path) {
         val parentDir = dir.parent
         Files.createDirectories(parentDir)
         val tempDir = Files.createTempDirectory(parentDir, "download-${safePathSegment(meta.version)}-")
         try {
             val request = HttpRequest.newBuilder(URI.create(meta.tarballUrl))
-                .header("User-Agent", "mycelium (pure-kotlin npm client)")
+                .header("User-Agent", "mycelium (pure-kotlin package registry client)")
                 .GET()
                 .build()
             val response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
@@ -160,16 +192,22 @@ object PackageCache {
 
             val digestAlgorithm = meta.checksum?.substringBefore(':')?.let(::algorithmName)
             val digest = digestAlgorithm?.let { MessageDigest.getInstance(it) }
-            // Wrap the *raw compressed* stream (before gunzip/untar) in the digest, exactly
-            // matching what npm's own dist.shasum/dist.integrity hash — the .tgz file's raw
-            // bytes, not its extracted contents.
+            // Wrap the *raw* stream (before any unpacking) in the digest, exactly matching
+            // what each registry's own checksum hashes — the downloaded archive's raw bytes,
+            // not its extracted contents.
             val rawStream: InputStream =
                 if (digest != null) DigestInputStream(response.body(), digest) else response.body()
 
+            val format = archiveFormatFor(ecosystem, meta.tarballUrl)
             rawStream.use {
-                extractTarGz(it, tempDir)
+                when (format) {
+                    ArchiveFormat.TAR_GZ -> extractTarGz(it, tempDir)
+                    ArchiveFormat.ZIP -> extractZip(it, tempDir, stripTopLevel = false)
+                    ArchiveFormat.ZIP_STRIP_TOP -> extractZip(it, tempDir, stripTopLevel = true)
+                    ArchiveFormat.GEM -> extractGem(it, tempDir)
+                }
 
-                // Drain any bytes the tar reader didn't need (end-of-archive padding, gzip
+                // Drain any bytes the reader didn't need (end-of-archive padding, gzip
                 // trailer) so the digest covers the entire downloaded file, matching how the
                 // registry computed it in the first place.
                 it.readAllBytes()
@@ -237,32 +275,103 @@ object PackageCache {
 
     // Streams the gzip'd tarball straight from the network into extracted files on disk —
     // never buffers the whole archive (compressed or extracted) in memory. Strips the
-    // tarball's own top-level directory (npm tarballs are always rooted at "package/") so
-    // `dir` ends up containing the package's files directly.
+    // tarball's own top-level directory (npm tarballs are rooted at "package/", PyPI sdists
+    // and crates.io .crate files at "{name}-{version}/") so `dir` ends up containing the
+    // package's files directly.
     private fun extractTarGz(rawStream: InputStream, destDir: Path) {
         GzipCompressorInputStream(UncloseableInputStream(rawStream)).use { gzip ->
-            TarArchiveInputStream(gzip).use { tar ->
-                var entry: TarArchiveEntry? = tar.nextEntry as TarArchiveEntry?
-                while (entry != null) {
-                    val name = entry.name.substringAfter('/', missingDelimiterValue = "")
-                    if (name.isNotEmpty()) {
-                        val dest = destDir.resolve(name).normalize()
-                        if (!dest.startsWith(destDir)) {
-                            throw MyceliumException("mycelium: tar entry escapes extraction dir: ${entry.name}")
-                        }
-                        if (entry.isDirectory) {
-                            Files.createDirectories(dest)
-                        } else {
-                            Files.createDirectories(dest.parent)
-                            writeEntry(tar, dest)
-                            if (entry.mode and 0b001_000_000 != 0) {
-                                dest.toFile().setExecutable(true)
-                            }
+            extractTarEntries(gzip, destDir, stripTopLevel = true)
+        }
+    }
+
+    // Shared tar-entry-walking loop, factored out so extractTarGz (npm/PyPI-sdist/crates.io,
+    // where every entry is rooted under one shared top-level directory to strip) and
+    // extractGem's inner data.tar.gz (whose entries are already rooted at the gem's real
+    // "lib/", "exe/", ... layout, nothing to strip) can share it.
+    private fun extractTarEntries(tarStream: InputStream, destDir: Path, stripTopLevel: Boolean) {
+        TarArchiveInputStream(tarStream).use { tar ->
+            var entry: TarArchiveEntry? = tar.nextEntry as TarArchiveEntry?
+            while (entry != null) {
+                val name = if (stripTopLevel) {
+                    entry.name.substringAfter('/', missingDelimiterValue = "")
+                } else {
+                    entry.name
+                }
+                if (name.isNotEmpty()) {
+                    val dest = destDir.resolve(name).normalize()
+                    if (!dest.startsWith(destDir)) {
+                        throw MyceliumException("mycelium: tar entry escapes extraction dir: ${entry.name}")
+                    }
+                    if (entry.isDirectory) {
+                        Files.createDirectories(dest)
+                    } else {
+                        Files.createDirectories(dest.parent)
+                        writeEntry(tar, dest)
+                        if (entry.mode and 0b001_000_000 != 0) {
+                            dest.toFile().setExecutable(true)
                         }
                     }
-                    entry = tar.nextEntry as TarArchiveEntry?
                 }
+                entry = tar.nextEntry as TarArchiveEntry?
             }
+        }
+    }
+
+    // Streams a ZIP archive (a PyPI wheel, or a Go module proxy source archive) straight
+    // from the network into extracted files on disk. `stripTopLevel` mirrors extractTarGz's
+    // own parameter: false for a wheel (already rooted at its real layout, e.g.
+    // "requests/api.py", "requests-2.31.0.dist-info/METADATA" — no shared wrapping
+    // directory), true for a Go module zip (every entry rooted under one shared
+    // "example.com/foo@v1.2.3/" directory the module proxy always adds).
+    private fun extractZip(rawStream: InputStream, destDir: Path, stripTopLevel: Boolean) {
+        ZipArchiveInputStream(rawStream).use { zip ->
+            var entry: ZipArchiveEntry? = zip.nextEntry as ZipArchiveEntry?
+            while (entry != null) {
+                val name = if (stripTopLevel) {
+                    entry.name.substringAfter('/', missingDelimiterValue = "")
+                } else {
+                    entry.name
+                }
+                if (name.isNotEmpty() && !entry.isDirectory) {
+                    val dest = destDir.resolve(name).normalize()
+                    if (!dest.startsWith(destDir)) {
+                        throw MyceliumException("mycelium: zip entry escapes extraction dir: ${entry.name}")
+                    }
+                    Files.createDirectories(dest.parent)
+                    writeEntry(zip, dest)
+                    // ZipArchiveEntry's unix mode is only populated when the archive was
+                    // created on a POSIX system (the "unix" external attributes field) —
+                    // wheels built on Windows won't have it, which is fine: falling back to
+                    // "not executable" is the same default a fresh file gets anyway.
+                    if (entry.unixMode and 0b001_000_000 != 0) {
+                        dest.toFile().setExecutable(true)
+                    }
+                } else if (name.isNotEmpty()) {
+                    Files.createDirectories(destDir.resolve(name).normalize())
+                }
+                entry = zip.nextEntry as ZipArchiveEntry?
+            }
+        }
+    }
+
+    // A `.gem` file is itself a plain (uncompressed) tar containing metadata.gz,
+    // checksums.yaml.gz, and data.tar.gz — only the last of which PackageCache needs: it's
+    // the gem's actual installable payload ("lib/foo.rb", "exe/foo", ...), gzip-compressed
+    // but — unlike npm/PyPI/crates.io tarballs — not wrapped in any shared top-level
+    // directory of its own, so it's extracted with stripTopLevel = false.
+    private fun extractGem(rawStream: InputStream, destDir: Path) {
+        TarArchiveInputStream(UncloseableInputStream(rawStream)).use { outerTar ->
+            var entry: TarArchiveEntry? = outerTar.nextEntry as TarArchiveEntry?
+            while (entry != null) {
+                if (entry.name == "data.tar.gz") {
+                    GzipCompressorInputStream(UncloseableInputStream(outerTar)).use { gzip ->
+                        extractTarEntries(gzip, destDir, stripTopLevel = false)
+                    }
+                    return
+                }
+                entry = outerTar.nextEntry as TarArchiveEntry?
+            }
+            throw MyceliumException("mycelium: .gem archive has no data.tar.gz entry")
         }
     }
 
@@ -305,14 +414,15 @@ object PackageCache {
         }
     }
 
-    // Installs a cached package into a project's node_modules by hardlinking every file from
-    // the cache rather than copying — the same "content-addressed store + hardlinks/reflinks
-    // into node_modules" trick bun and pnpm use to make repeated installs of the same
-    // version across projects nearly free. Falls back to a plain copy per-file if
-    // Files.createLink fails (e.g. the cache and the target node_modules live on different
-    // filesystems/devices, where hardlinks are impossible).
-    fun installInto(cacheDir: Path, targetNodeModulesDir: Path, packageName: String) {
-        val dest = targetNodeModulesDir.resolve(packageName)
+    // Installs a cached package into a project's own dependency directory (node_modules for
+    // npm, a vendor/gems-style directory for the other ecosystems — see PackageInstaller) by
+    // hardlinking every file from the cache rather than copying — the same "content-addressed
+    // store + hardlinks/reflinks into node_modules" trick bun and pnpm use to make repeated
+    // installs of the same version across projects nearly free. Falls back to a plain copy
+    // per-file if Files.createLink fails (e.g. the cache and the target directory live on
+    // different filesystems/devices, where hardlinks are impossible).
+    fun installInto(cacheDir: Path, targetDir: Path, packageName: String) {
+        val dest = targetDir.resolve(packageName)
         Files.createDirectories(dest)
         Files.walk(cacheDir).use { paths ->
             paths.sorted().forEach { source ->

@@ -1,6 +1,7 @@
 # Mycelium Roadmap
 
-*Last updated 2026-07-16. This is the forward-looking companion to `TODO.md` — `TODO.md`
+*Last updated 2026-07-16 (test-gating fix + compile-to-JS/package-infrastructure docs pass).
+This is the forward-looking companion to `TODO.md` — `TODO.md`
 is the detailed, ground-truth session log (architecture decisions, gotchas, exact test
 names); this file is the higher-altitude "what's next and in what order" view. When the
 two disagree, trust `TODO.md` and fix this file.*
@@ -70,6 +71,55 @@ Actively being filled as npm acid tests surface concrete gaps (e.g. `util.mjs` g
 `debuglog`, `parseArgs`, `promisify.custom`, `styleText`, `formatWithOptions`,
 `getSystemErrorName`, `toUSVString` this session). No known open gap tracked separately from
 the acid-test punch list above — new ones surface via Round 4.
+
+### Package infrastructure — DONE
+No external package-manager binary (`npm`/`pnpm`/`pip`/`gem`) is required for any of the
+following — all pure Kotlin, talking directly to each registry's HTTP API
+(`library/src/main/kotlin/org/mycelium/library/registry/`):
+
+- **`NpmRegistryClient`, `RubyGemsClient`, `PyPIClient`, `CratesIoClient`, `GoProxyClient`** —
+  one `PackageIndex` implementation per ecosystem (npm, RubyGems, PyPI, crates.io, the Go
+  module proxy). `Mycelium`'s constructor builds one instance of each and pairs it with its
+  own `PackageInstaller` (`registryClient`/`rubyGemsClient`/`pyPIClient`/`cratesIoClient`/
+  `goProxyClient` + their matching `*Installer` fields). npm and RubyGems/PyPI are wired all
+  the way into automatic bare-specifier resolution (see below); `CratesIoClient`/
+  `GoProxyClient` are constructed and available but not yet consulted automatically —
+  `RustSupport`/`TinyGoSupport` compile a single source file straight to one standalone
+  LLVM-bitcode/WASM unit with no multi-unit linking step yet, so there's no compile-time seam
+  an auto-fetched crate/module's output could plug into today.
+- **`PackageCache`** — content-verified (checksum), hardlink-based cache shared by every
+  consumer above, keyed `XDG_CACHE_HOME/mycelium/packages/<ecosystem>/<name>/<version>`.
+  Handles four archive shapes transparently (`.tgz`/PyPI sdist `.tar.gz`/crates.io `.crate` as
+  a top-level-dir-stripped gzip'd tar; a PyPI wheel `.whl` as a flat ZIP; a Go module `.zip` as
+  a top-level-dir-stripped ZIP; a RubyGems `.gem` as an outer tar wrapping an inner
+  `data.tar.gz`), so `PackageInstaller`/`CompilerDownloader` never need to know which
+  ecosystem they're installing for beyond picking the right `PackageIndex`.
+- **`--yolo` auto-install for Ruby and Python, not just npm**: a bare `require`/`import` in a
+  Ruby or Python guest script that can't be resolved against `$LOAD_PATH`/`sys.path` now
+  fetches the gem/package from RubyGems/PyPI (`InterceptingFileSystem.yoloInstallRubyGem`/
+  `yoloInstallPyPIPackage`) into a project-local vendor directory
+  (`.mycelium-vendor/gems/<name>` / `.mycelium-vendor/pypi/<name>`, picked to avoid colliding
+  with a real Bundler `vendor/gems` or virtualenv layout) and retries resolution — the same
+  "no subprocess needed" shape npm's `--yolo` already had, extended to two more ecosystems.
+  Unlike npm, there's no gem-install/pip-install subprocess fallback (no equivalent portable
+  CLI story to shell out to) — a failed pure-Kotlin install just surfaces as the same "cannot
+  find module" error resolution already reports when nothing resolves.
+- **Self-contained package installation, real semver resolution**: `PackageInstaller`
+  (manifest `package.json` deps, `--yolo` single-package installs, and now Ruby/PyPI installs
+  too) and `CompilerDownloader` (compile-to-JS compiler packages) both resolve version specs
+  via `SemverResolver` — a real npm-compatible range resolver (`^`/`~`/x-ranges/hyphen
+  ranges/`||`/comparators, matching `node-semver`'s `maxSatisfying` closely enough for
+  real-world dependency trees) against each registry's `fetchVersions`, not just an
+  exact-version-or-"latest" shortcut. npm's manifest/`--yolo` paths still fall back to
+  shelling out to `npm install`/`pnpm install` only on failure (e.g. a genuine network/registry
+  hiccup); neither needs npm/pnpm on PATH in the common case — confirmed by
+  `MyceliumIntegrationTest.kt`'s `manifestInstallRunsNpmInstall`/`yoloAutoInstallsMissingPackage`,
+  no longer gated on npm being present.
+- **`ToolResolver` + composable `ToolSource`** — ecosystem-agnostic "find me a tool binary"
+  chain (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload`), extracted
+  out of what used to be inline logic in `CompileToJsDispatcher`. Used today for PureScript's
+  separately-versioned `spago`; the natural extension point for any future non-npm tool
+  resolution.
 
 ---
 
@@ -159,38 +209,70 @@ get exercised.
 crate. A Ruby gem calls a Go function. A TypeScript file uses a Scala library. All in one
 process, no FFI, no serialization, no microservices.
 
-### Compile-to-JS languages
-Any language that compiles to JS runs on Mycelium today via the existing esbuild-based
-TS pipeline pattern, and gets full JS-ecosystem access plus every other language Mycelium
-supports.
+### Compile-to-JS languages — framework DONE, 7 languages supported
+Built as a generalized compile-to-JS pipeline, not one-off wiring per language:
+`CompileToJsDispatcher` (`library/src/main/kotlin/org/mycelium/library/compiler/`) resolves a
+`CompilerSpec` (from `CompilerRegistry`) for the importing file's extension, then routes
+through one of three `CompileToJsBackend` implementations depending on `BackendType`:
 
-**Compiler Resolution Strategy:**
-- **Version resolution**: Resolve compiler version from project config (`package.json`, `mycelium.toml`, etc.).
-- **Prebuilt download**: Download prebuilt from appropriate registry (npm, crates.io, PyPI, etc.).
-- **Caching**: Cache in `XDG_CACHE_HOME/mycelium/compilers/<lang>/<version>/`.
-- **Git as fallback only**: Git clone for compilers not published to registries — NOT the default. Git requires build from source (slow, needs build deps) and full clone may exceed individual release tarball size.
-- **Lazy loading model**: First time a file extension is encountered, fetch the appropriate compiler/runtime. Cache persists across runs — subsequent runs are offline. Users can eagerly pre-fetch via `mycelium install-language ruby` or similar.
-- **Resolution flow**: Extension mapping → language → compiler resolution → fetch → cache → compile.
+- **`BUNDLED`** (`EsbuildBackend`) — a compiler shipped with Mycelium itself, not
+  resolved/downloaded at all. TypeScript is the only language here (`io.mvnpm:esbuild-java`,
+  transform-only so `import`/`export` specifiers stay untouched for Mycelium's own resolver).
+- **`JS_API`** (`NpmJsApiBackend`) — the npm package exposes a JS-callable
+  `compile(source, options)`, `require()`'d into the shared GraalJS Context and called
+  directly. CoffeeScript, Civet, LiveScript.
+- **`SUBPROCESS`** (`SubprocessBackend`) — the only interface is a native compiler binary
+  (no JS API at all). Elm (`elm make`), PureScript (`purs compile`), ReScript (`bsc`).
+
+**Supported languages (7):** TypeScript (bundled), CoffeeScript, Civet, LiveScript
+(JS_API), Elm, PureScript, ReScript (SUBPROCESS, with project-aware whole-project builds —
+see below). All registered in `CompilerRegistry`, all covered by
+`MyceliumIntegrationTest.kt`/dedicated project-aware tests.
+
+**Investigated, not added** (see `CompilerRegistry.kt`'s own comment for full detail):
+Imba (compiler's return shape doesn't fit `NpmJsApiBackend`'s `outputIsObject` contract, plus
+only alpha releases), Gleam (compiler isn't published to npm at all — it's a Rust binary via
+GitHub releases/Hex), Dart/dart2js (no self-contained npm package; needs the full Dart SDK),
+Kotlin/JS (needs a full classpath + stdlib jars, not a single binary/JS-function call),
+Scala.js (needs scala-cli/sbt + linker + library jars), Fable (closest candidate —
+`@fable-org/fable-compiler-js` needs no .NET, but its npm `bin` is a plain JS file that only
+runs via its own `#!/usr/bin/env node` shebang, i.e. requires a real external `node`
+installation — the one thing every other compile-to-JS language here avoids).
+
+**Resolution order actually implemented** (`CompileToJsDispatcher.compile`,
+`CompilerDownloader`, `ToolResolver`):
+1. Pre-built output already exists — handled implicitly upstream (an imported package whose
+   `package.json` already points at plain `.js` never reaches the compile-to-JS path at all).
+2. A project file found walking up from the source (`elm.json`; `spago.yaml`/`spago.dhall`;
+   `rescript.json`/`bsconfig.json`) — routes through `ProjectBuildRunner`'s whole-project
+   build instead of single-file compilation (real cross-module imports need this).
+3. Already installed in the compiled file's own project's `node_modules`.
+4. Already downloaded to Mycelium's own compiler cache (`XDG_CACHE_HOME/mycelium/compilers/
+   <lang>/<version>/`) from a previous run.
+5. Neither — download now via the pure-Kotlin `NpmRegistryClient` + `PackageCache` (no `npm`
+   subprocess), for this and every future compile of that language+version.
+
+**Project-aware builds**: Elm/PureScript/ReScript compile a whole project (not just the
+imported file) when a real project config is found above it — `elm make`, `spago build`
+(PureScript's spago is a *separate* npm package, `spago`, resolved independently via
+`ToolResolver`/composable `ToolSource`s — project `node_modules/.bin` → system PATH →
+Mycelium's cache → auto-download), and `rescript build`. Falls back to single-file
+compilation (`purs compile`, bare `bsc`) with real, documented limitations when no project
+file exists (see each `CompilerSpec` registration's CAVEAT comments).
+
+**CLI**: `mycelium compiler fetch <lang>[@version]` / `compiler list` / `compiler cache`
+(`app/src/main/kotlin/org/mycelium/app/App.kt`) operate on the same `CompilerRegistry`/
+`CompilerDownloader` a running Mycelium instance uses, for eager pre-fetching and cache
+introspection.
 
 **Open question: Is Mycelium a CLI tool or a runtime?**
 - CLI tool: startup time matters (native-image wins).
 - Runtime/server: throughput matters (JVM is competitive, within 10-20% of C).
 - Likely both — JVM with startup optimizations may be the pragmatic answer.
 
-**Note**: Potentially more tractable than FFI work, but NOT as simple as just wiring in a
-compiler command — significant design decisions pending around: module resolution semantics
-per language, source-map fidelity for cross-language debugging, error attribution, and
-per-language build-cache strategies.
-
-- TypeScript — **done**.
-- CoffeeScript, Civet — planned.
-- ReScript, ReasonML — planned.
-- Elm — planned.
-- PureScript — planned.
-- ClojureScript — planned.
-- Scala.js — planned.
-- Kotlin/JS — planned.
-- Dart (dart2js) — planned.
+**Still open**: module resolution semantics per language beyond what's already handled,
+source-map fidelity for cross-language debugging, error attribution, and richer
+per-language build-cache invalidation (today: content-hash of source text + fixed version).
 
 ### Compile-to-WASM languages
 Any language with a WASM target runs via the existing `WebAssembly` JS-API-based
@@ -277,12 +359,6 @@ new libraries, (2) most high-value npm packages that truly require native code a
 
 These don't have an owner or a target yet — tracked so they aren't lost.
 
-- **Package manager auto-install**: npm bare-specifier resolution works against an existing
-  `node_modules`, but nothing auto-installs — users must `npm install` first. Eager
-  (install-on-import, magical but unpredictable) vs. declarative (manifest file, explicit but
-  more friction) is unresolved.
-- **pip / gem resolution**: no analogue to npm's `node_modules` walk exists yet for Python
-  (blocked in practice by the GraalPython bug) or Ruby (unblocked, just not built).
 - **GraalVM version ceiling**: pinned at 25.0.0 — the highest version where
   `polyglot:ruby`/`org.graalvm.ruby:ruby` and the old `polyglot:llvm` coordinate are still
   published on Maven Central (25.1.3 drops them). `org.graalvm.polyglot:ruby` is already

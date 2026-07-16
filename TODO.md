@@ -1,6 +1,6 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-16. This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
+*Updated 2026-07-16 (test-gating fix session: stale npm `assumeTrue` gates removed, compile-to-JS/package-infrastructure docs brought current, Gleam/Dart/Kotlin-JS/Scala.js/Fable investigated and not added). This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
 
 ## Vision
 
@@ -36,6 +36,20 @@ Mycelium's purpose: make every language's package ecosystem available to every o
   - `RubyModuleResolver.kt` (46 lines) — `$LOAD_PATH` resolution.
   - `ShimGenerator.kt` (34 lines) — cross-language ESM shim generation.
   - **Any older note (including elsewhere in this file) that says "`InterceptingFileSystem.kt`" for entry-point/conditional-exports resolution logic predates this split.**
+- **DIP-compliant composition root**: `Mycelium` (the class, in `Mycelium.kt`) constructs every
+  collaborator its object graph needs — one `PackageIndex` per ecosystem (`NpmRegistryClient`,
+  `RubyGemsClient`, `PyPIClient`, `CratesIoClient`, `GoProxyClient`), each paired with its own
+  `PackageInstaller`, plus `CompilerDownloader`/`CompilerRegistry`/`CompileToJsDispatcher` — in
+  its own constructor body, and threads them down into whatever needs them, rather than any
+  downstream class reaching for a concrete singleton itself. `CompileToJsDispatcher`/
+  `CompilerDownloader`/`PackageInstaller` depend only on the `PackageIndex`/`CompilerRegistry`/
+  `ToolResolver` interfaces and constructor params they're handed, never on a concrete
+  `*Client` directly — so a consumer embedding Mycelium as a library (or a test) can substitute
+  a fake registry/downloader/cache at exactly one point (`Mycelium`'s own constructor) without
+  touching any class further down the graph. Same pattern repeats one level down:
+  `CompileToJsDispatcher` takes `CompilerRegistry`/`CompilerDownloader`/`CompilerCache`/
+  `bundledBackend`/`ProjectBuildRunner`/`ToolResolver` as constructor params, all defaulted for
+  real callers but swappable in tests.
 
 ## Hard constraints / gotchas
 
@@ -148,6 +162,37 @@ implemented (~30 core modules total; see `library/src/main/resources/node-stdlib
 ### JavaScript / TypeScript — working
 Core language. TypeScript (`.ts`/`.mts`, routed to `js` via `JsSupport.extensions`) transpiles through `TsCompiler` (`library/src/main/kotlin/org/mycelium/library/TsCompiler.kt`) using `io.mvnpm:esbuild-java:1.5.1`. `InterceptingFileSystem.newByteChannel` intercepts `.ts`/`.mts` reads before any other routing and hands GraalJS the transpiled JS. Output cached on disk by source-content hash (`~/.cache/mycelium/ts`, same pattern as `Compiler.compile`'s LLVM cache) since esbuild spawns a subprocess and downloads a platform binary on first use (network required once; ~5s cold, near-instant cached). esbuild hashes output filenames unpredictably, so `TsCompiler` picks the lone `.js` file in the esbuild dist dir (safe since each transpile is a single non-bundled entry point). Covered by `jsImportsTypeScript` in `MyceliumIntegrationTest.kt`.
 
+### Compile-to-JS languages (CoffeeScript, Civet, LiveScript, Elm, PureScript, ReScript) — working
+Generalized pipeline, not one-off wiring: `CompileToJsDispatcher` resolves a `CompilerSpec`
+(`CompilerRegistry`) per extension and routes through one of three `CompileToJsBackend`s —
+`EsbuildBackend` (`BUNDLED`, TypeScript only), `NpmJsApiBackend` (`JS_API`, CoffeeScript/
+Civet/LiveScript — `require()`'d into the shared GraalJS Context), `SubprocessBackend`
+(`SUBPROCESS`, Elm/PureScript/ReScript — no JS-callable compile function at all). Elm/
+PureScript/ReScript additionally get project-aware whole-project builds (`elm.json`/
+`spago.yaml`,`spago.dhall`/`rescript.json`,`bsconfig.json` found walking up from the source
+file) via `ProjectBuildRunner`, falling back to single-file compilation with documented
+limitations when no project file exists.
+
+Compiler packages are resolved/downloaded via the pure-Kotlin `CompilerDownloader` (backed by
+`NpmRegistryClient` + `PackageCache`) — no `npm`/`node` subprocess needed to fetch them.
+PureScript's `spago` (a separate npm package from `purescript`/`purs`) is resolved
+independently via `ToolResolver`/composable `ToolSource`s (project `node_modules/.bin` →
+system PATH → Mycelium's own cache → auto-download).
+
+`jsImportsCoffeeScript`/`jsImportsCivet` in `MyceliumIntegrationTest.kt` were still gated on
+`npm` being on PATH from when this was first built with an actual `npm install` fallback path
+— that gate was stale (removed this session): `CompilerDownloader` never shells out to `npm`
+at all, only to the npm *registry* over HTTP, so both tests now run unconditionally (still
+need real network access to the registry the first time, cached thereafter).
+
+Investigated for addition, not added (see `CompilerRegistry.kt`'s own comment): Gleam (compiler
+isn't published to npm — it's a Rust binary via GitHub releases/Hex), Dart/dart2js (no
+self-contained npm package, needs the full Dart SDK), Kotlin/JS (needs a full classpath +
+stdlib jars), Scala.js (needs scala-cli/sbt + linker + library jars), Fable
+(`@fable-org/fable-compiler-js` needs no .NET, but its npm `bin` is a plain JS file relying on
+its own `#!/usr/bin/env node` shebang — would be the first compile-to-JS language requiring an
+external `node` install, which every other one here avoids).
+
 ### Go — working (WASM only)
 `TinyGoSupport` (Go → WASM via `tinygo build -target=wasi`, languageId = `"wasm"`) is wired into Mycelium's default language list. `tinygo` is in `flake.nix`'s devShell. Go→LLVM was investigated and ruled out (see doc comment on `TinyGoSupport` in `Languages.kt`). `LanguageSupport` has an `outputExtension` property so the compiled-import branch keys off it instead of hardcoding `"llvm"`; Go overrides it to `"wasm"`.
 
@@ -181,20 +226,63 @@ binary didn't exist yet. All three have since shipped — descriptions updated t
 what actually landed and what's still genuinely open (see ROADMAP.md's "Open design
 questions" for the longer-term unresolved angle on each).*
 
-### Package manager auto-install — landed (both eager and declarative)
+### Package manager auto-install — landed (both eager and declarative), now pure-Kotlin-first
 Both options from the original open question shipped, not just one: **`--yolo`** does eager
-auto-install (installs on first missing bare specifier), and **manifest-based install**
-auto-runs `npm install` when a `package.json` with dependencies is found but `node_modules`
-isn't (suppressible with `--no-install`, e.g. for offline use or when the user manages
-`node_modules` themselves). npm bare-specifier resolution against an existing
-`node_modules` was already implemented and still works as before.
+auto-install (installs on first missing bare specifier), and **manifest-based install** runs
+when a `package.json` with dependencies is found but `node_modules` isn't (suppressible with
+`--no-install`, e.g. for offline use or when the user manages `node_modules` themselves). npm
+bare-specifier resolution against an existing `node_modules` was already implemented and
+still works as before.
 
-### pip / gem resolution — landed
+Since then, both paths were rebuilt on top of `PackageInstaller` (pure Kotlin,
+`NpmRegistryClient` + `PackageCache`, no subprocess) as the primary path, falling back to
+shelling out to `npm install`/`pnpm install` only if that fails. `PackageInstaller` and
+`CompilerDownloader` now resolve real semver ranges (`^`/`~`/x-ranges/hyphen ranges/`||`/
+comparators) via `SemverResolver` against the registry's actual published versions, rather
+than falling back to "latest" — see `SemverResolver.kt`. So
+neither `--yolo` nor manifest-based install actually requires npm/pnpm on PATH anymore in the
+common case — `MyceliumIntegrationTest.kt`'s `yoloAutoInstallsMissingPackage` and
+`manifestInstallRunsNpmInstall` had this session's stale `assumeTrue(isCommandAvailable
+("npm"))` gate removed accordingly (both still need real network access to the npm registry,
+just not the npm binary itself).
+
+### pip / gem resolution — landed, including fetching (not just $LOAD_PATH/site-packages walk)
 Resolution for Python (site-packages) and Ruby (gem) packages is implemented, alongside the
 pre-existing npm resolution. Resolution order tries the host language's own ecosystem first,
 falling back to others. Python resolution is implemented but can't be exercised end-to-end
 in practice because of the GraalPython upstream bug (see "Python support" above) — the
 resolver itself is not what's blocked.
+
+Beyond the static walk, `--yolo` auto-install now covers Ruby/Python too, not just npm:
+`RubyGemsClient`/`PyPIClient` (pure-Kotlin `PackageIndex` implementations, mirroring
+`NpmRegistryClient`) are constructed in `Mycelium`'s composition root, each paired with its own
+`PackageInstaller`, and threaded into `InterceptingFileSystem` (`rubyGemsInstaller`/
+`pyPIInstaller` constructor params). A bare `require`/`import` that can't be resolved against
+`$LOAD_PATH`/`sys.path` (real or previously auto-installed) now fetches the gem/package from
+RubyGems/PyPI (`yoloInstallRubyGem`/`yoloInstallPyPIPackage`) into a project-local vendor
+directory (`.mycelium-vendor/gems/<name>` / `.mycelium-vendor/pypi/<name>`) and retries —
+`RubyModuleResolver`/`PythonModuleResolver` each gained a `vendorSearchPaths` list (consulted
+ahead of the real `$LOAD_PATH`/`sys.path`) and a `registerInstalledGem`/`registerInstalledPackage`
+method to register a freshly-installed package's actual importable directory (handling both a
+flat and a "src layout" sdist for Python; a gem's `lib/` convention for Ruby). No
+gem-install/pip-install subprocess fallback exists (unlike npm's yolo, which falls back to
+`npm install`/`pnpm install`) — there's no equivalent portable CLI story to shell out to, so a
+failed install just surfaces as the pre-existing "cannot find module" error.
+
+`PackageCache` gained real support for the archive shapes these ecosystems actually use beyond
+npm's `.tgz` — PyPI sdist `.tar.gz` (top-level-dir-stripped gzip tar, same as npm), a PyPI wheel
+`.whl` (flat ZIP, no stripping), a RubyGems `.gem` (an *outer* uncompressed tar wrapping an inner
+`data.tar.gz`, unwrapped via a new `extractGem`), and (support built, not yet exercised by an
+automatic resolver — see below) a Go module `.zip` (top-level-dir-stripped ZIP).
+
+`CratesIoClient`/`GoProxyClient` are constructed in `Mycelium`'s composition root
+(`cratesIoClient`/`cratesIoInstaller`, `goProxyClient`/`goProxyInstaller`) and fully able to
+resolve/download, but **not yet consulted by any automatic bare-specifier resolution** —
+`RustSupport`/`TinyGoSupport` compile a single source file straight to one standalone
+LLVM-bitcode/WASM unit (`Compiler.compile`) with no dependency-graph resolution or multi-unit
+linking step at all yet, so there's no compile-time seam an auto-fetched crate/module's
+compiled output could wire into today without that architecture existing first. That
+architecture gap — not the registry client — is what's actually blocking Rust/Go auto-install.
 
 ### Distribution form — CLI binary works, weight still an open question
 `native-image` now produces a working standalone `mycelium` binary (~887MB, RAM-capped at

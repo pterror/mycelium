@@ -2,6 +2,9 @@ package org.mycelium.app
 
 import org.mycelium.library.Mycelium
 import org.mycelium.library.MyceliumException
+import org.mycelium.library.compiler.CompilerDownloader
+import org.mycelium.library.compiler.CompilerRegistry
+import java.io.File
 
 // Parsed command line: the `--yolo`/`--no-install` flags can appear anywhere
 // (`mycelium --yolo file.mjs` or `mycelium run --yolo file.mjs`), so they're stripped out
@@ -36,6 +39,7 @@ fun main(args: Array<String>) {
             runFile(rest[1], yolo, noInstall)
         }
         "version" -> println("mycelium 0.1.0-dev")
+        "compiler" -> runCompilerCommand(rest.drop(1))
         "help", "--help", "-h" -> printUsage()
         else -> {
             // If it looks like a file path, treat it as implicit `run`
@@ -65,13 +69,161 @@ private fun printUsage() {
         mycelium — run any file, import any language
 
         usage:
-          mycelium run <file>    Run a file (js, mjs, rb, c, rs, py)
-          mycelium <file>        Shorthand for 'mycelium run <file>'
-          mycelium version       Show version
-          mycelium help          Show this help
+          mycelium run <file>            Run a file (js, mjs, rb, c, rs, py)
+          mycelium <file>                Shorthand for 'mycelium run <file>'
+          mycelium compiler fetch <lang>[@<version>]
+                                          Prefetch a compile-to-JS compiler
+          mycelium compiler list         List known compile-to-JS languages
+          mycelium compiler cache        Show cached compiler/package downloads
+          mycelium version               Show version
+          mycelium help                  Show this help
 
         flags:
           --yolo                 Auto-install missing npm packages on import
           --no-install           Skip auto-installing dependencies declared in package.json
     """.trimIndent())
+}
+
+private fun printCompilerUsage() {
+    println("""
+        usage:
+          mycelium compiler fetch <lang>[@<version>]   Prefetch a compiler
+          mycelium compiler list                       List registered languages
+          mycelium compiler cache                      Show cached downloads
+    """.trimIndent())
+}
+
+private fun runCompilerCommand(args: List<String>) {
+    if (args.isEmpty()) {
+        printCompilerUsage()
+        System.exit(1)
+        return
+    }
+    when (args[0]) {
+        "fetch" -> {
+            if (args.size < 2) {
+                System.err.println("mycelium: missing language argument")
+                System.err.println("usage: mycelium compiler fetch <lang>[@<version>]")
+                System.exit(1)
+                return
+            }
+            compilerFetch(args[1])
+        }
+        "list" -> compilerList()
+        "cache" -> compilerCache()
+        else -> {
+            System.err.println("mycelium: unknown compiler subcommand '${args[0]}'")
+            printCompilerUsage()
+            System.exit(1)
+        }
+    }
+}
+
+// Splits "coffeescript@2.7.0" into ("coffeescript", "2.7.0") or "coffeescript" into
+// ("coffeescript", null). Scoped npm-style language IDs aren't a thing here (languageId is
+// always the CompilerRegistry key, not the npm package name), so a plain lastIndexOf('@') is
+// sufficient — no need to special-case a leading '@' the way npm package name parsing would.
+private fun parseLangSpec(spec: String): Pair<String, String?> {
+    val at = spec.lastIndexOf('@')
+    return if (at > 0) spec.substring(0, at) to spec.substring(at + 1) else spec to null
+}
+
+private fun compilerFetch(spec: String) {
+    val (languageId, versionOverride) = parseLangSpec(spec)
+    val compilerSpec = CompilerRegistry.resolve(languageId)
+    if (compilerSpec == null) {
+        System.err.println("mycelium: unknown language '$languageId'")
+        System.err.println("run 'mycelium compiler list' to see known languages")
+        System.exit(1)
+        return
+    }
+    val npmPackageName = compilerSpec.npmPackageName
+    if (npmPackageName == null) {
+        println("$languageId is bundled with mycelium — nothing to fetch")
+        return
+    }
+    val version = versionOverride ?: compilerSpec.defaultVersion
+    println("Fetching $languageId@$version...")
+    try {
+        val cacheDir = CompilerDownloader.ensureDownloaded(languageId, npmPackageName, version)
+        println("Cached at $cacheDir")
+    } catch (e: MyceliumException) {
+        System.err.println(e.message)
+        System.exit(1)
+    }
+}
+
+private fun compilerList() {
+    val languages = CompilerRegistry.languageIds().sorted()
+    if (languages.isEmpty()) {
+        println("(no languages registered)")
+        return
+    }
+    for (languageId in languages) {
+        val spec = CompilerRegistry.resolve(languageId) ?: continue
+        val npmPackageName = spec.npmPackageName
+        val cached = when {
+            npmPackageName == null -> true // bundled, always "available"
+            else -> CompilerDownloader.isInstalledAt(
+                CompilerDownloader.cacheDirFor(languageId, spec.defaultVersion),
+                npmPackageName,
+            )
+        }
+        val marker = if (cached) "[cached]" else "[not cached]"
+        val pkgDescription = npmPackageName ?: "bundled"
+        println("$languageId ($pkgDescription@${spec.defaultVersion}) $marker")
+    }
+}
+
+private fun compilerCache() {
+    val cacheHome = System.getenv("XDG_CACHE_HOME") ?: File(System.getProperty("user.home"), ".cache").path
+    val packagesDir = File(cacheHome, "mycelium/packages")
+    if (!packagesDir.isDirectory) {
+        println("(no cached packages — $packagesDir does not exist)")
+        return
+    }
+    // Cached packages live at packages/<ecosystem>/<name>/<version> (scoped npm names nest one
+    // level deeper as packages/<ecosystem>/@scope/pkg/<version>) — walk down to the version
+    // directories (leaves that directly contain package files, no further subdirectories that
+    // are themselves version-shaped) and report each one's on-disk size.
+    val versionDirs = mutableListOf<File>()
+    fun walk(dir: File) {
+        val children = dir.listFiles()?.filter { it.isDirectory } ?: emptyList()
+        if (children.isEmpty()) return
+        // A directory is a "version dir" (a leaf to report) if none of its children look like
+        // further package-name/version nesting containing a package.json — simplest reliable
+        // signal: it directly contains a package.json.
+        if (File(dir, "package.json").isFile) {
+            versionDirs.add(dir)
+            return
+        }
+        children.forEach(::walk)
+    }
+    walk(packagesDir)
+
+    if (versionDirs.isEmpty()) {
+        println("(no cached packages under $packagesDir)")
+        return
+    }
+
+    versionDirs.sortBy { it.path }
+    for (dir in versionDirs) {
+        val relative = dir.relativeTo(packagesDir).path
+        val size = dirSize(dir)
+        println("$relative  ${formatSize(size)}")
+    }
+}
+
+private fun dirSize(dir: File): Long =
+    dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+private fun formatSize(bytes: Long): String {
+    val units = listOf("B", "KB", "MB", "GB")
+    var size = bytes.toDouble()
+    var unitIndex = 0
+    while (size >= 1024 && unitIndex < units.size - 1) {
+        size /= 1024
+        unitIndex++
+    }
+    return if (unitIndex == 0) "${bytes}B" else "%.1f%s".format(size, units[unitIndex])
 }

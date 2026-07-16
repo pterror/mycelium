@@ -52,4 +52,9 @@ object CompilerRegistry {
     fun register(spec: CompilerSpec) {
         specs[spec.languageId] = spec
     }
+
+    // All registered language IDs (built-ins plus anything a consumer has `register`ed) —
+    // used by e.g. `mycelium compiler list` to enumerate what's available without needing to
+    // know the specific set of built-in languages ahead of time.
+    fun languageIds(): Set<String> = specs.keys
 }

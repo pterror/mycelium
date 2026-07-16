@@ -12,17 +12,53 @@ plugins { id("buildlogic.kotlin-library-conventions") }
 // for the follow-up when upstream publishes matching 25.1.x Ruby/LLVM jars.
 val graalVersion = "25.0.0"
 
+// --- JVM-mode language packs -------------------------------------------------------------
+//
+// Every Truffle language — including GraalJS itself — is a separate, opt-in language pack.
+// The core runtime carries only the language-agnostic polyglot/truffle framework
+// (`org.graalvm.polyglot:polyglot`, `org.graalvm.truffle:truffle-api`); nothing in this
+// module's own Kotlin source references any language-specific artifact's Java classes
+// directly (Languages.kt only ever passes GraalVM *string* language IDs to
+// `Context#eval`/`Source#newBuilder`, resolved dynamically by the polyglot engine at
+// runtime). Each language's Maven artifacts are declared `compileOnly` (satisfies the
+// Kotlin compiler, contributes nothing to the runtime/application classpath) plus one
+// dedicated, non-transitive Configuration per language pack below, so a consumer can opt
+// into exactly the language jars it wants:
+//   - `:app:jvmRun` (JVM mode, see app/build.gradle.kts) defaults to JS and adds packs
+//     requested via `-Planguages=js,ruby,python,...`.
+//   - the native-image build (unaffected by any of this — see graalvmNative's `classpath(...)`
+//     wiring in app/build.gradle.kts) still bakes every language in, exactly as before.
+// `testImplementation` below still pulls in every pack unconditionally so the existing test
+// suite (which exercises JS/Ruby/Python/LLVM/WASM directly) keeps working unchanged.
+val jsLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val rubyLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val pythonLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val javaLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val llvmLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val wasmLang: Configuration by configurations.creating { isCanBeConsumed = false }
+
 dependencies {
   implementation("org.graalvm.truffle:truffle-api:$graalVersion")
   implementation("org.graalvm.polyglot:polyglot:$graalVersion")
-  implementation("org.graalvm.polyglot:js:$graalVersion")
-  implementation("org.graalvm.polyglot:python:$graalVersion")
-  implementation("org.graalvm.polyglot:java:$graalVersion")
-  implementation("org.graalvm.polyglot:ruby:$graalVersion")
-  implementation("org.graalvm.polyglot:wasm:$graalVersion")
-  implementation("org.graalvm.polyglot:llvm:$graalVersion")
-  implementation("org.graalvm.polyglot:llvm-native:$graalVersion")
-  implementation("org.graalvm.ruby:ruby:$graalVersion")
+
+  compileOnly("org.graalvm.polyglot:js:$graalVersion")
+  compileOnly("org.graalvm.polyglot:python:$graalVersion")
+  compileOnly("org.graalvm.polyglot:java:$graalVersion")
+  compileOnly("org.graalvm.polyglot:ruby:$graalVersion")
+  compileOnly("org.graalvm.polyglot:wasm:$graalVersion")
+  compileOnly("org.graalvm.polyglot:llvm:$graalVersion")
+  compileOnly("org.graalvm.polyglot:llvm-native:$graalVersion")
+  compileOnly("org.graalvm.ruby:ruby:$graalVersion")
+
+  jsLang("org.graalvm.polyglot:js:$graalVersion")
+  pythonLang("org.graalvm.polyglot:python:$graalVersion")
+  javaLang("org.graalvm.polyglot:java:$graalVersion")
+  rubyLang("org.graalvm.polyglot:ruby:$graalVersion")
+  rubyLang("org.graalvm.ruby:ruby:$graalVersion")
+  llvmLang("org.graalvm.polyglot:llvm:$graalVersion")
+  llvmLang("org.graalvm.polyglot:llvm-native:$graalVersion")
+  wasmLang("org.graalvm.polyglot:wasm:$graalVersion")
+
   implementation("io.mvnpm:esbuild-java:1.5.1")
 
   // Pure-Kotlin npm registry client + package cache (CompilerDownloader):
@@ -34,3 +70,10 @@ dependencies {
   implementation("org.json:json:20240303")
   implementation("org.apache.commons:commons-compress:1.26.2")
 }
+
+// Tests exercise Ruby/Python/LLVM/WASM directly against a real Context, so the test
+// classpath keeps every language pack unconditionally, same as before this split
+// (Configuration instances can no longer be passed directly to `dependencies { }` as of
+// Gradle 8 — `extendsFrom` is the supported way to fold one Configuration's dependencies
+// into another).
+configurations.testImplementation.get().extendsFrom(jsLang, rubyLang, pythonLang, javaLang, llvmLang, wasmLang)

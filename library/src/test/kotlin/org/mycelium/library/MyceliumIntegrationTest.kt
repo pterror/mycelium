@@ -2249,49 +2249,40 @@ class MyceliumIntegrationTest {
 
     // --- `setTimeout`/`setInterval`/`setImmediate` globals ---
     //
-    // setImmediate (and any zero-delay, non-repeating setTimeout) resolves on the JS
-    // microtask queue (see TIMERS_INIT_SCRIPT's `nextTick`), so it fires on whichever
-    // thread is already inside the context — safe to observe on the shared `vm` with a
-    // single eval call.
+    // TimerManager (library/src/main/kotlin/org/mycelium/library/TimerManager.kt) drives a
+    // conventional single-threaded event loop entirely on whichever thread calls
+    // `Mycelium.runEventLoop()` — no timer ever gets its own background thread the way the
+    // previous (removed) implementation did, so none of these need to poll from a second
+    // thread or guard against "Multi threaded access" races: scheduling a timer via `eval`
+    // just registers it, and `runEventLoop()` deterministically drives every ref'd timer to
+    // completion before returning.
     //
-    // A genuine delay (setTimeout with ms > 0, or any setInterval) is instead backed by a
-    // dedicated daemon `java.lang.Thread` that sleeps for real wall-clock time and then
-    // calls back into the context itself (see TIMERS_INIT_SCRIPT's `runDelayed`) — the same
-    // "another thread enters the context" pattern as http.mjs's server dispatch thread,
-    // which (per the doc comment on importHttpModule's server half above) permanently
-    // forfeits the context back to that thread once it touches it. So, like the
-    // http.createServer / express.listen tests above, these use a dedicated, throwaway
-    // Mycelium instance rather than the shared `vm`.
+    // A single-shot poll helper (`pollUntilTrue`, used elsewhere by the child_process
+    // spawn/exec tests further up, which *do* still involve a genuine second OS thread —
+    // the reader/waiter threads those spawn) remains below.
 
-    @Test fun setImmediateWorks() {
-        val mc = vm
-        assertEquals("function", mc.eval("js", "typeof setImmediate").asString())
-        mc.eval("js", """
-            globalThis.__setImmediateFired = false;
-            setImmediate(() => { globalThis.__setImmediateFired = true; });
-        """.trimIndent())
-        assertTrue(mc.eval("js", "globalThis.__setImmediateFired").asBoolean())
-    }
-
-    // A single-shot (non-repeating) timer's background thread only ever touches the
-    // context for the brief instant it invokes its callback (see TIMERS_INIT_SCRIPT's
-    // runDelayed), so polling from this thread in between is safe the vast majority of the
-    // time — but if a poll's eval() happens to land in that exact instant, GraalJS throws
-    // "Multi threaded access requested ... but is not allowed" rather than queuing or
-    // blocking (confirmed empirically — see setIntervalWorks' doc comment for the repeating
-    // case, which hits this unavoidably rather than just rarely). Retrying past that
-    // exception here is enough for the non-repeating case, where the window is narrow.
     private fun pollUntilTrue(mc: Mycelium, expr: String, timeoutMs: Long = 5000): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             try {
                 if (mc.eval("js", expr).asBoolean()) return true
             } catch (e: IllegalStateException) {
-                // Raced the timer thread's own brief context entry — just retry.
+                // Raced another thread's own brief context entry — just retry.
             }
             Thread.sleep(20)
         }
         return mc.eval("js", expr).asBoolean()
+    }
+
+    @Test fun setImmediateWorks() {
+        val mc = Mycelium()
+        assertEquals("function", mc.eval("js", "typeof setImmediate").asString())
+        mc.eval("js", """
+            globalThis.__setImmediateFired = false;
+            setImmediate(() => { globalThis.__setImmediateFired = true; });
+        """.trimIndent())
+        mc.runEventLoop()
+        assertTrue(mc.eval("js", "globalThis.__setImmediateFired").asBoolean())
     }
 
     @Test fun setTimeoutWorks() {
@@ -2301,28 +2292,20 @@ class MyceliumIntegrationTest {
             globalThis.__setTimeoutFired = false;
             setTimeout(() => { globalThis.__setTimeoutFired = true; }, 10);
         """.trimIndent())
+        mc.runEventLoop()
         assertTrue(
-            pollUntilTrue(mc, "globalThis.__setTimeoutFired"),
-            "setTimeout callback did not fire within the timeout"
+            mc.eval("js", "globalThis.__setTimeoutFired").asBoolean(),
+            "setTimeout callback did not fire"
         )
     }
 
     @Test fun setIntervalWorks() {
         val mc = Mycelium()
         assertEquals("function", mc.eval("js", "typeof setInterval").asString())
-        // Unlike setTimeoutWorks' single-shot fire, an interval's background timer thread
-        // ticks repeatedly (see TIMERS_INIT_SCRIPT's runDelayed do/while loop), staying
-        // inside the context for the entire tick (sleep, then invoke the callback) each
-        // time around. Round-tripping a read-back eval() from *this* thread while that timer
-        // thread could still be mid-tick was found (empirically) to throw "Multi threaded
-        // access requested ... but is not allowed" — GraalJS Contexts don't allow two
-        // threads touching them at once, and there's no reliable window from the host side
-        // to know the timer thread is between ticks rather than inside one. So the callback
-        // below calls `clearInterval` on *itself* once it's fired 3 times — entirely from
-        // within the timer thread's own already-entered call, with no external thread
-        // involved — which both proves the interval fires more than once and exercises
-        // clearInterval, without this thread ever needing to touch the context while a tick
-        // might be in flight.
+        // The callback calls `clearInterval` on itself once it's fired 3 times — both
+        // proving the interval fires more than once and exercising clearInterval, and
+        // (crucially) giving the event loop a ref'd-timer-count of zero so
+        // `runEventLoop()` actually returns instead of looping on this interval forever.
         mc.eval("js", """
             globalThis.__intervalCount = 0;
             globalThis.__intervalId = setInterval(() => {
@@ -2332,12 +2315,178 @@ class MyceliumIntegrationTest {
                 }
             }, 10);
         """.trimIndent())
-        // Comfortably longer than 3 ticks' worth of real time (10ms each), so the timer
-        // thread is certain to have already self-cleared and exited by the time this reads
-        // the final count back.
-        Thread.sleep(300)
+        mc.runEventLoop()
         val finalCount = mc.eval("js", "globalThis.__intervalCount").asInt()
         assertEquals(3, finalCount, "expected setInterval to fire exactly 3 times before self-clearing via clearInterval")
+    }
+
+    @Test fun clearTimeoutCancelsPendingTimer() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__cancelledFired = false;
+            const id = setTimeout(() => { globalThis.__cancelledFired = true; }, 20);
+            clearTimeout(id);
+            // A second, ref'd timer so the event loop has something to actually run —
+            // otherwise runEventLoop() would return immediately with nothing to prove the
+            // cancelled timer *didn't* fire during a real drive of the loop.
+            globalThis.__otherFired = false;
+            setTimeout(() => { globalThis.__otherFired = true; }, 30);
+        """.trimIndent())
+        mc.runEventLoop()
+        assertTrue(mc.eval("js", "globalThis.__otherFired").asBoolean())
+        assertTrue(!mc.eval("js", "globalThis.__cancelledFired").asBoolean(), "cleared setTimeout fired anyway")
+    }
+
+    @Test fun clearIntervalCancelsRepeatingTimer() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__count = 0;
+            const id = setInterval(() => { globalThis.__count++; }, 10);
+            setTimeout(() => { clearInterval(id); }, 55);
+        """.trimIndent())
+        mc.runEventLoop()
+        val count = mc.eval("js", "globalThis.__count").asInt()
+        assertTrue(count in 3..6, "expected roughly 4-5 interval ticks in ~55ms, got $count")
+    }
+
+    // Node/Bun/Deno: an unref'd timer doesn't keep the event loop (here, `runEventLoop()`)
+    // alive — the process is free to exit even while it's still pending.
+    @Test fun unrefdTimerDoesNotKeepEventLoopAlive() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__unrefFired = false;
+            const t = setTimeout(() => { globalThis.__unrefFired = true; }, 10000);
+            t.unref();
+        """.trimIndent())
+        val start = System.currentTimeMillis()
+        mc.runEventLoop()
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue(elapsed < 2000, "runEventLoop() should have returned immediately with only an unref'd timer pending, took ${elapsed}ms")
+        assertTrue(!mc.eval("js", "globalThis.__unrefFired").asBoolean())
+    }
+
+    // ref() on an already-unref'd timer restores its ability to keep the loop alive.
+    @Test fun refRestoresEventLoopKeepAlive() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__fired = false;
+            const t = setTimeout(() => { globalThis.__fired = true; }, 10);
+            t.unref();
+            t.ref();
+        """.trimIndent())
+        mc.runEventLoop()
+        assertTrue(mc.eval("js", "globalThis.__fired").asBoolean())
+    }
+
+    @Test fun hasRefReflectsRefUnrefState() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            const t = setTimeout(() => {}, 10000);
+            globalThis.__hasRefInitially = t.hasRef();
+            t.unref();
+            globalThis.__hasRefAfterUnref = t.hasRef();
+            t.ref();
+            globalThis.__hasRefAfterRef = t.hasRef();
+            t.close();
+        """.trimIndent())
+        assertTrue(mc.eval("js", "globalThis.__hasRefInitially").asBoolean())
+        assertTrue(!mc.eval("js", "globalThis.__hasRefAfterUnref").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__hasRefAfterRef").asBoolean())
+    }
+
+    // close() is Node's alias for clearTimeout/clearInterval, callable directly on the
+    // Timer handle rather than needing the original id passed back to a global function.
+    @Test fun timerCloseCancelsIt() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__closedFired = false;
+            const t = setTimeout(() => { globalThis.__closedFired = true; }, 20);
+            t.close();
+            globalThis.__otherFired = false;
+            setTimeout(() => { globalThis.__otherFired = true; }, 30);
+        """.trimIndent())
+        mc.runEventLoop()
+        assertTrue(mc.eval("js", "globalThis.__otherFired").asBoolean())
+        assertTrue(!mc.eval("js", "globalThis.__closedFired").asBoolean())
+    }
+
+    // refresh() restarts a timer's countdown from "now" — used e.g. by idle-timeout
+    // patterns that repeatedly postpone firing as long as activity keeps happening.
+    @Test fun refreshRestartsTimerCountdown() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__fireOrder = [];
+            const t = setTimeout(() => { globalThis.__fireOrder.push('refreshed'); }, 30);
+            setTimeout(() => { t.refresh(); }, 15);
+            setTimeout(() => { globalThis.__fireOrder.push('marker'); }, 35);
+        """.trimIndent())
+        mc.runEventLoop()
+        // Without the refresh at t=15 the original timer would have fired at t=30, before
+        // the t=35 marker; refreshing it at t=15 pushes its firing out to t=45, after the
+        // marker.
+        val order = mc.eval("js", "JSON.stringify(globalThis.__fireOrder)").asString()
+        assertEquals("[\"marker\",\"refreshed\"]", order)
+    }
+
+    @Test fun multipleTimersFireInOrder() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__order = [];
+            setTimeout(() => { globalThis.__order.push('c'); }, 30);
+            setTimeout(() => { globalThis.__order.push('a'); }, 10);
+            setTimeout(() => { globalThis.__order.push('b'); }, 20);
+        """.trimIndent())
+        mc.runEventLoop()
+        val order = mc.eval("js", "JSON.stringify(globalThis.__order)").asString()
+        assertEquals("[\"a\",\"b\",\"c\"]", order)
+    }
+
+    // A setTimeout callback that itself schedules another setTimeout — must not be lost or
+    // deadlock the loop; the nested timer should still fire before the loop goes idle.
+    @Test fun nestedSetTimeoutWorks() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__outerFired = false;
+            globalThis.__innerFired = false;
+            setTimeout(() => {
+                globalThis.__outerFired = true;
+                setTimeout(() => { globalThis.__innerFired = true; }, 10);
+            }, 10);
+        """.trimIndent())
+        mc.runEventLoop()
+        assertTrue(mc.eval("js", "globalThis.__outerFired").asBoolean())
+        assertTrue(mc.eval("js", "globalThis.__innerFired").asBoolean())
+    }
+
+    // Extra arguments passed to setTimeout after the delay are forwarded to the callback —
+    // standard Node/browser setTimeout behavior (`setTimeout(fn, ms, ...args)`).
+    @Test fun setTimeoutForwardsExtraArguments() {
+        val mc = Mycelium()
+        mc.eval("js", """
+            globalThis.__received = null;
+            setTimeout((a, b) => { globalThis.__received = a + ':' + b; }, 5, 'x', 'y');
+        """.trimIndent())
+        mc.runEventLoop()
+        assertEquals("x:y", mc.eval("js", "globalThis.__received").asString())
+    }
+
+    // `Mycelium.runFile` drives the event loop itself after evaluating the entry file, so a
+    // script whose only remaining work is a ref'd setTimeout still completes it before
+    // `runFile` returns — mirroring how a real Node process stays alive exactly as long as
+    // a ref'd timer is pending, then exits.
+    @Test fun runFileDrainsRefdTimersBeforeReturning() {
+        val tmpDir = java.nio.file.Files.createTempDirectory("mycelium-timer-runfile-").toFile()
+        tmpDir.deleteOnExit()
+        val entry = File(tmpDir, "main.mjs")
+        entry.writeText("""
+            globalThis.__ranToCompletion = false;
+            setTimeout(() => {
+                globalThis.__ranToCompletion = true;
+            }, 10);
+        """.trimIndent())
+        val mc = Mycelium()
+        mc.runFile(entry.absolutePath)
+        assertTrue(mc.eval("js", "globalThis.__ranToCompletion").asBoolean())
     }
 
     // --- Subpath exports (package.json `"exports"` mapping a subpath to a file, distinct

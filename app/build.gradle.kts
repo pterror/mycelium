@@ -3,6 +3,13 @@ plugins {
     id("org.graalvm.buildtools.native") version "0.10.4"
 }
 
+// Forces :library's build.gradle.kts to be evaluated before this file finishes configuring
+// — needed so the `project(":library").configurations.getByName("rubyLang")` (etc.) lookups
+// below, both in the `jvmRun` task and in the `graalvmNative` block, can find the
+// per-language-pack Configurations :library declares, rather than racing Gradle's default
+// (unspecified) cross-project configuration order.
+evaluationDependsOn(":library")
+
 dependencies {
     implementation(project(":library"))
 }
@@ -14,8 +21,61 @@ application {
 
 // Run via: ./gradlew :app:run --args="run path/to/file.mjs"
 // (the `application` plugin forwards --args to main(args) automatically)
+//
+// Since library/build.gradle.kts moved ALL GraalVM language packs (including JS) off
+// `implementation` and onto `compileOnly` + dedicated per-language Configurations, the
+// plain `application` plugin's `run` task's classpath — the main source set's
+// runtimeClasspath — now carries only the language-agnostic Truffle/polyglot framework
+// with NO languages at all. This task is therefore the "bare core" execution path;
+// use `jvmRun` below (which defaults to JS) for actual script execution.
 tasks.named<JavaExec>("run") {
     workingDir = rootDir
+}
+
+// JVM-mode language packs available to add to `jvmRun`'s classpath, keyed by the `-P`
+// property value a caller passes (e.g. `-Planguages=js,ruby`) to the Configuration name
+// declared in library/build.gradle.kts.
+val languagePackConfigNames = mapOf(
+    "js" to "jsLang",
+    "ruby" to "rubyLang",
+    "python" to "pythonLang",
+    "java" to "javaLang",
+    "llvm" to "llvmLang",
+    "wasm" to "wasmLang",
+)
+
+// `./gradlew :app:jvmRun --args="run path/to/file.mjs"`
+// `./gradlew :app:jvmRun --args="run path/to/file.rb" -Planguages=js,ruby`
+//
+// Runs Mycelium in JVM mode with the core runtime plus whichever Truffle language packs
+// are named in the `-Planguages` property (comma-separated: `js`, `ruby`, `python`,
+// `java`, `llvm`, `wasm`). **Defaults to `js` when no `-Planguages` is specified**, so
+// existing usage (`./gradlew :app:jvmRun --args="run file.mjs"`) keeps working without
+// having to spell out `-Planguages=js` every time. Pass `-Planguages=` (empty) to run
+// with NO languages at all (useful only for probing — Mycelium will report an error
+// since it has no supported extensions).
+val jvmRun by tasks.registering(JavaExec::class) {
+    group = "application"
+    description = "Run Mycelium in JVM mode. Pass -Planguages=js,ruby,python,java,llvm,wasm to select language packs (default: js)."
+    mainClass.set("org.mycelium.app.AppKt")
+    workingDir = rootDir
+    classpath = sourceSets.main.get().runtimeClasspath
+
+    val languageProp = project.findProperty("languages") as String?
+    val requested = when {
+        // Explicit `-Planguages=...` (including `-Planguages=` for empty)
+        languageProp != null -> languageProp.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        // No `-Planguages` at all — default to JS so existing usage doesn't break.
+        else -> listOf("js")
+    }
+    for (pack in requested) {
+        val configName = languagePackConfigNames[pack]
+            ?: throw GradleException(
+                "mycelium: unknown language pack '$pack' — available: " +
+                    languagePackConfigNames.keys.sorted().joinToString(", ")
+            )
+        classpath += project(":library").configurations.getByName(configName)
+    }
 }
 
 graalvmNative {
@@ -26,6 +86,14 @@ graalvmNative {
             buildArgs.add("--initialize-at-build-time")
             buildArgs.add("-H:+ReportExceptionStackTraces")
             buildArgs.add("-J-Xmx8g")
+            // The native-image build path is unaffected by the compileOnly split above —
+            // it still bakes in every language, exactly as before that split — by
+            // explicitly adding each language pack Configuration to the native-image
+            // classpath here (they no longer arrive transitively via `implementation` now
+            // that library/build.gradle.kts moved them to `compileOnly`).
+            for (configName in languagePackConfigNames.values) {
+                classpath(project(":library").configurations.getByName(configName))
+            }
         }
     }
 }

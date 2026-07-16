@@ -2,8 +2,11 @@ package org.mycelium.library
 
 import java.io.File
 import org.graalvm.polyglot.Context
+import org.graalvm.polyglot.Engine
 import org.graalvm.polyglot.Source
+import org.graalvm.polyglot.Value
 import org.graalvm.polyglot.io.IOAccess
+import org.graalvm.polyglot.proxy.ProxyExecutable
 import org.mycelium.library.compiler.CompileToJsDispatcher
 import org.mycelium.library.compiler.CompilerCache
 import org.mycelium.library.compiler.CompilerDownloader
@@ -17,7 +20,7 @@ import org.mycelium.library.registry.PyPIClient
 import org.mycelium.library.registry.RubyGemsClient
 
 class Mycelium(
-    val languages: List<LanguageSupport> = listOf(
+    requestedLanguages: List<LanguageSupport> = listOf(
         JsSupport, CoffeeSupport, CivetSupport, LiveScriptSupport, ElmSupport, PureScriptSupport, ReScriptSupport,
         GleamSupport, ImbaSupport,
         DartSupport, KotlinJsSupport, ScalaJsSupport,
@@ -37,6 +40,41 @@ class Mycelium(
     // resolves to". Set to false (the app's `--no-install` flag) to skip it entirely.
     val autoInstall: Boolean = true
 ) {
+    // JVM-mode support: library/build.gradle.kts splits the GraalVM language runtimes
+    // (ruby/python/java/llvm/wasm) into separate, non-transitive Gradle Configurations
+    // ("language packs") that a JVM-mode launch (app/build.gradle.kts's `jvmRun` task) can
+    // add to the classpath selectively — see that file's own comments. Native-image builds
+    // are unaffected (every pack is still added to the native-image classpath explicitly),
+    // but in JVM mode a given process may genuinely be missing e.g. TruffleRuby's jars
+    // entirely. `Engine#getLanguages` reports exactly what's actually resolvable on this
+    // classpath/module-path, queried via a throwaway probe Engine below.
+    //
+    // This is deliberately kept separate from the real Context's own (implicit) Engine
+    // rather than sharing one Engine instance between the two via `.engine(...)` —
+    // attaching an explicit, potentially-multi-Context-shared Engine to a Context changes
+    // GraalVM's language-sharing rules: languages that don't support context sharing (Ruby
+    // is one — see the PolyglotException this used to throw, "lazily initialized language
+    // 'ruby' does not support sharing... must be known ahead of time when the context is
+    // created") then refuse to lazily initialize at all, breaking exactly the on-demand
+    // "only touch a language when a script actually needs it" behavior this class relies
+    // on. A second, throwaway Engine here costs one extra (and, since GraalVM CE has no
+    // libgraal on a stock JDK, textually near-identical) startup warning printed to
+    // stderr — not worth the sharing restriction to avoid.
+    private val availableLanguageIds: Set<String> = Engine.create().languages.keys
+
+    // `requestedLanguages` filtered down to what's actually usable in this process: a
+    // LanguageSupport whose `languageId` isn't in `availableLanguageIds` (e.g. RubySupport
+    // when no `rubyLang`-pack jar was added to a JVM-mode classpath) is dropped here rather
+    // than left to fail lazily and confusingly the first time some script tries to use it —
+    // every other consumer of `languages` (extensionMap, supportedExtensions,
+    // detectHostLanguage, runFile/evalModule's "don't know how to run/import" checks) reads
+    // this filtered list, so an unavailable language is reported the same clean way an
+    // unrecognized extension already is, and the injectEvalModule loop in `init` below never
+    // touches a language that isn't actually there (see RubySupport.injectEvalModule, which
+    // unconditionally calls `context.eval("ruby", ...)` and would otherwise blow up
+    // Mycelium's own constructor before any guest script ever ran).
+    val languages: List<LanguageSupport> = requestedLanguages.filter { it.languageId in availableLanguageIds }
+
     private val filesystem = InterceptingFileSystem()
 
     // Composition root for the compiler/registry object graph: everything below is
@@ -84,29 +122,31 @@ class Mycelium(
     // option cannot be enabled globally on the shared Context without redesigning that
     // mechanism (e.g. a separate Context per CJS-only subtree, which conflicts with the
     // single shared Context/polyglot-bindings architecture used everywhere else here).
-    private val context: Context =
-        Context.newBuilder()
+    private val jsAvailable = "js" in availableLanguageIds
+
+    private val context: Context = run {
+        val builder = Context.newBuilder()
             .allowAllAccess(true)
             .allowIO(IOAccess.newBuilder().fileSystem(filesystem).build())
-            // Unrelated to js.commonjs-require above (which swaps the module *loader* and
-            // breaks cross-language imports). This only changes what Context#eval hands
-            // back for a Source that turns out to be an ES module: the module's namespace
-            // object (so host code can read named/default exports off the returned Value)
-            // instead of `undefined` (an ES module's top level has no completion value).
-            // Needed by InterceptingFileSystem.requireModule, which evaluates a resolved
-            // module directly from Kotlin (unlike ordinary `import`, which GraalJS's own
-            // module linker resolves internally without ever handing Java-side code a
-            // Value to inspect).
-            .option("js.esm-eval-returns-exports", "true")
-            // Enables GraalJS's built-in `WebAssembly` JS API global (WebAssembly.Module /
-            // .Instance / ...), which InterceptingFileSystem.loadWasmExports uses to load
-            // tinygo-compiled Go WASM modules and read their exports off
-            // `instance.exports`. GraalVM's raw "wasm" Truffle language
-            // (context.eval("wasm", ...)) exposes no exports as Value members at all — see
-            // TinyGoSupport in Languages.kt — so the JS WebAssembly API is used instead of
-            // evaluating compiled WASM directly as a "wasm"-language Source.
-            .option("js.webassembly", "true")
-            .build()
+        // JS-specific Context options — only applied when GraalJS is actually on the
+        // classpath. These are `js.*`-namespaced options that GraalVM will reject outright
+        // ("Unknown option: js.esm-eval-returns-exports") if no language with ID "js" is
+        // installed, so they must be gated rather than unconditionally set.
+        if (jsAvailable) {
+            builder
+                // Makes Context#eval return the module's namespace object for ES modules
+                // (so host code can read named/default exports off the returned Value)
+                // instead of `undefined`. Needed by InterceptingFileSystem.requireModule.
+                .option("js.esm-eval-returns-exports", "true")
+                // Enables GraalJS's built-in `WebAssembly` JS API global. Additionally
+                // gated on "wasm" being available — GraalJS's WebAssembly API requires the
+                // "wasm" Truffle language to exist so it can delegate to it internally, and
+                // throws IllegalStateException out of JSRealm's constructor if "wasm" is
+                // absent.
+                .option("js.webassembly", ("wasm" in availableLanguageIds).toString())
+        }
+        builder.build()
+    }
 
     private val extensionMap: Map<String, LanguageSupport> =
         languages.flatMap { lang -> lang.extensions.map { it to lang } }.toMap()
@@ -133,22 +173,88 @@ class Mycelium(
         filesystem.resolveRequireSpecifierPaths(args[0].asString(), args[1].asString())
     }
 
+    // Host-side single-threaded event loop backing `setTimeout`/`setInterval`/
+    // `setImmediate` — see TimerManager's own doc comment for why this replaced an earlier
+    // one-thread-per-timer implementation. `runFile` (below) drives this loop to
+    // completion after evaluating the entry file, the same way Node keeps its process
+    // alive only as long as ref'd timers/handles remain; `runEventLoop` is also exposed
+    // publicly so tests (or any other caller not going through `runFile`) can pump it
+    // directly after scheduling timers via a bare `eval`.
+    private val timerManager = TimerManager()
+
+    private fun millisFromArg(v: Value): Long = if (v.isNumber) v.asDouble().toLong() else 0L
+
+    // Accepts either a `Timer` handle (as returned by our own `setTimeout`/`setInterval`/
+    // `setImmediate` — see TimerManager.handleFor) or a raw numeric id, matching every
+    // shape real code passes to `clearTimeout`/`clearInterval`/`clearImmediate`.
+    private fun clearTimerArg(v: Value?) {
+        if (v == null || v.isNull) return
+        if (v.hasMember("close")) {
+            v.invokeMember("close")
+        } else if (v.isNumber) {
+            timerManager.clear(v.asLong())
+        }
+    }
+
+    private val setTimeoutFn = ProxyExecutable { args ->
+        val callback = args[0]
+        val delay = if (args.size > 1) millisFromArg(args[1]) else 0L
+        val extraArgs = if (args.size > 2) args.drop(2) else emptyList()
+        timerManager.handleFor(timerManager.schedule(callback, delay, false, extraArgs))
+    }
+
+    private val setIntervalFn = ProxyExecutable { args ->
+        val callback = args[0]
+        val delay = if (args.size > 1) millisFromArg(args[1]) else 0L
+        val extraArgs = if (args.size > 2) args.drop(2) else emptyList()
+        timerManager.handleFor(timerManager.schedule(callback, delay, true, extraArgs))
+    }
+
+    private val setImmediateFn = ProxyExecutable { args ->
+        val callback = args[0]
+        val extraArgs = if (args.size > 1) args.drop(1) else emptyList()
+        timerManager.handleFor(timerManager.schedule(callback, 0L, false, extraArgs))
+    }
+
+    private val clearTimerFn = ProxyExecutable { args ->
+        clearTimerArg(args.getOrNull(0))
+        null
+    }
+
     init {
         filesystem.init(context, this, compileToJsDispatcher, packageInstaller, yolo, rubyGemsInstaller, pyPIInstaller)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
-        context.getBindings("js").putMember("__mycelium_require__", requireFn)
-        context.getBindings("js").putMember("__mycelium_require_resolve__", requireResolveFn)
-        context.getBindings("js").putMember("__mycelium_require_resolve_paths__", requireResolvePathsFn)
-        context.eval("js", GLOBAL_ALIAS_INIT_SCRIPT)
-        context.eval("js", PROCESS_INIT_SCRIPT)
-        context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
-        context.eval("js", ERROR_CAPTURE_STACK_TRACE_INIT_SCRIPT)
-        context.eval("js", TEXT_ENCODING_INIT_SCRIPT)
-        context.eval("js", TIMERS_INIT_SCRIPT)
-        context.eval("js", GLOBAL_BUFFER_INIT_SCRIPT)
-        context.eval("js", GLOBAL_URL_INIT_SCRIPT)
+        // Everything below is JS-specific: the `__mycelium_require__` bindings live on
+        // `context.getBindings("js")`, and the init scripts are all evaluated as JS. When
+        // GraalJS isn't on the classpath these calls would throw — skip them entirely.
+        // Mycelium still constructs and can run non-JS languages (Ruby, Python, etc.) in
+        // that case, just without the JS-hosted cross-language bridge, CJS require shim,
+        // or Node-compat globals (process, Buffer, URL, timers, TextEncoder, etc.) that
+        // only exist in the JS guest.
+        if (jsAvailable) {
+            context.getBindings("js").putMember("__mycelium_require__", requireFn)
+            context.getBindings("js").putMember("__mycelium_require_resolve__", requireResolveFn)
+            context.getBindings("js").putMember("__mycelium_require_resolve_paths__", requireResolvePathsFn)
+            // setTimeout/setInterval/setImmediate and their clear* counterparts are
+            // implemented entirely host-side (TimerManager) rather than in
+            // TIMERS_INIT_SCRIPT's JS — see TimerManager's doc comment.
+            context.getBindings("js").putMember("setTimeout", setTimeoutFn)
+            context.getBindings("js").putMember("clearTimeout", clearTimerFn)
+            context.getBindings("js").putMember("setInterval", setIntervalFn)
+            context.getBindings("js").putMember("clearInterval", clearTimerFn)
+            context.getBindings("js").putMember("setImmediate", setImmediateFn)
+            context.getBindings("js").putMember("clearImmediate", clearTimerFn)
+            context.eval("js", GLOBAL_ALIAS_INIT_SCRIPT)
+            context.eval("js", PROCESS_INIT_SCRIPT)
+            context.eval("js", GLOBAL_CRYPTO_INIT_SCRIPT)
+            context.eval("js", ERROR_CAPTURE_STACK_TRACE_INIT_SCRIPT)
+            context.eval("js", TEXT_ENCODING_INIT_SCRIPT)
+            context.eval("js", QUEUE_MICROTASK_INIT_SCRIPT)
+            context.eval("js", GLOBAL_BUFFER_INIT_SCRIPT)
+            context.eval("js", GLOBAL_URL_INIT_SCRIPT)
+        }
     }
 
     fun supportForExtension(extension: String): LanguageSupport? = extensionMap[extension]
@@ -173,8 +279,12 @@ class Mycelium(
         }
         val language = languageFromExtension(file.extension)
             ?: throw MyceliumException(
-                "mycelium: don't know how to run '${file.name}' — supported extensions: " +
-                    supportedExtensions.joinToString(", ")
+                if (supportedExtensions.isEmpty())
+                    "mycelium: no languages available — add language JARs to the classpath " +
+                        "(e.g. -Planguages=js or -Planguages=js,ruby)"
+                else
+                    "mycelium: don't know how to run '${file.name}' — supported extensions: " +
+                        supportedExtensions.joinToString(", ")
             )
         if (autoInstall) {
             maybeInstallDependencies(file.absoluteFile.parentFile)
@@ -183,6 +293,24 @@ class Mycelium(
         val source = Source.newBuilder(language, code, path).build()
         val dir = file.absoluteFile.parentFile.toPath()
         filesystem.withSourceDirectory(dir) { context.eval(source) }
+        // Mirrors Node: the process (here, this call) stays alive only as long as a ref'd
+        // timer/handle remains pending — evaluating the entry file above may have
+        // registered `setTimeout`/`setInterval` callbacks via the Kotlin-backed globals,
+        // which this drives to completion on the same (calling) thread that owns the
+        // Context. A script that registered no timers (or only unref'd ones) returns
+        // immediately, same as before this loop existed.
+        if (jsAvailable) {
+            runEventLoop()
+        }
+    }
+
+    // Drives the host-side timer event loop (TimerManager) on the calling thread until no
+    // ref'd `setTimeout`/`setInterval`/`setImmediate` timer remains pending. `runFile`
+    // calls this automatically after evaluating the entry file; exposed publicly as well
+    // so a caller driving Mycelium directly via `eval`/`evalModule` (e.g. a test, or an
+    // embedder with its own entry point) can pump the same loop explicitly.
+    fun runEventLoop() {
+        timerManager.runUntilIdle()
     }
 
     fun eval(languageId: String, code: String): org.graalvm.polyglot.Value =
@@ -693,149 +821,32 @@ class Mycelium(
             })();
         """.trimIndent()
 
-        // Polyfills the `setTimeout`/`setInterval`/`setImmediate` global timer functions
-        // (and their `clear*` counterparts) — GraalJS provides none of these itself (they're
-        // a browser/Node runtime feature, not part of the ECMAScript spec), yet they're
-        // used pervasively, including by core Express machinery (the `router` package calls
-        // `setImmediate()` to defer to the next tick when unwinding a middleware chain, and
-        // the deferred continuation is what actually invokes the route handler that finishes
-        // the HTTP response).
+        // `setTimeout`/`setInterval`/`setImmediate` and their `clear*` counterparts are
+        // registered directly as host (Kotlin) `ProxyExecutable` globals in `init` above
+        // (see `setTimeoutFn`/`setIntervalFn`/`setImmediateFn`/`clearTimerFn` and
+        // `TimerManager`) rather than in a JS init script — GraalJS provides none of these
+        // itself (they're a browser/Node runtime feature, not part of the ECMAScript
+        // spec), and a prior JS-side implementation that spawned a dedicated
+        // `java.lang.Thread` per timer to sleep for real wall-clock time before calling
+        // back into the Context crashed with `IllegalStateException: Multi threaded
+        // access` the moment two such threads' brief Context entries overlapped — GraalJS
+        // only permits one thread inside a Context at a time. TimerManager instead runs a
+        // conventional single-threaded event loop (find the next due timer, run it,
+        // repeat) entirely on whichever thread already owns the Context.
         //
-        // Two things were tried and rejected before landing on the split below:
-        //
-        //  1. Resolve every timer on the JS microtask queue (`Promise.resolve().then(...)`,
-        //     mirroring http.mjs's nextTick), on the theory that Mycelium has no real event
-        //     loop anyway. This hangs on any "poll until some background thread's I/O
-        //     finishes" retry loop (`function poll() { if (!ready) setTimeout(poll, 10); }
-        //     poll();` — a common pattern): it becomes unbounded synchronous microtask
-        //     recursion, and GraalJS drains the microtask queue to completion before
-        //     `Context#eval` returns control to the caller — starving out the other thread
-        //     (e.g. an http.mjs HttpServer dispatch thread) the poll loop is actually
-        //     waiting on. Livelock, not just slow.
-        //  2. Real delays via a shared `java.util.concurrent.ScheduledExecutorService`.
-        //     GraalJS can't unambiguously hand a plain JS function to
-        //     `ScheduledExecutorService#schedule`, which is overloaded on `Runnable` vs
-        //     `Callable` — a JS function satisfies both functional-interface shapes, so the
-        //     call fails with "Multiple applicable overloads found for method name schedule".
-        //     A dedicated `java.lang.Thread` per timer sidesteps the overload ambiguity, but
-        //     introduces a *second* failure mode specific to zero-delay `setImmediate`:
-        //     starting a brand-new OS thread takes real (if small) time, during which the
-        //     original caller's synchronous call stack — e.g. http.mjs's HttpServer request
-        //     handler — has often already returned and left the polyglot Context, but the
-        //     new timer thread's very first `Context`-touching call can still race that
-        //     departure and never observably "win" the handoff, so the deferred callback
-        //     (and, transitively, the `res.end()` inside it that actually completes the HTTP
-        //     response) silently never runs — a real deadlock, reproduced by
-        //     `expressServerHandlesRequestsAndFourOhFours` hanging indefinitely.
-        //
-        // The fix: split by intent rather than using one mechanism for both. `setImmediate`
-        // and a zero/near-zero-delay `setTimeout` are used, in practice, to *defer* — yield
-        // once before continuing, not to wait for real wall-clock time to pass — so they
-        // resolve on the microtask queue like nextTick, which is synchronous-safe (bounded:
-        // a single deferred continuation, not an unbounded retry loop) and never needs a
-        // second thread to touch the Context. Only a *genuine* delay (`ms` clearly > 0, the
-        // shape a retry/poll loop actually uses) gets the dedicated-background-thread
-        // treatment from rejected approach #2 above — spending real wall-clock time before
-        // re-entering the Context is exactly what avoids the livelock in approach #1, and a
-        // many--millisecond gap is enough for a same-thread `new Thread(...).start()` to
-        // reliably outlive whatever call stack scheduled it.
-        private val TIMERS_INIT_SCRIPT = """
+        // Only `queueMicrotask` remains a JS-side polyfill here: it's just sugar over
+        // `Promise.resolve().then(...)`, unrelated to the timer/event-loop machinery.
+        // avvio (fastify's plugin-loading/boot library) calls the bare global
+        // `queueMicrotask(...)` unconditionally — with no feature-detection guard — from
+        // several points in its plugin-queue-draining logic (see avvio/lib/plugin.js's
+        // `check()`). Previously undefined here, so that call threw a bare `TypeError:
+        // queueMicrotask is not a function` from deep inside a queue callback with no
+        // surrounding `try`/`catch` anywhere on the call stack to report it — silently
+        // aborting `fastify().listen()`'s plugin boot sequence partway through, which left
+        // its returned promise forever unresolved instead of ever rejecting — see
+        // NpmCompatibilityTest.fastifyListensAndCloses.
+        private val QUEUE_MICROTASK_INIT_SCRIPT = """
             (function () {
-                var JThread = Java.type('java.lang.Thread');
-
-                var nextId = 1;
-                var cancelled = Object.create(null);
-
-                function nextTick(fn) {
-                    Promise.resolve().then(fn);
-                }
-
-                // A dedicated daemon `Thread` per scheduled timer — see the "one thread per
-                // timer" rationale in the doc comment above. Only used for a genuine
-                // (`ms` > 0) delay; zero-delay scheduling goes through `nextTick` instead
-                // (see `schedule` below).
-                function runDelayed(fn, args, delayMs, id, repeating) {
-                    var thread = new JThread(function () {
-                        try {
-                            do {
-                                JThread.sleep(delayMs);
-                                if (cancelled[id]) return;
-                                if (typeof fn === 'function') fn.apply(null, args);
-                            } while (repeating && !cancelled[id]);
-                        } catch (e) {
-                            // InterruptedException (or any other) from a cancelled/racing
-                            // timer — nothing more to do.
-                        } finally {
-                            delete cancelled[id];
-                        }
-                    });
-                    thread.setDaemon(true);
-                    thread.setName('mycelium-timer-' + id);
-                    thread.start();
-                }
-
-                function schedule(fn, ms, args, repeating) {
-                    var id = nextId++;
-                    var delay = typeof ms === 'number' && ms > 0 ? Math.floor(ms) : 0;
-                    if (delay > 0) {
-                        runDelayed(fn, args, delay, id, repeating);
-                    } else if (repeating) {
-                        // A zero-delay *repeating* interval has no safe microtask
-                        // implementation (see rejected approach #1) — fall back to the
-                        // background-thread path with a minimal 1ms tick instead of
-                        // spinning the guest thread forever.
-                        runDelayed(fn, args, 1, id, true);
-                    } else {
-                        nextTick(function () {
-                            if (cancelled[id]) { delete cancelled[id]; return; }
-                            if (typeof fn === 'function') fn.apply(null, args);
-                        });
-                    }
-                    return id;
-                }
-
-                function clear(id) {
-                    cancelled[id] = true;
-                }
-
-                if (typeof globalThis.setTimeout === 'undefined') {
-                    globalThis.setTimeout = function (fn, ms) {
-                        return schedule(fn, ms, Array.prototype.slice.call(arguments, 2), false);
-                    };
-                }
-                if (typeof globalThis.clearTimeout === 'undefined') {
-                    globalThis.clearTimeout = clear;
-                }
-                if (typeof globalThis.setInterval === 'undefined') {
-                    globalThis.setInterval = function (fn, ms) {
-                        return schedule(fn, ms, Array.prototype.slice.call(arguments, 2), true);
-                    };
-                }
-                if (typeof globalThis.clearInterval === 'undefined') {
-                    globalThis.clearInterval = clear;
-                }
-                if (typeof globalThis.setImmediate === 'undefined') {
-                    globalThis.setImmediate = function (fn) {
-                        return schedule(fn, 0, Array.prototype.slice.call(arguments, 1), false);
-                    };
-                }
-                if (typeof globalThis.clearImmediate === 'undefined') {
-                    globalThis.clearImmediate = clear;
-                }
-                // Standard web-platform/Node global (unrelated to the CommonJS `module`
-                // object despite the similar name) — queues `fn` to run as a microtask,
-                // the same "drain before the next macrotask" timing `Promise.prototype.then`
-                // callbacks get, just without needing an actual `Promise` object around.
-                // avvio (fastify's plugin-loading/boot library) calls the bare global
-                // `queueMicrotask(...)` unconditionally — with no feature-detection guard —
-                // from several points in its plugin-queue-draining logic (see
-                // avvio/lib/plugin.js's `check()`). Previously undefined here, so that call
-                // threw a bare `TypeError: queueMicrotask is not a function` from deep
-                // inside a queue callback with no surrounding `try`/`catch` anywhere on the
-                // call stack to report it — silently aborting `fastify().listen()`'s plugin
-                // boot sequence partway through, which left its returned promise forever
-                // unresolved instead of ever rejecting — see
-                // NpmCompatibilityTest.fastifyListensAndCloses.
                 if (typeof globalThis.queueMicrotask === 'undefined') {
                     globalThis.queueMicrotask = function (fn) {
                         Promise.resolve().then(fn);

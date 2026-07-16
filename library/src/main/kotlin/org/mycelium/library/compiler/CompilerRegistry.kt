@@ -547,12 +547,10 @@ class CompilerRegistry {
                 // native platform binaries via GitHub Releases and Coursier, not npm; no
                 // self-contained npm package bundles a working Scala.js toolchain the way
                 // Elm/PureScript/ReScript's npm wrappers do, so there's no npmPackageName here.
-                // Auto-download (a GitHub-Releases ToolSource, the way Gleam's `gleam` gets
-                // one) is left as a follow-up: only ProjectLocalBin/SystemPath are wired up for
-                // now, so this registration only helps a project/environment (e.g. this
-                // codebase's own NixOS flake, or a Nix devShell) that already provides
-                // scala-cli on PATH or in node_modules/.bin — a real gap versus Dart/Kotlin-JS
-                // above, called out explicitly rather than silently.
+                // Auto-download: a GitHub-Releases ToolSource (the same shape Gleam's `gleam`
+                // gets), added below via toolSources — see scalaCliReleaseAssetName's own doc
+                // comment for scala-cli's asset-naming convention and why it's a bare `.gz`
+                // rather than the `.tar.gz`/`.zip` Gleam ships.
                 npmPackageName = null,
                 defaultVersion = "1.5.0",
                 backendType = BackendType.SUBPROCESS,
@@ -580,6 +578,22 @@ class CompilerRegistry {
                     buildList {
                         sourcePath.parent?.let { add(ProjectLocalBin(it, versionCheck)) }
                         add(SystemPath(versionCheck))
+                        // Last resort: Mycelium's own GitHub-release download cache, the same
+                        // "user's own install always wins, download only as a last resort"
+                        // precedence Gleam's `gleam`/Dart's `dart2js` get above — pinned to
+                        // this registration's own `defaultVersion` rather than the (possibly
+                        // range-shaped, e.g. "^1.5.0") project constraint, since scala-cli
+                        // isn't published anywhere SemverResolver can resolve a range against
+                        // (mirrors Gleam's own fixed-tag GitHubRelease, not Dart's
+                        // constraint-driven exact-version download).
+                        add(
+                            GitHubRelease(
+                                owner = "VirtusLab",
+                                repo = "scala-cli",
+                                tag = "v1.5.0",
+                                assetName = scalaCliReleaseAssetName("1.5.0"),
+                            )
+                        )
                     }
                 },
                 subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
@@ -712,6 +726,36 @@ class CompilerRegistry {
         }
         val extension = if (os.contains("win")) "zip" else "tar.gz"
         return "gleam-v$version-$target.$extension"
+    }
+
+    // Maps this JVM's OS/architecture (plus the caller-supplied scala-cli version) to the
+    // exact GitHub release asset name scala-cli's own release workflow publishes — verified
+    // against https://github.com/VirtusLab/scala-cli/releases/tag/v1.5.0's actual asset list.
+    // Unlike Gleam, scala-cli ships the bare binary gzip-compressed directly (`.gz`, handled
+    // by ToolResolver.kt's GitHubRelease.extractPlainGzip) rather than wrapped in a
+    // `.tar.gz`/`.zip` archive, for every platform except Windows (`.zip`, still just the
+    // bare `scala-cli.exe` at the archive root — verified the same way).
+    //
+    // Linux x86_64 has a `-static` variant (a genuinely statically-linked binary, confirmed
+    // via `file`) in addition to the plain dynamically-linked one; the static build is
+    // preferred since a dynamically-linked generic-Linux binary won't run as-is on NixOS (no
+    // FHS-standard dynamic linker path) — exactly the kind of environment Mycelium's own
+    // NixOS-flake-provided dev tooling otherwise sidesteps, so a downloaded fallback binary
+    // should too, wherever scala-cli's own release actually offers one. Linux aarch64 has no
+    // such statically-linked single-binary asset (only a dynamically-linked `.gz` or a
+    // JVM-bundling `-static-sdk.zip`, the latter not flat-at-archive-root the way
+    // GitHubRelease's extraction assumes), so it falls back to the plain dynamically-linked
+    // build.
+    private fun scalaCliReleaseAssetName(version: String): String {
+        val os = System.getProperty("os.name").lowercase()
+        val arch = System.getProperty("os.arch").lowercase()
+        val isArm = arch.contains("aarch64") || arch.contains("arm")
+        return when {
+            os.contains("win") -> "scala-cli-x86_64-pc-win32.zip"
+            os.contains("mac") || os.contains("darwin") ->
+                if (isArm) "scala-cli-aarch64-apple-darwin.gz" else "scala-cli-x86_64-apple-darwin.gz"
+            else -> if (isArm) "scala-cli-aarch64-pc-linux.gz" else "scala-cli-x86_64-pc-linux-static.gz"
+        }
     }
 
     // Maps this JVM's OS/architecture to the platform-specific subdirectory name the

@@ -216,8 +216,11 @@ class RegistryDownload(
 //
 // Downloads `https://github.com/{owner}/{repo}/releases/download/{tag}/{assetName}` (once)
 // into `XDG_CACHE_HOME/mycelium/tools/<toolName>/<tag>/`, extracting whichever of .tar.gz/
-// .tgz/.zip `assetName` names — the two archive shapes GitHub release assets almost always
-// use — and returns the path to `toolName` inside that directory. Unlike npm tarballs
+// .tgz/.zip/.gz `assetName` names — the three asset shapes GitHub release assets in practice
+// use (.tar.gz/.tgz and .zip being real archives with their own entry names; a bare .gz,
+// scala-cli's own convention, being nothing more than the single binary itself
+// gzip-compressed with no archive structure at all — see extractPlainGzip) — and returns the
+// path to `toolName` inside that directory. Unlike npm tarballs
 // (always rooted at one shared top-level directory, e.g. "package/"), a GitHub release
 // asset's own layout varies per project; Gleam's ships its binary unwrapped at the archive's
 // own root (a single entry literally named "gleam"), so entries are extracted preserving
@@ -241,7 +244,7 @@ class GitHubRelease(
             return binaryPath
         }
 
-        download(cacheDir)
+        download(cacheDir, toolName)
 
         // A caller-supplied `assetName` whose extracted contents don't actually contain a
         // file named `toolName` is treated as an ordinary miss (null), matching every other
@@ -259,7 +262,7 @@ class GitHubRelease(
         return File(xdgCacheHome, "mycelium/tools/$toolName/$tag").toPath()
     }
 
-    private fun download(cacheDir: Path) {
+    private fun download(cacheDir: Path, toolName: String) {
         val parentDir = cacheDir.parent
         Files.createDirectories(parentDir)
         val tempDir = Files.createTempDirectory(parentDir, "download-$tag-")
@@ -280,9 +283,16 @@ class GitHubRelease(
                 when {
                     assetName.endsWith(".tar.gz") || assetName.endsWith(".tgz") -> extractTarGz(body, tempDir)
                     assetName.endsWith(".zip") -> extractZip(body, tempDir)
+                    // scala-cli's own release assets (e.g.
+                    // "scala-cli-x86_64-pc-linux-static.gz") are the bare gzip-compressed
+                    // binary itself, unlike Gleam's .tar.gz — no tar/zip archive structure
+                    // (no entry name) at all, so extraction here is just "gunzip straight to
+                    // a file named `toolName`" rather than walking archive entries the way
+                    // extractTarGz/extractZip do.
+                    assetName.endsWith(".gz") -> extractPlainGzip(body, tempDir, toolName)
                     else -> throw MyceliumException(
                         "mycelium: don't know how to extract GitHub release asset '$assetName' " +
-                            "(only .tar.gz/.tgz/.zip are supported)"
+                            "(only .tar.gz/.tgz/.zip/.gz are supported)"
                     )
                 }
             }
@@ -315,6 +325,14 @@ class GitHubRelease(
                 }
             }
         }
+    }
+
+    private fun extractPlainGzip(rawStream: InputStream, destDir: Path, toolName: String) {
+        val dest = destDir.resolve(toolName)
+        GzipCompressorInputStream(rawStream).use { gzip ->
+            Files.copy(gzip, dest, StandardCopyOption.REPLACE_EXISTING)
+        }
+        dest.toFile().setExecutable(true)
     }
 
     private fun extractZip(rawStream: InputStream, destDir: Path) {

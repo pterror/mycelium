@@ -4,7 +4,17 @@ import org.mycelium.library.Mycelium
 import org.mycelium.library.MyceliumException
 import org.mycelium.library.compiler.CompilerDownloader
 import org.mycelium.library.compiler.CompilerRegistry
+import org.mycelium.library.registry.NpmRegistryClient
 import java.io.File
+
+// The CLI's own small composition root for the `mycelium compiler ...` subcommands, which
+// operate on the compiler registry/downloader directly rather than through a running
+// Mycelium instance (unlike `mycelium run`, which constructs its own Mycelium — see
+// runFile — with its own equivalent instances). Built once per process rather than per
+// subcommand invocation so `compiler list`/`compiler cache` see a consistent registry.
+private val registryClient = NpmRegistryClient()
+private val compilerDownloader = CompilerDownloader(registryClient)
+private val compilerRegistry = CompilerRegistry()
 
 // Parsed command line: the `--yolo`/`--no-install` flags can appear anywhere
 // (`mycelium --yolo file.mjs` or `mycelium run --yolo file.mjs`), so they're stripped out
@@ -130,7 +140,7 @@ private fun parseLangSpec(spec: String): Pair<String, String?> {
 
 private fun compilerFetch(spec: String) {
     val (languageId, versionOverride) = parseLangSpec(spec)
-    val compilerSpec = CompilerRegistry.resolve(languageId)
+    val compilerSpec = compilerRegistry.resolve(languageId)
     if (compilerSpec == null) {
         System.err.println("mycelium: unknown language '$languageId'")
         System.err.println("run 'mycelium compiler list' to see known languages")
@@ -145,7 +155,7 @@ private fun compilerFetch(spec: String) {
     val version = versionOverride ?: compilerSpec.defaultVersion
     println("Fetching $languageId@$version...")
     try {
-        val cacheDir = CompilerDownloader.ensureDownloaded(languageId, npmPackageName, version)
+        val cacheDir = compilerDownloader.ensureDownloaded(languageId, npmPackageName, version)
         println("Cached at $cacheDir")
     } catch (e: MyceliumException) {
         System.err.println(e.message)
@@ -154,18 +164,18 @@ private fun compilerFetch(spec: String) {
 }
 
 private fun compilerList() {
-    val languages = CompilerRegistry.languageIds().sorted()
+    val languages = compilerRegistry.languageIds().sorted()
     if (languages.isEmpty()) {
         println("(no languages registered)")
         return
     }
     for (languageId in languages) {
-        val spec = CompilerRegistry.resolve(languageId) ?: continue
+        val spec = compilerRegistry.resolve(languageId) ?: continue
         val npmPackageName = spec.npmPackageName
         val cached = when {
             npmPackageName == null -> true // bundled, always "available"
-            else -> CompilerDownloader.isInstalledAt(
-                CompilerDownloader.cacheDirFor(languageId, spec.defaultVersion),
+            else -> compilerDownloader.isInstalledAt(
+                compilerDownloader.cacheDirFor(languageId, spec.defaultVersion),
                 npmPackageName,
             )
         }

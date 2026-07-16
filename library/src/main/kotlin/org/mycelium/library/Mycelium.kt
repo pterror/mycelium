@@ -4,6 +4,13 @@ import java.io.File
 import org.graalvm.polyglot.Context
 import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.IOAccess
+import org.mycelium.library.compiler.CompileToJsDispatcher
+import org.mycelium.library.compiler.CompilerCache
+import org.mycelium.library.compiler.CompilerDownloader
+import org.mycelium.library.compiler.CompilerRegistry
+import org.mycelium.library.compiler.EsbuildBackend
+import org.mycelium.library.registry.NpmRegistryClient
+import org.mycelium.library.registry.PackageInstaller
 
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
@@ -25,6 +32,20 @@ class Mycelium(
     val autoInstall: Boolean = true
 ) {
     private val filesystem = InterceptingFileSystem()
+
+    // Composition root for the compiler/registry object graph: everything below is
+    // constructed here (rather than reached for as a global singleton) and threaded down
+    // into whatever actually needs it — CompileToJsDispatcher/InterceptingFileSystem — so
+    // each of those depends only on the interfaces/classes it's handed, not on how they're
+    // built. NpmRegistryClient is the only PackageIndex implementation today; a consumer
+    // wanting a different package ecosystem (or a test wanting a fake registry) would swap
+    // it out right here rather than anywhere downstream.
+    private val registryClient = NpmRegistryClient()
+    private val compilerDownloader = CompilerDownloader(registryClient)
+    private val compilerRegistry = CompilerRegistry()
+    private val compileToJsDispatcher =
+        CompileToJsDispatcher(compilerRegistry, compilerDownloader, CompilerCache, EsbuildBackend())
+    private val packageInstaller = PackageInstaller(registryClient)
 
     // js.commonjs-require was prototyped here and reverted — see TODO.md. Enabling it
     // swaps GraalJS's ES module loader for NpmCompatibleESModuleLoader, which rejects any
@@ -87,7 +108,7 @@ class Mycelium(
     }
 
     init {
-        filesystem.init(context, this, yolo)
+        filesystem.init(context, this, compileToJsDispatcher, packageInstaller, yolo)
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
         }
@@ -217,7 +238,7 @@ class Mycelium(
         System.err.println("mycelium: installing dependencies from package.json...")
         try {
             val dependencies = packageJsonDependencies(pkgJsonText)
-            org.mycelium.library.registry.PackageInstaller.installDependencies(dependencies, nodeModules.toPath())
+            packageInstaller.installDependencies(dependencies, nodeModules.toPath())
             return
         } catch (e: Exception) {
             System.err.println(

@@ -120,7 +120,15 @@ class PythonInteropExperimentTest {
             .allowIO(IOAccess.newBuilder().fileSystem(fs).build())
             .build()
         val mc = Mycelium(listOf(JsSupport, PythonSupport))
-        fs.init(ctx, mc)
+        val registryClient = org.mycelium.library.registry.NpmRegistryClient()
+        val dispatcher = org.mycelium.library.compiler.CompileToJsDispatcher(
+            org.mycelium.library.compiler.CompilerRegistry(),
+            org.mycelium.library.compiler.CompilerDownloader(registryClient),
+            org.mycelium.library.compiler.CompilerCache,
+            org.mycelium.library.compiler.EsbuildBackend(),
+        )
+        val installer = org.mycelium.library.registry.PackageInstaller(registryClient)
+        fs.init(ctx, mc, dispatcher, installer)
         val code = """Polyglot.eval("python", "print('hi')")"""
         val source = Source.newBuilder("js", code, "test.mjs").build()
         ctx.eval(source)

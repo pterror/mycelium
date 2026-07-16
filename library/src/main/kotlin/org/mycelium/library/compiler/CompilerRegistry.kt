@@ -2,12 +2,19 @@ package org.mycelium.library.compiler
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 
 // Maps a language ID (e.g. "coffeescript", "typescript") to the CompilerSpec describing how
 // to compile it to JS. Ships with entries for every compile-to-JS language Mycelium knows
 // about out of the box; `register` lets a consumer add support for further languages without
 // modifying this file.
-object CompilerRegistry {
+//
+// A class (constructed by Mycelium, the composition root) rather than a global `object`, so
+// a consumer embedding Mycelium as a library can own its own registry instance — e.g. two
+// independent Mycelium instances in the same JVM registering different/conflicting
+// languageIds without stepping on each other's global state, or a test constructing a
+// registry with only the specs it needs.
+class CompilerRegistry {
     private val specs = mutableMapOf<String, CompilerSpec>()
 
     init {
@@ -102,6 +109,24 @@ object CompilerRegistry {
                 backendType = BackendType.SUBPROCESS,
                 subprocessBinaryPath = { packageDir -> packageDir.resolve("bin/elm") },
                 subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
+                // Project-aware path (see ProjectBuildRunner/CompileToJsDispatcher.
+                // compileProjectAware): when a real elm.json is found walking up from the
+                // imported .elm file, it's used as-is (its own "source-directories" and
+                // "dependencies" — no more single-package/elm-core-only limitation) instead
+                // of the minimal scaffolded one below. `elm make <sourcePath> --output=...`
+                // compiles that specific entry module plus every module it transitively
+                // imports (resolved via the project's own source-directories) into one JS
+                // bundle exposing a global `Elm.<ModuleName>.init()` — the same "whole
+                // dependency graph in one file" shape a hand-written elm.json-less single
+                // file could never produce. Different entry modules imported from the same
+                // project get their own bundle (elmBundlePathFor hashes the absolute source
+                // path), since `elm make` only bundles what a given entry point actually
+                // needs rather than "every module in the project" the way spago/rescript do.
+                projectFileNames = listOf("elm.json"),
+                projectBuildArgs = { _, _, sourcePath, outputDir ->
+                    listOf("make", sourcePath.toString(), "--output=${elmBundlePathFor(outputDir, sourcePath)}")
+                },
+                resolveProjectOutput = { _, outputDir, sourcePath -> elmBundlePathFor(outputDir, sourcePath) },
                 // CAVEAT: `elm make` refuses to run without a discoverable `elm.json` in (or
                 // above) its working directory — with none present, it interactively prompts
                 // "Would you like me to create an elm.json file for you? [Y/n]:" on stdin,
@@ -139,6 +164,44 @@ object CompilerRegistry {
                 backendType = BackendType.SUBPROCESS,
                 subprocessBinaryPath = { packageDir -> packageDir.resolve("purs.bin") },
                 subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
+                // Project-aware path (see ProjectBuildRunner/CompileToJsDispatcher.
+                // compileProjectAware): when a real spago.yaml (current, "Spago Next"
+                // config format) or spago.dhall (legacy Dhall-based config) is found walking
+                // up from the imported .purs file, the whole project is built with
+                // `spago build` instead of compiling just the one file with `purs compile`
+                // — spago resolves the project's package set/dependencies and compiles
+                // every module's full cross-module import graph, which single-file `purs
+                // compile` fundamentally cannot (see the CAVEAT below). `spago build`
+                // writes each compiled module to `output/<ModuleName>/index.js` under the
+                // project root by default (the same layout `purs compile --output` uses,
+                // just always rooted at the project rather than a scratch workDir), so
+                // resolveProjectOutput reuses the exact same module-name-from-source
+                // extraction the single-file fallback's `locateOutput` already does.
+                //
+                // Unlike Elm/ReScript, the project build here is driven by a *different*
+                // binary than single-file compilation: spago (the package manager/build-tool
+                // CLI) is a separate project from `purs` (the compiler itself) and is not
+                // provided by the `purescript` npm package at all (that package only ships
+                // `purs`/`purs.bin`) — nor does Mycelium's CompilerDownloader know how to
+                // fetch it, since spago isn't resolved through the same npm-registry-package
+                // pipeline the rest of this file uses. `projectBuildBinaryPath` therefore
+                // ignores the resolved `packageDir` entirely and returns a bare "spago",
+                // left for the OS/ProcessBuilder to find on PATH — the same PATH-searched
+                // fallback approach InterceptingFileSystem.yoloInstall already uses for
+                // `npm`/`pnpm` when the pure-Kotlin install path doesn't apply. A user
+                // importing a real Spago-managed PureScript project is expected to have
+                // spago itself installed already (e.g. via `npm install -g spago`,
+                // a package manager, or the official installer) — Mycelium surfaces a clear
+                // "requires 'spago' — install it and try again" error (see
+                // ProjectBuildRunner.runBuild) rather than silently falling back to (or
+                // failing on) the single-file path when it's missing.
+                projectFileNames = listOf("spago.yaml", "spago.dhall"),
+                projectBuildBinaryPath = { _ -> Path.of("spago") },
+                projectBuildArgs = { _, _, _, _ -> listOf("build") },
+                resolveProjectOutput = { projectRoot, _, sourcePath ->
+                    val moduleName = extractPureScriptModuleName(sourcePath) ?: "Main"
+                    projectRoot.resolve("output").resolve(moduleName).resolve("index.js")
+                },
                 // CAVEAT: `purs bundle` (which used to produce a single-file JS bundle) was
                 // removed in 0.15 — the documented modern workflow is "compile with `purs
                 // compile`, then hand the resulting ES modules under `output/` to a real
@@ -179,6 +242,38 @@ object CompilerRegistry {
                 // — no elm.json- or output-directory-locating workaround required.
                 subprocessOutputMode = SubprocessOutputMode.STDOUT,
                 compileArgs = { sourcePath, _, _ -> listOf(sourcePath.toString()) },
+                // Project-aware path (see ProjectBuildRunner/CompileToJsDispatcher.
+                // compileProjectAware): when a real rescript.json (current config file name)
+                // or bsconfig.json (legacy name, still supported) is found walking up from
+                // the imported .res file, the whole project is built via the `rescript`
+                // build-system binary instead of compiling just the one file with the
+                // barebone `bsc` compiler — `bsc <file>.res` alone has no notion of the
+                // project's own module namespace/dependencies (see the "simplest to drive"
+                // comment on the single-file `compileArgs` above: it works precisely because
+                // it *ignores* project structure) and can't resolve cross-module imports the
+                // way `bsc`-invoked-by-`rescript`, with the full project's build graph, can.
+                // The `rescript` npm package conveniently ships this build-system binary
+                // (`rescript.exe`) in the very same platform-specific directory as `bsc.exe`
+                // (confirmed against the package's own layout: `<platform>/{bsc,rescript,
+                // bstracing}.exe`), so — unlike PureScript's spago — no separate
+                // PATH-searched tool or additional download is needed here at all.
+                // `rescript build` compiles every module in the project and writes each
+                // one's output to a `.bs.js` file adjacent to its own `.res` source (the
+                // default `suffix` — a project configuring a different one, e.g. `.res.mjs`,
+                // via rescript.json's "suffix"/"package-specs" field is a known limitation of
+                // this hardcoded default; ReScript's rescript.json can also redirect output
+                // to a separate directory via "sources"/monorepo-style configuration, which
+                // resolveProjectOutput's simple same-directory adjacency assumption doesn't
+                // account for either).
+                projectFileNames = listOf("rescript.json", "bsconfig.json"),
+                projectBuildBinaryPath = { packageDir ->
+                    packageDir.resolve(rescriptPlatformDir()).resolve("rescript.exe")
+                },
+                projectBuildArgs = { _, _, _, _ -> listOf("build") },
+                resolveProjectOutput = { _, _, sourcePath ->
+                    val base = sourcePath.toString().removeSuffix(".res").removeSuffix(".resi")
+                    Path.of("$base.bs.js")
+                },
             )
         )
         // Imba (`imba` on npm) was also investigated and NOT added: its
@@ -237,6 +332,20 @@ object CompilerRegistry {
 
     private fun jsonStringLiteral(s: String): String =
         "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+    // Where the project-aware Elm build (see the "elm" CompilerSpec registration's
+    // projectBuildArgs/resolveProjectOutput above) writes/reads the single bundled JS file
+    // for a given entry module — keyed by a hash of the entry source file's own absolute
+    // path (rather than e.g. its bare module name) since two different projects, or two
+    // different entry modules within one project, must never collide on the same bundle
+    // file under the shared `.mycelium-build/elm` scratch directory ProjectBuildRunner
+    // creates per project.
+    private fun elmBundlePathFor(outputDir: Path, sourcePath: Path): Path {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(sourcePath.toAbsolutePath().normalize().toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return outputDir.resolve("$digest.js")
+    }
 
     // Best-effort extraction of a PureScript source file's own module name (e.g. "Main" from
     // "module Main where" or "module Data.Foo.Bar (baz) where") — used by the "purescript"

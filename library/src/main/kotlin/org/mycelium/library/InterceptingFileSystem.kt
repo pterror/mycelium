@@ -2,6 +2,7 @@ package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
 import org.mycelium.library.compiler.CompileToJsDispatcher
+import org.mycelium.library.registry.PackageInstaller
 import java.io.File
 import java.net.URI
 import java.nio.channels.SeekableByteChannel
@@ -34,6 +35,12 @@ class InterceptingFileSystem : FileSystem {
     private var mycelium: Mycelium? = null
     private var yolo: Boolean = false
     private val delegate = FileSystem.newDefaultFileSystem()
+
+    // Set by init() — provided by Mycelium (the composition root) rather than reached for
+    // as a global singleton, so this class depends only on the CompileToJsDispatcher/
+    // PackageInstaller abstractions and can be constructed/tested with fakes of either.
+    private var compileToJsDispatcher: CompileToJsDispatcher? = null
+    private var packageInstaller: PackageInstaller? = null
 
     private val nodeModuleResolver = NodeModuleResolver { context!! }
     private val pythonModuleResolver = PythonModuleResolver()
@@ -83,9 +90,17 @@ class InterceptingFileSystem : FileSystem {
             ?: sourceDirectoryStack.get().firstOrNull()
             ?: Path.of("").toAbsolutePath()
 
-    fun init(context: Context, mycelium: Mycelium, yolo: Boolean = false) {
+    fun init(
+        context: Context,
+        mycelium: Mycelium,
+        compileToJsDispatcher: CompileToJsDispatcher,
+        packageInstaller: PackageInstaller,
+        yolo: Boolean = false,
+    ) {
         this.context = context
         this.mycelium = mycelium
+        this.compileToJsDispatcher = compileToJsDispatcher
+        this.packageInstaller = packageInstaller
         this.yolo = yolo
     }
 
@@ -292,7 +307,7 @@ class InterceptingFileSystem : FileSystem {
         val installDir = (sourceDirectoryStack.get().lastOrNull() ?: Path.of("").toAbsolutePath()).toFile()
         System.err.println("mycelium: installing $packageName...")
         try {
-            org.mycelium.library.registry.PackageInstaller.installPackageTree(
+            packageInstaller!!.installPackageTree(
                 packageName, null, installDir.toPath().resolve("node_modules")
             )
             return
@@ -414,7 +429,7 @@ class InterceptingFileSystem : FileSystem {
             ) {
                 val compilerId = mycelium?.supportForExtension(path.extension)?.jsCompilerId
                 if (compilerId != null) {
-                    val js = CompileToJsDispatcher.compile(compilerId, path, context!!)
+                    val js = compileToJsDispatcher!!.compile(compilerId, path, context!!)
                     return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
                 }
             }

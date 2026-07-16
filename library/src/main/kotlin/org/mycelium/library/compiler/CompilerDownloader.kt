@@ -1,8 +1,8 @@
 package org.mycelium.library.compiler
 
 import org.mycelium.library.MyceliumException
-import org.mycelium.library.registry.NpmRegistryClient
 import org.mycelium.library.registry.PackageCache
+import org.mycelium.library.registry.PackageIndex
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -13,16 +13,15 @@ import java.nio.file.StandardCopyOption
 // last resort in CompileToJsDispatcher's resolution chain, after "already in the project's
 // own node_modules" and "already downloaded to this cache before" both come up empty.
 //
-// Talks directly to the npm registry (NpmRegistryClient) and PackageCache's global,
-// content-verified tarball cache — no `npm`/`pnpm`/`node` subprocess involved, matching the
-// rest of Mycelium's "no external tools needed" design.
-object CompilerDownloader {
+// Talks directly to a PackageIndex (NpmRegistryClient in practice, injected by the caller —
+// Mycelium.kt is the composition root that constructs one — rather than hardcoded here) and
+// PackageCache's global, content-verified tarball cache — no `npm`/`pnpm`/`node` subprocess
+// involved, matching the rest of Mycelium's "no external tools needed" design.
+class CompilerDownloader(private val registry: PackageIndex) {
     private val baseCacheDir = File(
         System.getenv("XDG_CACHE_HOME") ?: File(System.getProperty("user.home"), ".cache").path,
         "mycelium/compilers"
     )
-
-    private val registry = NpmRegistryClient()
 
     // Where a given language+version's compiler package would live once downloaded — the
     // directory to hand to `require()` (via `__mycelium_require__`) as its resolution root,

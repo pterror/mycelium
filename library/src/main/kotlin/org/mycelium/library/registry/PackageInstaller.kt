@@ -5,11 +5,12 @@ import java.nio.file.Path
 
 // Shared pure-Kotlin package installer used by both InterceptingFileSystem's `--yolo`
 // auto-install and Mycelium's manifest-based (package.json) auto-install. Talks directly
-// to the npm registry (NpmRegistryClient) and PackageCache's global, content-verified
-// tarball cache — no `npm`/`pnpm`/`node` subprocess involved — mirroring
-// CompilerDownloader's approach for downloading compile-to-JS compiler packages, just
-// installing into a *project's own* node_modules directory instead of a private
-// per-language cache directory.
+// to a PackageIndex (NpmRegistryClient in practice, injected by the caller — Mycelium.kt
+// is the composition root that constructs one — rather than hardcoded here) and
+// PackageCache's global, content-verified tarball cache — no `npm`/`pnpm`/`node`
+// subprocess involved — mirroring CompilerDownloader's approach for downloading
+// compile-to-JS compiler packages, just installing into a *project's own* node_modules
+// directory instead of a private per-language cache directory.
 //
 // TODO(semver): like CompilerDownloader, this has no real semver-range resolver yet.
 // Exact versions ("1.2.3") are fetched as-is; anything else (a range, "^"/"~" prefix, a
@@ -26,9 +27,7 @@ import java.nio.file.Path
 // of the same package, whichever is encountered first silently wins. A correct
 // implementation would nest the loser under the requiring package's own node_modules,
 // the way real npm/pnpm do.
-object PackageInstaller {
-    private val registry = NpmRegistryClient()
-
+class PackageInstaller(private val registry: PackageIndex) {
     // See CompilerDownloader's own exactVersionOrNull for the rationale: only a plain
     // "1.2.3"-shaped version is safe to hand to the registry's single-version endpoint;
     // anything else (including null — "no version specified") falls back to "latest".

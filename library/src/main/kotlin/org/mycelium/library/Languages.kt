@@ -103,6 +103,34 @@ object ReScriptSupport : LanguageSupport by JsSupport {
     override val jsCompilerId = "rescript"
 }
 
+// Dart, compiled to plain JS via dart2js (SubprocessBackend, resolved via ToolResolver/
+// ToolSource rather than an npm package — see CompilerRegistry's "dart" registration and
+// ToolResolver.kt's DartSdkDownload) — see CoffeeSupport's own doc comment for why delegation
+// (`by JsSupport`) is enough here.
+object DartSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("dart")
+    override val jsCompilerId = "dart"
+}
+
+// Kotlin/JS, compiled via SubprocessBackend (backed by the `kotlin-compiler` npm package's
+// bundled `kotlinc-js` binary — see CompilerRegistry's "kotlinjs" registration for why this
+// falls back to a subprocess rather than an in-process Kotlin/JS compiler-API call despite
+// Kotlin already being Mycelium's own host language). `.kt`/`.kts` both route through the same
+// compiler — see CoffeeSupport's own doc comment for why delegation (`by JsSupport`) is enough
+// here.
+object KotlinJsSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("kt", "kts")
+    override val jsCompilerId = "kotlinjs"
+}
+
+// Scala.js, compiled via SubprocessBackend (backed by a `scala-cli` binary already on PATH or
+// in node_modules/.bin — see CompilerRegistry's "scalajs" registration) — see CoffeeSupport's
+// own doc comment for why delegation (`by JsSupport`) is enough here.
+object ScalaJsSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("scala")
+    override val jsCompilerId = "scalajs"
+}
+
 // Gleam, compiled via SubprocessBackend (backed by a native `gleam` binary downloaded from
 // GitHub Releases — see CompilerRegistry's "gleam" registration and ToolResolver.kt's
 // GitHubRelease for the download workflow) — see CoffeeSupport's own doc comment for why

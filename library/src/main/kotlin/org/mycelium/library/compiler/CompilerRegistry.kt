@@ -28,6 +28,12 @@ class CompilerRegistry {
                 compileFunction = "",
                 compileOptions = emptyMap(),
                 outputIsObject = false,
+                // `tsc --version` prints "Version 5.4.5" — only consulted by
+                // CompileToJsDispatcher.resolveTscOverride when a project opts into the real
+                // `tsc` instead of this BUNDLED EsbuildBackend registration; see its own doc
+                // comment for what "opts into" means.
+                versionCommand = listOf("--version"),
+                versionExtractor = { output -> Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1) },
             )
         )
         register(
@@ -38,6 +44,15 @@ class CompilerRegistry {
                 compileFunction = "require('coffeescript').compile",
                 compileOptions = mapOf("bare" to true),
                 outputIsObject = false,
+                // Not consulted by the JS_API backend itself (which reads the resolved npm
+                // package's own package.json "version" field directly rather than shelling
+                // out — see CompilerDownloader.installedPackageVersion) but declared anyway
+                // for API completeness/future use: `coffee --version` prints "CoffeeScript
+                // version 2.7.0".
+                versionCommand = listOf("--version"),
+                versionExtractor = { output ->
+                    Regex("""CoffeeScript version\s+(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                },
             )
         )
         register(
@@ -60,6 +75,9 @@ class CompilerRegistry {
                 // leaving in TypeScript-flavored syntax).
                 compileOptions = mapOf("js" to true, "sync" to true),
                 outputIsObject = false,
+                // `civet --version` prints "@danielx/civet: 0.11.14".
+                versionCommand = listOf("--version"),
+                versionExtractor = { output -> Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1) },
             )
         )
         register(
@@ -79,6 +97,11 @@ class CompilerRegistry {
                 // `var`/`function` declarations it can rewrite into `export`s).
                 compileOptions = mapOf("bare" to true),
                 outputIsObject = false,
+                // `lsc --version` prints "LiveScript 1.6.0".
+                versionCommand = listOf("--version"),
+                versionExtractor = { output ->
+                    Regex("""LiveScript\s+(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                },
             )
         )
         // Elm, PureScript, and ReScript: none of them expose a JS-callable
@@ -114,6 +137,10 @@ class CompilerRegistry {
                 // Latest npm "elm" dist-tag as of this writing; wraps compiler release 0.19.1.
                 defaultVersion = "0.19.1-6",
                 backendType = BackendType.SUBPROCESS,
+                // `elm --version` prints just the bare version, e.g. "0.19.1" — no prefix/
+                // suffix text to strip at all, unlike CoffeeScript/LiveScript's own output.
+                versionCommand = listOf("--version"),
+                versionExtractor = { output -> Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1) },
                 subprocessBinaryPath = { packageDir -> packageDir.resolve("bin/elm") },
                 subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
                 // Project-aware path (see ProjectBuildRunner/CompileToJsDispatcher.
@@ -169,6 +196,9 @@ class CompilerRegistry {
                 // TypeScript/CoffeeScript output, via JsSupport, so this is compatible).
                 defaultVersion = "0.15.15",
                 backendType = BackendType.SUBPROCESS,
+                // `purs --version` prints just the bare version, e.g. "0.15.15".
+                versionCommand = listOf("--version"),
+                versionExtractor = { output -> Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1) },
                 subprocessBinaryPath = { packageDir -> packageDir.resolve("purs.bin") },
                 subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
                 // Project-aware path (see ProjectBuildRunner/CompileToJsDispatcher.
@@ -245,6 +275,10 @@ class CompilerRegistry {
                 // Latest npm "rescript" dist-tag as of this writing.
                 defaultVersion = "11.1.4",
                 backendType = BackendType.SUBPROCESS,
+                // `bsc.exe -version` prints e.g. "11.1.4" (the ReScript/BuckleScript OCaml
+                // toolchain's own version flag spelling, `-version` rather than `--version`).
+                versionCommand = listOf("-version"),
+                versionExtractor = { output -> Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1) },
                 subprocessBinaryPath = { packageDir -> packageDir.resolve(rescriptPlatformDir()).resolve("bsc.exe") },
                 // Of the three, ReScript's `bsc` is the simplest to drive: as a standalone
                 // ("barebone") single-file compiler (as opposed to `rescript`/`bsb`, the

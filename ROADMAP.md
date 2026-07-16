@@ -1,17 +1,24 @@
 # Mycelium Roadmap
 
-*Last updated 2026-07-17 (distribution architecture — the roadmap's long-standing "big open
-decision" — resolved this session with real benchmarks: GraalJS guest JIT confirmed
-already-on in native image, JS-vs-V8 and native-image-vs-JVM-mode throughput gaps measured,
-the "Oracle GraalVM 1.55x faster than CE" claim corrected, and the 887MB-binary problem
-solved by splitting languages into on-demand Gradle configurations. Net direction: JVM mode,
-not native-image; a daemon architecture is now the open follow-on question. See "Distribution
-Architecture" and "Open threads" below.) Previous update (2026-07-16): compile-to-JS expanded
-to 12 languages, pure-Kotlin registry infrastructure, content-addressable store, version-aware
-tool resolution. This is the forward-looking companion to `TODO.md` — `TODO.md`
-is the detailed, ground-truth session log (architecture decisions, gotchas, exact test
-names); this file is the higher-altitude "what's next and in what order" view. When the
-two disagree, trust `TODO.md` and fix this file.*
+*Last updated 2026-07-17 (session #2: the daemon architecture — the previous update's "open
+follow-on question" — is now DONE, not just scoped: Unix socket server, shared `Engine` with
+per-request `Context` cwd/env isolation, auto-start with config opt-out, 1h idle timeout,
+G1-tuned GC flags applied at launch, XDG config with project-local override. The
+inter-core-module-import gap (`EventEmitter` duplicated across `stream.mjs`/`http.mjs`) is
+also fixed — root cause was a GraalJS dual-cache bug between `node:`-prefixed and bare module
+specifiers, fixed via specifier normalization. Native-image removal is reconfirmed complete.
+The event loop is now gated to JS-language evaluations only. See "Open threads" below — items
+2 and 3 from the previous update are now resolved.) Previous update, same day (distribution
+architecture — the roadmap's long-standing "big open decision" — resolved with real
+benchmarks: GraalJS guest JIT confirmed already-on in native image, JS-vs-V8 and
+native-image-vs-JVM-mode throughput gaps measured, the "Oracle GraalVM 1.55x faster than CE"
+claim corrected, and the 887MB-binary problem solved by splitting languages into on-demand
+Gradle configurations. Net direction: JVM mode, not native-image.) Previous update
+(2026-07-16): compile-to-JS expanded to 12 languages, pure-Kotlin registry infrastructure,
+content-addressable store, version-aware tool resolution. This is the forward-looking
+companion to `TODO.md` — `TODO.md` is the detailed, ground-truth session log (architecture
+decisions, gotchas, exact test names); this file is the higher-altitude "what's next and in
+what order" view. When the two disagree, trust `TODO.md` and fix this file.*
 
 Mycelium's purpose: make every language's package ecosystem available to every other
 language — npm, PyPI, RubyGems, crates.io, all importable from anywhere, cross-language, in
@@ -78,6 +85,14 @@ Actively being filled as npm acid tests surface concrete gaps (e.g. `util.mjs` g
 `debuglog`, `parseArgs`, `promisify.custom`, `styleText`, `formatWithOptions`,
 `getSystemErrorName`, `toUSVString` this session). No known open gap tracked separately from
 the acid-test punch list above — new ones surface via Round 4.
+
+### Event loop gated to JS only — DONE this session
+`Mycelium.kt`'s `runEventLoop()` previously drained timers/microtasks unconditionally after
+every top-level evaluation, regardless of language — harmless for JS, but wasteful and
+conceptually wrong for GraalVM-native non-JS languages (Ruby, C/LLVM, Python once unblocked)
+that have no JS-style event loop. Now gated on `language == "js"`. Compile-to-JS languages
+(TypeScript, Gleam, Dart, etc.) are unaffected — their compiled output runs *as* JS through
+`JsSupport`, so they still drain the loop via that delegation path.
 
 ### Package infrastructure — DONE
 No external package-manager binary (`npm`/`pnpm`/`pip`/`gem`) is required for any of the
@@ -248,12 +263,22 @@ reference):
   but can dynamically load Truffle language JARs on demand — the split-JAR
   `-Planguages=...` mechanism above is built on this. This is now the chosen path.
 
-**Startup optimization (JVM path, still open — daemon is now the leading direction):**
-- **Daemon mode** — new leading candidate this session; see "Open threads" below for the scoping
-  notes (XDG config, project-level overrides, optional not forced, G1 tuning for memory
-  reclamation). Not yet implemented.
+**Startup optimization (JVM path) — daemon mode: DONE.**
+- **Daemon mode — implemented this session** (`library/src/main/kotlin/org/mycelium/library/daemon/`:
+  `DaemonServer.kt`, `DaemonClient.kt`, `DaemonPaths.kt`, `Protocol.kt`). Unix socket transport,
+  one shared GraalVM `Engine` reused across requests with a fresh per-request `Context`
+  (`currentWorkingDirectory`/`environment` builder isolation, same API the non-daemon path
+  already used), auto-start on `mycelium run`/`mycelium <file>` with a config opt-out
+  (`daemon.enabled = false` in `config.toml`), 1h default idle timeout, and the G1 GC flags
+  benchmarked below now actually applied at daemon-subprocess launch in `App.kt`. XDG config
+  (`~/.config/mycelium/config.toml`) with project-local override (`.mycelium/config.toml`,
+  found walking up from cwd) via `Config.kt`. All constraints scoped when this item was first
+  opened (with/without daemon, XDG+override config, memory reclamation, IPC/lifecycle design)
+  are satisfied — see `TODO.md`'s "Daemon architecture — RESOLVED/implemented this session" for
+  full detail.
 - CRaC (Coordinated Restore at Checkpoint) — snapshot running JVM, restore instantly. Not
-  investigated this session; still an option if a daemon proves insufficient or undesirable.
+  investigated; would only be worth revisiting if the daemon proves insufficient for some
+  use case (e.g. environments where a long-lived background process isn't wanted at all).
 - GraalVM `--engine.CacheStore` — persist compiled Truffle code across runs. Not investigated.
 - AppCDS (Application Class Data Sharing) — pre-cache class loading. Not investigated.
 
@@ -364,10 +389,18 @@ file exists (see each `CompilerSpec` registration's CAVEAT comments).
 `CompilerDownloader` a running Mycelium instance uses, for eager pre-fetching and cache
 introspection.
 
-**Open question: Is Mycelium a CLI tool or a runtime?**
-- CLI tool: startup time matters (native-image wins).
+**Open question: Is Mycelium a CLI tool or a runtime? — settled this session's earlier
+distribution-architecture work.**
+- CLI tool: startup time matters — native-image would have won on raw cold-start, but its
+  peak throughput trails JVM mode even after guest JIT warmup, and it can't dynamically load
+  per-language JARs (the mechanism the 887MB-binary fix depends on). The native-image build
+  config has since been removed from the project entirely. The daemon (see "Daemon
+  architecture" in Open threads, now implemented) is the answer for CLI-style startup cost
+  instead: amortize JVM/Context startup across invocations rather than eliminating JVM startup
+  via a different build mode.
 - Runtime/server: throughput matters (JVM is competitive, within 10-20% of C).
-- Likely both — JVM with startup optimizations may be the pragmatic answer.
+- **Answer: JVM mode for both**, with the daemon covering the CLI-startup-cost concern that
+  used to be native-image's main argument.
 
 **Still open**: module resolution semantics per language beyond what's already handled,
 source-map fidelity for cross-language debugging, error attribution, and richer
@@ -476,25 +509,24 @@ new libraries, (2) most high-value npm packages that truly require native code a
    not native-image-vs-native-image) and is retracted. **What replaces this as the open
    question**: see "Daemon architecture" below — JVM mode's ~0.9s cold start is now the
    remaining cost to amortize for CLI-style usage.
-2. **Daemon architecture — new this session, unresolved.** With JVM mode as the chosen
-   direction, an optional long-lived daemon process (amortizing JVM/Context startup across
-   invocations, à la the Gradle daemon or nailgun) is the natural next step for CLI-style
-   single-shot usage. Must work with or without the daemon (user's choice, never forced);
-   config should be XDG-compliant (`~/.config/mycelium/`) with project-local overrides taking
-   precedence; the G1 GC tuning flags benchmarked this session
-   (`-XX:+UseG1GC -XX:G1PeriodicGCInterval=1000 -XX:MinHeapFreeRatio=10
-   -XX:MaxHeapFreeRatio=20`, reclaiming 1914MB peak → 187MB idle in 30s) are the starting
-   point for keeping a long-lived daemon's memory footprint down. IPC transport, request
-   framing, and process lifecycle (start/stop/idle-timeout) are all undesigned — this is a
-   scoping note, not a plan yet.
-3. **Inter-core-module import problem — new this session, architecture gap.** Node core
-   modules (`stream.mjs`, `http.mjs`, etc.) are loaded as standalone synthetic ESM resources
-   and cannot `import` each other. Concretely: `EventEmitter` is duplicated inline in every
-   core module that needs it rather than shared via import. Works today because the
-   duplication is small, but any `EventEmitter` behavioral fix has to be applied in every
-   copy, and this gets worse as more core modules need to share logic. Needs a fix in the
-   core-module loader (`CoreModuleRegistry.kt`/`InterceptingFileSystem.kt`) to let one
-   synthetic `.mjs` shim import another by core-module specifier. Not started.
+2. **Daemon architecture — RESOLVED/implemented this session (later in the same 2026-07-17
+   day as item 1 above).** Unix socket server (`DaemonServer.kt`), one shared `Engine` reused
+   across requests with per-request `Context` isolation via
+   `Context.Builder.currentWorkingDirectory()`/`.environment()`, auto-start with a config
+   opt-out, 1h idle timeout, and the G1 GC tuning flags benchmarked earlier this session now
+   actually applied at daemon-subprocess launch (not just benchmarked in isolation). XDG
+   config (`~/.config/mycelium/config.toml`) with project-local override
+   (`.mycelium/config.toml`) implemented in `Config.kt`. IPC transport (Unix socket + a small
+   framed protocol in `Protocol.kt`), request framing, and process lifecycle (start/stop/idle
+   shutdown) are all designed and built, not just scoped. See `TODO.md` for full detail.
+3. **Inter-core-module import problem — RESOLVED this session.** Root cause: GraalJS caches
+   the same core module twice — once under its `node:`-prefixed URI and once under the bare
+   specifier — so two shims importing the "same" module via different specifier forms got two
+   independent instances. Fixed via specifier normalization in `CoreModuleRegistry.kt`
+   (`normalizeCoreModuleSpecifiers`, rewrites `node:`-prefixed import/export specifiers to
+   bare form before the source reaches GraalJS). `EventEmitter` is now genuinely shared:
+   `stream.mjs`, `http.mjs`, and `https.mjs` all `import { EventEmitter } from "events"`
+   instead of carrying inline duplicates.
 4. **Rust/Go auto-install** — `CratesIoClient`/`GoProxyClient` registry clients exist and can
    resolve/download, but there's no linking stage for compiled output yet; `RustSupport`/
    `TinyGoSupport` each compile a single source file straight to one standalone unit with no

@@ -1,6 +1,6 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-15. This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
+*Updated 2026-07-16. This file is the project's institutional memory — written to survive context compaction. Treat as reliable background, but verify against code before relying on specifics that could have drifted.*
 
 ## Vision
 
@@ -16,6 +16,26 @@ Mycelium's purpose: make every language's package ecosystem available to every o
 - **esbuild used for TypeScript transpilation only, not for CJS.** Bundling/transpiling CJS would break Node's circular-dependency semantics; esbuild is invoked transform-only (`bundle = false`) purely to strip TS types/syntax, leaving `import`/`export` specifiers untouched so Mycelium's own resolver still handles them.
 - **Node stdlib implemented as synthetic core modules backed by Java interop**, cross-referencing Node/Deno/Bun source for exact semantics (must mirror Node 1:1, not just approximate it).
 - **Cross-language binding namespacing**: polyglot bindings keyed as `"modulepath:exportname"` to avoid collisions between languages/modules sharing one bindings object.
+- **`InterceptingFileSystem` split into 8 focused classes** (commit `1abf11e`, end of this
+  session): it had grown to 1389 lines doing module resolution, CJS execution, shim
+  generation, and compiler dispatch all in one place. GraalVM's `FileSystem` interface is
+  confirmed to be the *only* officially-sanctioned interception point (no module-resolver
+  hook, no `Source`-level interception exists), so the FileSystem-interception architecture
+  itself is correct and was kept — only the monolith was split, pure refactor, no behavior
+  change, all 216 tests still pass. New layout, all in
+  `library/src/main/kotlin/org/mycelium/library/`:
+  - `InterceptingFileSystem.kt` (515 lines) — thin `FileSystem` adapter + orchestration;
+    still owns `sourceDirectoryStack` and `lastReadModuleDir` (the stateful bits).
+  - `NodeModuleResolver.kt` (378 lines) — `node_modules` walk, `package.json`
+    `exports`/`imports`/`main` resolution (`resolvePackageEntryPoint`, `resolveConditions`
+    live here now, **not** in `InterceptingFileSystem.kt`).
+  - `CjsRuntime.kt` (352 lines) — `require()`, module cache, CJS→ESM shim generation.
+  - `Compiler.kt` (117 lines) — LLVM/WASM compilation + loading.
+  - `CoreModuleRegistry.kt` (98 lines) — the Node-stdlib core-module map.
+  - `PythonModuleResolver.kt` (50 lines) — `sys.path` resolution.
+  - `RubyModuleResolver.kt` (46 lines) — `$LOAD_PATH` resolution.
+  - `ShimGenerator.kt` (34 lines) — cross-language ESM shim generation.
+  - **Any older note (including elsewhere in this file) that says "`InterceptingFileSystem.kt`" for entry-point/conditional-exports resolution logic predates this split.**
 
 ## Hard constraints / gotchas
 
@@ -52,53 +72,76 @@ If all runtime globals are defined simultaneously, a package with inconsistent d
 
 **Round 1 (5/5 pass, unpinned versions):** lodash, minimist, chalk, uuid, dotenv.
 
-**Round 2 (2/5 pass):**
+**Round 2 — initially 2/5 pass, ended the session at 5/5 (all gaps fixed):**
 - `semver` — WORKS (plain CJS, same `"main"` → CJS-to-ESM path as lodash).
-- `ms` — FAILS. `"main": "./index"` has no file extension; `InterceptingFileSystem.resolvePackageEntryPoint` resolves it literally with no extension-probing fallback (real Node tries `./index`, `./index.js`, `./index.json`, `./index.node`, `./index/index.js`).
-- `debug` — FAILS. `require("tty")`; `tty` is not among Mycelium's ~16 synthetic core modules. Common transitive dep (pulled in by express via body-parser), so this one gap blocks a lot of the ecosystem.
-- `axios` — FAILS. `exports["."]` is a *nested* conditions object where even the `"default"` condition's value is itself another `{require, default}` object. `ENTRY_POINT_RESOLVER` only descends one level before unconditionally `.asString()`-ing the result. Proper Node conditional-exports resolution is recursive; Mycelium's isn't. (The underlying `http`/`https` core-module shims are a real, if minimal, implementation — this is purely a resolution-layer gap.)
-- `express` — FAILS, for the same reason as `debug` (transitively pulls it in via body-parser) — not a distinct express-specific gap.
+- `ms` — initially FAILED, **fixed**: extensionless `"main"` resolution now probes `.js`/`.json`/etc. like Node does. `"main": "./index"` had no file extension; the entry-point resolver (now `NodeModuleResolver.resolvePackageEntryPoint` post-refactor — see "Architecture decisions" above) resolved it literally with no extension-probing fallback.
+- `debug` — initially FAILED on `require("tty")` (not yet a core module at the time). **Fixed**: real `tty` module added.
+- `axios` — initially FAILED on non-recursive conditional-exports resolution (`exports["."]` nested one level deeper than the resolver descended). **Fixed**: resolver now recurses.
+- `express` — initially FAILED transitively via the same `debug`/`tty` gap. **Fixed** once `tty` landed; also required `Error.captureStackTrace` and `http2` later on (see Round 4-adjacent work) before a full live-HTTP-round-trip test passed.
 
-**Chalk regression (pre-existing, confirmed via `git stash` to predate this session):** `chalkResolvesSubpathImports` fails against whatever chalk version npm currently resolves as "latest" (5.6.2 as of last check) — `#ansi-styles` fails with "no matching imports entry found", i.e. the fallback path (`sourceDirectoryStack.get().firstOrNull() ?: process.cwd()`) is hit instead of chalk's real `source/` directory. Suggests the source-directory `ThreadLocal` stack (pushed/popped around `newByteChannel` reads in `InterceptingFileSystem.kt`) is empty by the time GraalJS resolves the import. This is a flake risk for the whole `NpmCompatibilityTest` suite, since no test there pins package versions.
+**Chalk regression (pre-existing, confirmed via `git stash` to predate this session) — fixed:** `chalkResolvesSubpathImports` was failing against current "latest" chalk (5.6.2) — `#ansi-styles` failed with "no matching imports entry found". Root cause: GraalJS's ESM loader resolves a module's imports in a second phase, after `sourceDirectoryStack` (pushed/popped around `newByteChannel` reads in `InterceptingFileSystem.kt`) had already popped that module's directory. Fixed with a `lastReadModuleDir` ThreadLocal that tracks the last-read module's directory for subpath/bare-specifier resolution.
 
-All findings above are cataloged as tests in `NpmCompatibilityTest.kt` (see its class doc comment for full detail) — **cataloged, not yet fixed**, per the project's "find gaps, don't fix them yet" sweep approach.
+All Round 1/2 findings are cataloged as tests in `NpmCompatibilityTest.kt` (see its class doc comment for full detail) — all now passing, not just cataloged.
 
-### Known npm gaps to fix (ordered simplest → hardest)
-1. Extensionless `"main"` field resolution — probe `.js`/`.json`/`index.js` etc. like Node does.
-2. Add a `tty` core module (a stub is fine — just needs `isatty()` and a `WriteStream`).
-3. Recursive/nested conditional-exports resolution in `package.json`'s `"exports"` field.
-4. Chalk subpath-import regression (`sourceDirectoryStack` empty for subpath imports).
+### Known npm gaps to fix (ordered simplest → hardest) — ALL FOUR FIXED this session
+1. Extensionless `"main"` field resolution — **fixed**, now probes `.js`/`.json`/`index.js` etc. like Node does.
+2. Add a `tty` core module — **fixed**, real module (not just a stub), in the `NodeParityTest.kt` `MODULES` list.
+3. Recursive/nested conditional-exports resolution in `package.json`'s `"exports"` field — **fixed**, also handles array-of-fallback-candidates form (needed for yargs/escalade).
+4. Chalk subpath-import regression — **fixed**: root cause was GraalJS's ESM loader resolving a module's imports in a second phase after `sourceDirectoryStack` had already popped that module's directory; fixed with a `lastReadModuleDir` ThreadLocal tracking the last-read module's directory.
 
 **Round 3 (ws, commander, yargs, glob, pino, zod, nanoid, inquirer) — quick-win fixes landed this session:**
 - `ws`, `zod`, `nanoid` — already WORKED (no gaps).
 - `commander` — was FAILING on `util.mjs` missing `stripVTControlCharacters`. Fixed: added to `util.mjs`, now WORKS end-to-end.
-- `yargs` — was FAILING on escalade's `exports["./sync"]` being an *array* of fallback candidates (`RESOLVE_CONDITIONS_FN` didn't recurse into arrays). Fixed: `resolveConditions` in `InterceptingFileSystem.kt` now tries each array element in order. Still fails past that point — yargs's platform shim also needs `node:module` (`builtinModules`), not yet registered.
-- `glob` — was FAILING on missing `fs/promises`/`node:fs/promises` core module. Fixed: added `fs-promises.mjs`, registered in `coreModules`. Still fails past that point — minimatch/path-scurry construct `new URL(...)` at module scope, and `URL` isn't a global in Mycelium's guest environment (only importable via the `url` module).
-- `pino` — was FAILING on missing `diagnostics_channel`/`node:diagnostics_channel`. Fixed: added a real (not just stubbed) pub/sub implementation in `diagnostics_channel.mjs`. Still fails past that point — pino's thread-transport also needs `worker_threads`, not yet registered.
-- `inquirer` — was FAILING on missing `async_hooks`/`node:async_hooks`. Fixed: added `async_hooks.mjs` with a genuinely-working (synchronous-only) `AsyncLocalStorage` plus inert `createHook`/`AsyncResource` stubs. Still fails past that point — inquirer also needs `node:readline`, not yet registered.
+- `yargs` — was FAILING on escalade's `exports["./sync"]` being an *array* of fallback candidates (`RESOLVE_CONDITIONS_FN` didn't recurse into arrays). Fixed: `resolveConditions` (now in `NodeModuleResolver.kt` post-refactor — see "Architecture decisions" below) now tries each array element in order. **Later in the same session**, `node:module` (`builtinModules`) was implemented too — yargs now passes fully.
+- `glob` — was FAILING on missing `fs/promises`/`node:fs/promises` core module. Fixed: added `fs-promises.mjs`, registered in `coreModules`. **Later in the same session**, global `URL`/`URLSearchParams` were exposed (glob/minimatch/path-scurry construct `new URL(...)` at module scope) — glob now passes fully.
+- `pino` — was FAILING on missing `diagnostics_channel`/`node:diagnostics_channel`. Fixed: added a real (not just stubbed) pub/sub implementation in `diagnostics_channel.mjs`. **Later in the same session**, `worker_threads` was implemented and `buffer.constants` (`MAX_STRING_LENGTH`) was added — pino now passes fully.
+- `inquirer` — was FAILING on missing `async_hooks`/`node:async_hooks`. Fixed: added `async_hooks.mjs` with a genuinely-working (synchronous-only) `AsyncLocalStorage` plus inert `createHook`/`AsyncResource` stubs. **Later in the same session**, `readline` was implemented and a CJS→ESM named-export interop gap for `chardet` was fixed (Mycelium executes the CJS module first, then enumerates its real `module.exports` at runtime to generate accurate named ESM re-exports — more correct than Node's static `cjs-module-lexer` since it catches dynamic exports too) — inquirer now passes fully. **Round 3 final: 8/8 pass** (ws, zod, nanoid, commander, yargs, glob, pino, inquirer).
 - Also fixed while in the area (not gating any round-3 package directly, but needed for real-world npm compat): `util.mjs` gained `debuglog`/`debug`, `parseArgs`, `promisify.custom`, `styleText`, `formatWithOptions`, `getSystemErrorName`, `toUSVString`.
 - `assert.strict.rejects`/`assert.strict.doesNotReject` — checked, were already correctly implemented (no bug found there).
 
-**Round 4 (fastify, jsonwebtoken, bcryptjs, moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — heavier/more complex packages, 3/10 pass, cataloged only (no fixes this round):**
-- `bcryptjs`, `moment`, `yaml` — WORK (no gaps; same "pure JS, no exotic surface" shape as lodash/moment/zod).
-- `fastify` — FAILS. `require('node:dns')` at module scope; `dns` still isn't a registered core module.
-- `jsonwebtoken` — FAILS. `secretOrPrivateKey instanceof KeyObject` where `KeyObject` comes from `require('crypto')` — `node-stdlib/crypto.mjs` has a working internal `KeyObject` class (used by its own `createPrivateKey`/`createPublicKey`/`createSecretKey`) but its `export default {...}` never includes it, so `KeyObject` is `undefined` and `instanceof undefined` throws instead of evaluating false.
-- `socket.io` — FAILS with an unqualified `Is a directory` exception and no guest-code stack frame (fails during import resolution before any module body runs) — same failure signature as round 3's pre-fix yargs/escalade gap, but socket.io's own top-level `exports` is a plain (non-nested, non-array) object, so the trigger is somewhere in its transitive dependency tree, not yet isolated.
-- `mongoose` — FAILS with the exact same unqualified `Is a directory` exception as socket.io, likely the same underlying gap; not yet isolated given mongoose's dependency tree size.
-- `pg` — FAILS. `require('util/types')` (extensionless subpath, not `node:util/types`) isn't a registered core module — only `util` itself is.
-- `sharp` — FAILS, but *not* on native-addon loading as expected going in: `dist/utility.mjs` does `import { availableParallelism } from 'node:os'` at module scope, and `os.mjs` doesn't export it (Node 19+ addition) — ES module linking rejects the whole graph before sharp ever attempts to load its native binding.
-- `esbuild` — FAILS. `require.resolve` is not implemented at all — Mycelium's CJS `require()` shim has no `.resolve` method, so `downloadedBinPath`'s `require.resolve(...)` call (used to locate the platform-specific binary package) throws before esbuild even gets to spawning its child-process binary.
+**Round 4 (fastify, jsonwebtoken, bcryptjs, moment, yaml, socket.io, mongoose, pg, sharp, esbuild) — FINAL: 9/10 pass, only `sharp` fails (native addon, expected/permanent):**
 
-All round 4 findings are cataloged as `@Disabled` tests (failing packages) or real passing tests (bcryptjs/moment/yaml) in `NpmCompatibilityTest.kt` — see its class doc comment for full detail — **cataloged, not fixed**, same sweep approach as prior rounds.
+Initial pass found 3/10 working and 7 gaps (see prior paragraph in git history for the
+original per-package diagnosis); all but one were fixed in the same session:
+- **Fixed**: `dns` module implemented (unblocked fastify's initial gap — fastify then hit a
+  separate GraalJS parser bug, see below); `crypto.mjs`'s internal `KeyObject` class now
+  exported (jsonwebtoken passes); `util/types` registered as a core module subpath (pg
+  passes); `os.availableParallelism` added (sharp got past its ES-module-linking failure,
+  though it still fails later on the native addon itself — expected); `require.resolve()`
+  implemented on the CJS shim (esbuild passes); the "Is a directory" exception blocking both
+  socket.io and mongoose was `Files.exists()` returning true for directories somewhere in
+  `NodeModuleResolver`'s resolution walk — fixed with `Files.isRegularFile()`, which also
+  surfaced and fixed a CJS/ESM condition-priority bug (`require` vs `import` ordering).
+- **fastify** — after the `dns` fix, hit a second wall initially misdiagnosed as "GraalJS
+  can't parse `}export{` syntax in toad-cache" (an upstream parser bug, thought
+  unfixable). Re-investigated and that diagnosis was wrong — the real blockers were a
+  missing `perf_hooks` module, `http.Server.setTimeout()`, `Server.listen()` not emitting a
+  `"listening"` event, and a missing `queueMicrotask` global. All fixed; fastify passes.
+- **sharp** — the only permanent failure. Needs native N-API/`dlopen` support to load
+  libvips's compiled addon; GraalJS has no N-API layer (same reason native addons don't work
+  in Deno, and only work in Bun because Bun built a compat layer). Now fails with sharp's own
+  clean error message rather than crashing, which is the fully-correct behavior for a native
+  addon Mycelium can't load — this is a distinct, permanent gap (see "Native addon / FFI
+  support" in ROADMAP.md), not a stdlib omission to revisit.
 
-### Next npm gaps to fix (ordered simplest → hardest)
-1. `node:module` core module (at least `builtinModules`) — unblocks yargs.
-2. `worker_threads` core module (stub acceptable) — unblocks pino.
-3. `readline` core module — unblocks inquirer.
-4. Expose `URL`/`URLSearchParams` as globals (not just importable from `url`) — unblocks glob/minimatch/path-scurry.
+All round 4 findings are cataloged as tests in `NpmCompatibilityTest.kt` (9 passing, 1
+`@Disabled` for sharp) — see its class doc comment for full detail.
+
+**Full acid-test tally across all 4 rounds: 27/28 (96%).** Only `sharp` fails, and only for
+the fundamental native-addon reason above.
+
+### Known npm/stdlib gaps remaining (small, none blocking a cataloged package)
+1. `dgram`, `cluster` core modules — not implemented (no cataloged package has hit these yet).
+2. `NodeParityTest.kt`'s `MODULES` list hasn't been extended to include `dns`,
+   `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types` — all
+   exist and work, just lack parity-harness coverage (test-coverage gap only).
+3. Console output could be improved beyond GraalJS's defaults (unchanged from earlier notes).
 
 ### Missing Node stdlib modules
-`net`, `dns`, `dgram`, `cluster`, `util/types` (subpath of `util`, not a top-level gap). (`child_process`, `tty`, `diagnostics_channel`, `async_hooks`, `fs/promises`, `worker_threads`, `readline`, `module` are now implemented.) Also: console output could be improved beyond GraalJS's defaults; `require.resolve` is unimplemented (esbuild, round 4); `os.mjs` is missing `availableParallelism` (Node 19+, sharp, round 4); `crypto.mjs`'s internal `KeyObject` class is never exported (jsonwebtoken, round 4).
+Only `dgram` and `cluster` remain unimplemented. Everything else previously tracked here —
+`net`, `dns`, `util/types`, `child_process`, `tty`, `diagnostics_channel`, `async_hooks`,
+`fs/promises`, `worker_threads`, `readline`, `module`, `perf_hooks`, `timers` — is now
+implemented (~30 core modules total; see `library/src/main/resources/node-stdlib/*.mjs`).
 
 ## Language support status
 
@@ -133,14 +176,37 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 
 ## Open threads
 
-### Package manager auto-install
-npm bare-specifier resolution works against an existing `node_modules` (walks parent dirs, reads `package.json` exports/main), but there's no auto-install — users must `npm install` packages themselves first. Open design question: eager (install on first import — magical but unpredictable) vs. declarative (manifest file — explicit but adds friction). Neither pip nor gem resolution exists yet at all (see below).
+*The three items below were written when auto-install, pip/gem resolution, and the CLI
+binary didn't exist yet. All three have since shipped — descriptions updated to reflect
+what actually landed and what's still genuinely open (see ROADMAP.md's "Open design
+questions" for the longer-term unresolved angle on each).*
 
-### pip / gem resolution
-npm's `node_modules` resolution is implemented; analogous resolution for Python (pip/site-packages) and Ruby (gem) packages is not. Each ecosystem has different conventions for "already installed" package layout — worth investigating those conventions before building resolvers. Blocked in practice for Python by the GraalPython upstream bug above, but the resolver work itself is independent and could proceed for Ruby.
+### Package manager auto-install — landed (both eager and declarative)
+Both options from the original open question shipped, not just one: **`--yolo`** does eager
+auto-install (installs on first missing bare specifier), and **manifest-based install**
+auto-runs `npm install` when a `package.json` with dependencies is found but `node_modules`
+isn't (suppressible with `--no-install`, e.g. for offline use or when the user manages
+`node_modules` themselves). npm bare-specifier resolution against an existing
+`node_modules` was already implemented and still works as before.
 
-### Distribution form
-CLI exists (`mycelium run/version/help`) but is only invoked via `./gradlew :app:run --args="..."`. `native-image` produces a standalone binary but at ~887MB; `installDist` is ~709MB but needs a JRE. User wants a genuinely self-contained binary (not Nix-only) — neither current option is fully satisfying. Open question: is GraalVM's weight simply acceptable for end users, or is a lighter packaging path worth exploring?
+### pip / gem resolution — landed
+Resolution for Python (site-packages) and Ruby (gem) packages is implemented, alongside the
+pre-existing npm resolution. Resolution order tries the host language's own ecosystem first,
+falling back to others. Python resolution is implemented but can't be exercised end-to-end
+in practice because of the GraalPython upstream bug (see "Python support" above) — the
+resolver itself is not what's blocked.
+
+### Distribution form — CLI binary works, weight still an open question
+`native-image` now produces a working standalone `mycelium` binary (~887MB, RAM-capped at
+build time via `-J-Xmx8g`) and `installDist` produces a ~709MB JRE-dependent alternative —
+both work via `./gradlew :app:installDist` / `:app:nativeCompile`, not just `:app:run`. The
+genuinely open question, tracked in ROADMAP.md's "Distribution" and "Open design questions"
+sections, is whether GraalVM's ~700-900MB footprint is acceptable long-term or worth
+trimming — and a substantial redesign direction was scoped this session (not yet
+implemented): don't bundle *any* Truffle language runtime or compiler in the core binary;
+fetch and cache them on demand per-language, JVM-mode only (native-image can't dynamically
+load Truffle languages post-build — see ROADMAP.md's "Distribution Architecture" section for
+the full native-image-vs-JVM tradeoff writeup).
 
 ## User preferences (for future sessions)
 

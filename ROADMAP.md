@@ -24,26 +24,46 @@ with `NodeParityTest.kt` harness verifying export-by-export parity against a rea
   `string_decoder`, `tls`, `tty`, `url`, `util`, `zlib`.
 - **Implemented but not yet in the parity list**: `fs/promises` (as `fs-promises.mjs`),
   `diagnostics_channel` (real pub/sub, not a stub), `async_hooks` (synchronous-only
-  `AsyncLocalStorage`, inert `createHook`/`AsyncResource`).
-- **Missing entirely**: `worker_threads`, `readline`, `node:module` (at least
-  `builtinModules`), `dns`, `dgram`, `cluster`.
+  `AsyncLocalStorage`, inert `createHook`/`AsyncResource`), `dns`/`dns/promises`,
+  `worker_threads`, `readline`/`readline/promises`, `node:module` (`builtinModules` etc.),
+  `perf_hooks`, `timers`/`timers/promises`, `util/types` (subpath of `util`). All landed
+  during round-3/round-4 npm acid-test gap-filling (see below) — `NodeParityTest.kt`'s
+  `MODULES` list (`library/src/test/kotlin/org/mycelium/library/NodeParityTest.kt`) simply
+  hasn't been extended to cover them yet, a follow-up task, not a functionality gap.
+- **Missing entirely**: `dgram`, `cluster`.
 - Parity testing is deliberately not pass/fail per missing export — it's a gap-finding
   signal (`--info` output), not a gate. Hard failure is reserved for "module doesn't load in
   Mycelium at all but loads in Node" or a genuine behavioral mismatch.
 
-### npm acid testing (27/28 passing)
-Cross-ecosystem compatibility test harness. Only failure is `sharp` (native addon requiring
-N-API; fundamentally blocked until native-addon FFI support is available).
+### npm acid testing (27/28 passing — DONE for now)
+Cross-ecosystem compatibility test harness, `NpmCompatibilityTest.kt`. Only failure is
+`sharp` (native addon requiring N-API; fails gracefully with sharp's own error message
+rather than crashing — fundamentally blocked until native-addon FFI support is available,
+not a stdlib gap).
 
-- **Round 1** (5/5 pass, unpinned versions): lodash, minimist, chalk, uuid, dotenv.
-- **Round 2** (2/5 pass): `semver` works; `ms`, `debug`, `axios`, `express` fail — see gaps
-  below. Chalk also has a pre-existing flake risk (`sourceDirectoryStack` empty for subpath
-  imports against latest chalk).
-- **Round 3** (quick-win fixes landed): `ws`, `zod`, `nanoid` already worked. `commander`,
-  `yargs`, `glob`, `pino`, `inquirer` were failing and got partial or full fixes this round —
-  each still has one more layer to peel (see "Next" below).
-- **Round 4** (not started): harder real-world packages — webpack, esbuild, prisma, next.js
-  loader, etc.
+- **Round 1** (5/5 pass): lodash, minimist, chalk, uuid, dotenv.
+- **Round 2** (5/5 pass): semver, ms, debug, axios, express — all gaps fixed (extensionless
+  `main` resolution, `tty` module, recursive conditional exports, `Error.captureStackTrace`,
+  `http2` module, `net`/`tls` modules, chalk subpath-import regression fixed via a
+  `lastReadModuleDir` ThreadLocal tracking the last-read module's directory).
+- **Round 3** (8/8 pass): ws, zod, nanoid, commander, yargs, glob, pino, inquirer. Required:
+  `util.stripVTControlCharacters`/`debuglog`/`parseArgs`, array-fallback conditional exports,
+  `node:fs/promises` alias, `diagnostics_channel`, `async_hooks`, `node:module`
+  (`builtinModules`), `worker_threads`, `readline`, global `URL`/`URLSearchParams`,
+  `buffer.constants`, legacy `global` alias for `globalThis`, and runtime CJS-export
+  enumeration for inquirer's ESM-interop of `chardet` (inspects the actual `module.exports`
+  object after execution rather than static analysis — same pattern as the cross-language
+  shims, more correct than Node's `cjs-module-lexer` since it catches dynamic exports too).
+- **Round 4** (8/10 pass): bcryptjs, moment, yaml, jsonwebtoken, pg, esbuild, socket.io,
+  mongoose. Fixed: `crypto.KeyObject` now exported, `util/types` subpath module,
+  `os.availableParallelism`, `require.resolve()` on the CJS shim, `dns` module,
+  `perf_hooks` module, `queueMicrotask` global, `http.Server` `"listening"` event +
+  `setTimeout()`. The socket.io/mongoose "Is a directory" failure was `Files.exists()`
+  returning true for directories in `NodeModuleResolver`; fixed with `Files.isRegularFile()`
+  — also surfaced a CJS/ESM condition-priority bug (`require` vs `import` ordering) fixed at
+  the same time. Only `sharp` still fails (native addon, see above).
+- **Round 5**: not started — would need to go after even heavier packages (webpack, prisma,
+  next.js loader-class tooling) to find the next layer of gaps.
 
 ### Stream/Buffer/crypto API gaps
 Actively being filled as npm acid tests surface concrete gaps (e.g. `util.mjs` gained
@@ -55,30 +75,32 @@ the acid-test punch list above — new ones surface via Round 4.
 
 ## Next (short term)
 
-- **Remaining Node stdlib modules**: `worker_threads`, `readline`, `node:module`, `dns`,
-  `dgram`, `cluster`. Console output improvements beyond GraalJS's defaults.
+*Everything that was listed here as of the last update (extensionless `main`, `tty`, nested
+conditional exports, chalk regression, `node:module`/`worker_threads`/`readline`/global
+`URL`, Round 3 and Round 4 acid tests) has since been fixed — see "npm acid testing" above.
+Only genuinely open items remain below.*
+
+- **Remaining Node stdlib modules**: `dgram`, `cluster`. Console output improvements beyond
+  GraalJS's defaults.
 - **`node:fs/promises` as first-class**, not a re-export shim over `fs`.
-- **`http.Agent` / `http.globalAgent`** — not yet implemented.
+- **`http.Agent` / `http.globalAgent`** — implemented (round 4 work); revisit only if a
+  future package surfaces a gap in it.
+- **`NodeParityTest.kt`'s `MODULES` list is behind the actual implemented-module set** —
+  `dns`, `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types`
+  all exist as `.mjs` files but aren't yet in the parity harness's `MODULES` list. Purely a
+  test-coverage gap, not a functionality gap.
 - **Parity test hardening**: edge cases, behavioral fuzzing (today's parity test mostly
   diffs *export surface*, not deep behavior).
-- **Fix remaining Round 3 acid-test failures**, in the order they were found:
-  1. `node:module` core module (at least `builtinModules`) — unblocks `yargs` fully.
-  2. `worker_threads` core module (stub acceptable) — unblocks `pino` fully.
-  3. `readline` core module — unblocks `inquirer` fully.
-  4. Expose `URL`/`URLSearchParams` as JS globals, not just importable from `url` — unblocks
-     `glob`/`minimatch`/`path-scurry` (they construct `new URL(...)` at module scope).
-- **Older Round 2 gaps still open** (simplest → hardest):
-  1. Extensionless `"main"` field resolution — probe `.js`/`.json`/`index.js` like Node does
-     (`InterceptingFileSystem.resolvePackageEntryPoint`). Unblocks `ms`.
-  2. `tty` core module — **done** (now in the parity `MODULES` list above; TODO.md's older
-     "known gaps" note predates this).
-  3. Recursive/nested conditional-exports resolution in `package.json`'s `"exports"` field
-     (`ENTRY_POINT_RESOLVER` only descends one level today). Unblocks `axios`.
-  4. Chalk subpath-import regression — `sourceDirectoryStack` `ThreadLocal` appears empty by
-     the time GraalJS resolves a subpath import; flake risk for the whole
-     `NpmCompatibilityTest` suite since no test pins versions.
-- **Round 4 acid test**: webpack, esbuild, prisma, next.js loader-class tooling — a
-  deliberate difficulty step up from Round 3's app-level packages.
+- **Round 5 acid test**: webpack, prisma, next.js loader-class tooling — a deliberate
+  difficulty step up from Round 4's already-heavy packages (esbuild passed in round 4).
+- **`InterceptingFileSystem` was split into 8 focused classes** this session (see
+  `library/src/main/kotlin/org/mycelium/library/`: `NodeModuleResolver.kt`,
+  `CjsRuntime.kt`, `Compiler.kt`, `CoreModuleRegistry.kt`, `PythonModuleResolver.kt`,
+  `RubyModuleResolver.kt`, `ShimGenerator.kt`, plus the now-515-line
+  `InterceptingFileSystem.kt` itself as a thin FileSystem adapter). Pure refactor, no
+  behavior change, all 216 tests still pass. **Any doc or comment referencing
+  `InterceptingFileSystem.resolvePackageEntryPoint` or `resolveConditions` as living in
+  `InterceptingFileSystem.kt` is stale — both now live in `NodeModuleResolver.kt`.**
 
 ---
 

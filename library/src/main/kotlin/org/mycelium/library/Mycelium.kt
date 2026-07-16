@@ -19,6 +19,7 @@ import org.mycelium.library.registry.RubyGemsClient
 class Mycelium(
     val languages: List<LanguageSupport> = listOf(
         JsSupport, CoffeeSupport, CivetSupport, LiveScriptSupport, ElmSupport, PureScriptSupport, ReScriptSupport,
+        GleamSupport, ImbaSupport,
         RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport
     ),
     // When true, a bare specifier that can't be resolved against any existing

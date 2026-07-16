@@ -31,10 +31,12 @@ class NpmJsApiBackend(
     // installed there) or CompilerCache/CompilerDownloader's on-disk cache directory for
     // this language+version.
     private val moduleResolutionDir: Path,
-    // Mirrors CompilerSpec.outputIsObject — true if the compile function's return value is
-    // an object with a `code` string property (e.g. `{code, sourceMap}`) rather than being
-    // the compiled JS string itself.
-    private val outputIsObject: Boolean,
+    // Mirrors CompilerSpec.outputIsObject/outputProperty, already combined by
+    // CompilerSpec.createBackend into the one property name this backend actually needs:
+    // null if the compile function's return value IS the compiled JS string itself, or the
+    // property name to read (e.g. "code" for CompilerSpec.outputIsObject compilers, "js" for
+    // Imba's Compilation/Document-shaped result) if it returns an object instead.
+    private val outputProperty: String?,
 ) : CompileToJsBackend {
     private val packageName: String
     private val memberChain: List<String>
@@ -87,12 +89,12 @@ class NpmJsApiBackend(
             )
         }
 
-        return if (outputIsObject) {
-            val code = result.getMember("code")
+        return if (outputProperty != null) {
+            val output = result.getMember(outputProperty)
                 ?: throw MyceliumException(
-                    "mycelium: '$packageName' compile result has no 'code' property"
+                    "mycelium: '$packageName' compile result has no '$outputProperty' property"
                 )
-            code.asString()
+            output.asString()
         } else {
             result.asString()
         }

@@ -53,8 +53,58 @@ data class CompilerSpec(
     // true if `compileFunction`'s result is an object with a `code` (or similarly-named)
     // string property rather than being the compiled JS string itself — e.g. some
     // compilers return `{code, sourceMap}` rather than a bare string. Only meaningful for
-    // backendType == JS_API.
+    // backendType == JS_API. Superseded by `outputProperty` below when a language's output
+    // property isn't literally named "code" (e.g. Imba's "js") — kept as its own boolean
+    // (rather than folded away entirely) so every pre-existing registration
+    // (CoffeeScript/Civet/LiveScript, none of which actually set it true) keeps reading the
+    // same way it always has.
     val outputIsObject: Boolean = false,
+    // The property name to read off `compileFunction`'s result when it returns an object
+    // rather than a bare string — e.g. Imba's `require('imba/compiler').compile(code, o)`
+    // returns a whole Compilation/Document instance whose compiled output lives on `.js`
+    // (confirmed against the published 2.0.0-alpha.252 tarball's
+    // src/compiler/compilation.mjs, which does `this.js = ""` then populates it during
+    // `compile()`), not `.code`. Null (the default) means "derive the effective property
+    // from `outputIsObject`" — `"code"` when `outputIsObject` is true, or "the result IS the
+    // string" (no property read at all) when it's false — so this field only needs setting
+    // at all for a compiler whose object output uses some other property name than "code".
+    // Only meaningful for backendType == JS_API; see NpmJsApiBackend's own constructor doc
+    // comment for how the two fields combine into the single property name it actually uses.
+    val outputProperty: String? = null,
+
+    // Version-aware resolution (see ToolResolver.kt's VersionCheck): the CLI command to run
+    // against a *candidate* binary (project-local node_modules/.bin entry, a system-PATH
+    // install, or an already-downloaded cache entry) to self-report its version, and how to
+    // pull a bare version string out of whatever it prints — every tool formats `--version`
+    // differently ("0.19.1" vs. "CoffeeScript version 2.7.0" vs. "Dart SDK version: 3.4.0
+    // (stable) ..."). Both null (the default) for every pre-existing JS_API registration
+    // (CoffeeScript/Civet/LiveScript/Imba) means "accept whatever's installed" — those are
+    // `require()`'d straight into the shared GraalJS Context rather than invoked as a
+    // subprocess, so there's no separate `--version` binary to shell out to at all; their own
+    // version-constraint checking instead happens by reading the resolved npm package's own
+    // package.json "version" field directly (see CompilerDownloader.installedPackageVersion /
+    // CompileToJsDispatcher.resolveCompilerLocation), which needs neither field. `versionCommand`/
+    // `versionExtractor` are for SUBPROCESS-backed (and non-npm, tool-resolved) languages
+    // instead — Elm/PureScript/ReScript/Dart/Kotlin-JS/Scala.js — whose only interface to probe
+    // is the binary itself.
+    val versionCommand: List<String>? = null,
+    val versionExtractor: ((String) -> String?)? = null,
+
+    // Tool-based resolution for a SUBPROCESS spec whose compiler isn't an npm package at all —
+    // Dart's `dart2js`/`dart` (distributed as a platform SDK zip, see ToolResolver.kt's
+    // DartSdkDownload) is the case this exists for. Resolved via the shared ToolResolver/
+    // ToolSource chain (project-local -> system PATH -> Mycelium's own download cache ->
+    // download) exactly like CompilerSpec.projectBuildToolSources does for a *project*-build
+    // binary — this is the single-file-compile counterpart, consulted by
+    // CompileToJsDispatcher.compile whenever `npmPackageName` is null, `backendType` is
+    // SUBPROCESS, and no project file was found above the compiled source (or the language
+    // has no `projectFileNames` at all). `toolBinaryName` names the executable to resolve
+    // (e.g. "dart2js"); `toolSources` builds the ToolSource list given the compiled file's own
+    // path (so ProjectLocalBin/version-check constraints can be anchored there) — both null
+    // (the default) preserves every npm-backed SUBPROCESS language's (Elm/PureScript/ReScript)
+    // existing resolution completely unchanged.
+    val toolBinaryName: String? = null,
+    val toolSources: ((sourcePath: Path) -> List<ToolSource>)? = null,
 
     // Which CompileToJsBackend CompileToJsDispatcher should route this language through.
     // Defaults to BUNDLED when there's no npm package at all (matches TypeScript's existing
@@ -135,6 +185,25 @@ data class CompilerSpec(
     // `projectBuildNpmPackage` is also null) skips the PATH-search step entirely.
     val projectBuildPathBinaryName: String? = null,
 
+    // Overrides the entire project-build-binary resolution chain with a caller-supplied
+    // ToolSource list, for a project-build tool that isn't hosted on npm at all — Gleam's
+    // `gleam` binary (a native Rust binary distributed only via GitHub Releases; the "gleam"
+    // package that does exist on npm is an unrelated JS library) is the one case today.
+    // `projectBuildNpmPackage`/`projectBuildBinaryPath`/`projectBuildPathBinaryName`
+    // above are all built around an npm-shaped `<dir>/node_modules/<pkg>` layout
+    // (CachedPackage/RegistryDownload in ToolResolver.kt), which simply doesn't exist for a
+    // GitHub-release-only tool — so rather than contorting those fields to fit, this lets a
+    // language hand CompileToJsDispatcher.resolveProjectBuildBinary a fully custom source
+    // list instead (typically `listOf(ProjectLocalBin(...), SystemPath(), GitHubRelease(...))`,
+    // mirroring the same "project-local -> system PATH -> Mycelium's own download cache/
+    // download" precedence every other language gets, just sourced from ToolResolver.kt's
+    // GitHubRelease rather than RegistryDownload for the last step). Given `sourcePath` so
+    // ProjectLocalBin can be anchored at the compiled file's own project. Null (the default)
+    // preserves every existing language's (Elm/PureScript/ReScript) npm-based resolution
+    // completely unchanged — this is only ever consulted when non-null, taking priority over
+    // `projectBuildNpmPackage`'s own resolution entirely.
+    val projectBuildToolSources: ((sourcePath: Path) -> List<ToolSource>)? = null,
+
     // Builds the CLI arguments (everything after the resolved binary) for a whole-project
     // build, given the project root, the resolved build binary, the specific source file
     // that triggered this compile (needed by Elm, whose `elm make` takes an explicit entry
@@ -176,7 +245,12 @@ data class CompilerSpec(
     val createBackend: (context: Context, moduleResolutionDir: Path) -> CompileToJsBackend = { context, moduleResolutionDir ->
         when (backendType) {
             BackendType.JS_API ->
-                NpmJsApiBackend(context, compileFunction, moduleResolutionDir, outputIsObject)
+                NpmJsApiBackend(
+                    context,
+                    compileFunction,
+                    moduleResolutionDir,
+                    outputProperty ?: if (outputIsObject) "code" else null,
+                )
             BackendType.SUBPROCESS -> {
                 val npmPkg = npmPackageName
                     ?: throw MyceliumException(

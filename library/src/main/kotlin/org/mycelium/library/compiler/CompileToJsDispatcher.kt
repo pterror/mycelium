@@ -74,9 +74,21 @@ class CompileToJsDispatcher(
         }
 
         val compiled = if (spec.backendType == BackendType.BUNDLED) {
-            bundledBackend.compile(sourceText, sourcePath, spec.compileOptions)
+            // TypeScript's one and only BUNDLED registration additionally supports an
+            // explicit opt-in to the user's own installed `tsc` (project devDependency or
+            // system PATH) instead of the bundled EsbuildBackend — see
+            // resolveTscOverride's own doc comment for what "explicitly opt in" means and
+            // why this is checked before ever falling back to the bundled backend.
+            resolveTscOverride(languageId, sourcePath)?.let { tscBinary ->
+                compileWithTsc(tscBinary, sourcePath)
+            } ?: bundledBackend.compile(sourceText, sourcePath, spec.compileOptions)
         } else if (projectRoot != null) {
             compileProjectAware(spec, languageId, sourcePath, projectRoot.first, projectRoot.second)
+        } else if (spec.npmPackageName == null && spec.toolBinaryName != null && spec.toolSources != null) {
+            // Dart (and any future non-npm, tool-resolved SUBPROCESS language): resolved via
+            // ToolResolver/ToolSource instead of the npm node_modules/cache/download chain —
+            // see CompilerSpec.toolBinaryName's own doc comment.
+            compileViaToolResolver(spec, languageId, sourceText, sourcePath)
         } else {
             val npmPackageName = spec.npmPackageName
                 ?: throw MyceliumException(
@@ -89,6 +101,114 @@ class CompileToJsDispatcher(
         }
         cache.put(languageId, spec.defaultVersion, sourceHash, compiled)
         return compiled
+    }
+
+    // Resolves + invokes a SUBPROCESS-backed compiler whose binary isn't an npm package at all
+    // (Dart's `dart2js`) — mirrors CompilerSpec.createBackend's own SUBPROCESS branch (same
+    // executable-bit fixup, same SubprocessBackend construction) but sources the binary from
+    // `spec.toolSources` via the shared ToolResolver instead of an npm `packageDir`.
+    private fun compileViaToolResolver(
+        spec: CompilerSpec,
+        languageId: String,
+        sourceText: String,
+        sourcePath: Path,
+    ): String {
+        val toolName = spec.toolBinaryName
+            ?: throw MyceliumException("mycelium: compiler spec for '$languageId' has no toolBinaryName")
+        val buildSources = spec.toolSources
+            ?: throw MyceliumException("mycelium: compiler spec for '$languageId' has no toolSources")
+        val args = spec.compileArgs
+            ?: throw MyceliumException("mycelium: compiler spec for '$languageId' is SUBPROCESS but has no compileArgs")
+        val binaryPath = toolResolver.resolve(toolName, buildSources(sourcePath))
+        if (Files.isRegularFile(binaryPath)) {
+            binaryPath.toFile().setExecutable(true)
+        }
+        val backend = SubprocessBackend(
+            binaryPath = binaryPath,
+            compileArgs = args,
+            outputMode = spec.subprocessOutputMode,
+            locateOutput = spec.locateOutput,
+        )
+        return backend.compile(sourceText, sourcePath, spec.compileOptions)
+    }
+
+    // TypeScript's registered CompilerSpec is BackendType.BUNDLED (compiled via the bundled
+    // EsbuildBackend, no npm resolution at all) — but a project can also opt into the *real*
+    // `tsc` compiler instead, when it's actually available and the project has visibly opted
+    // in. "Explicitly opts in" is interpreted here as: a `tsconfig.json` exists somewhere above
+    // the compiled file (the project's own signal that it's TypeScript-toolchain-aware, as
+    // opposed to a loose .ts file with no project config at all, which stays on the bundled
+    // esbuild path exactly as before) AND a `tsc` binary can actually be resolved (project
+    // node_modules/.bin, or system PATH) whose own reported version satisfies whatever version
+    // constraint the project's package.json declares for "typescript" (if any — no constraint
+    // means "accept whatever's found"). Returns null (falls back to bundled esbuild) if either
+    // condition doesn't hold, so every project without a tsconfig.json keeps behaving exactly
+    // as before this method existed.
+    private fun resolveTscOverride(languageId: String, sourcePath: Path): Path? {
+        if (languageId != "typescript") return null
+        val projectRoot = findAncestorWith(sourcePath.parent, "tsconfig.json") ?: return null
+        val constraint = findPackageJsonConstraint(sourcePath.parent, "typescript")
+        val versionCheck = constraint?.let {
+            VersionCheck(listOf("--version"), ::extractTscVersion, it.versionSpec)
+        }
+        val sources = buildList {
+            add(ProjectLocalBin(projectRoot, versionCheck))
+            add(SystemPath(versionCheck))
+        }
+        return try {
+            toolResolver.resolve("tsc", sources, constraint?.versionSpec, constraint?.packageJsonPath)
+        } catch (e: MyceliumException) {
+            null
+        }
+    }
+
+    // `tsc --version` prints e.g. "Version 5.4.5" — pull the bare semver out of it.
+    private fun extractTscVersion(output: String): String? =
+        Regex("""(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)""").find(output)?.groupValues?.get(1)
+
+    // Runs the user's own `tsc` against a single file, mirroring SubprocessBackend's own
+    // "temp workdir, read the emitted file back" shape but using tsc's own transpile-only
+    // single-file invocation rather than a project-wide `tsc -p tsconfig.json` build (which
+    // would compile every file in the project's `include`, not just the one Mycelium was
+    // actually asked to import) — `--outDir` redirects the emitted .js into a scratch
+    // directory this method reads back and cleans up itself.
+    private fun compileWithTsc(tscBinary: Path, sourcePath: Path): String {
+        val workDir = Files.createTempDirectory("mycelium-tsc-")
+        try {
+            val outputFile = workDir.resolve(sourcePath.fileName.toString().removeSuffix(".ts") + ".js")
+            val command = listOf(
+                tscBinary.toString(),
+                sourcePath.toString(),
+                "--outDir", workDir.toString(),
+                "--module", "esnext",
+                "--target", "esnext",
+                "--moduleResolution", "bundler",
+            )
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText()
+            val exitCode = process.waitFor()
+            if (exitCode != 0 || !Files.exists(outputFile)) {
+                throw MyceliumException(
+                    "mycelium: '$tscBinary' failed to compile '${sourcePath.fileName}' (exit $exitCode):\n$output"
+                )
+            }
+            return outputFile.toFile().readText()
+        } finally {
+            workDir.toFile().deleteRecursively()
+        }
+    }
+
+    // Walks `startDir` and its ancestors looking for `fileName` — used by resolveTscOverride
+    // to find a tsconfig.json above the compiled file, mirroring ProjectBuildRunner's own
+    // ancestor walk for elm.json/spago.yaml/rescript.json but without needing a whole
+    // (projectRoot, projectFile) pair back.
+    private fun findAncestorWith(startDir: Path?, fileName: String): Path? {
+        var dir: Path? = startDir
+        while (dir != null) {
+            if (Files.isRegularFile(dir.resolve(fileName))) return dir
+            dir = dir.parent
+        }
+        return null
     }
 
     // Drives a whole-project build (via ProjectBuildRunner) for a language whose
@@ -144,6 +264,16 @@ class CompileToJsDispatcher(
     //       3. Mycelium's own download cache (a previous run, this or a different project)
     //       4. neither -> download it into the cache now, for this and every future compile
     private fun resolveProjectBuildBinary(spec: CompilerSpec, languageId: String, sourcePath: Path): Path {
+        // A third shape, alongside the null/non-null `projectBuildNpmPackage` split
+        // documented below: a project-build tool that isn't hosted on npm at all (Gleam's
+        // `gleam`, distributed only via GitHub Releases — see CompilerSpec.
+        // projectBuildToolSources's own doc comment). Takes priority over
+        // `projectBuildNpmPackage` entirely when set.
+        spec.projectBuildToolSources?.let { buildToolSources ->
+            val toolName = spec.projectBuildPathBinaryName ?: languageId
+            return toolResolver.resolve(toolName, buildToolSources(sourcePath))
+        }
+
         val resolveBinaryFromPackageDir = spec.projectBuildBinaryPath ?: spec.subprocessBinaryPath
             ?: throw MyceliumException(
                 "mycelium: compiler spec for '$languageId' has projectFileNames but no " +
@@ -171,7 +301,7 @@ class CompileToJsDispatcher(
             // projectBuildPathBinaryName and projectBuildNpmPackage always name the same tool
             // for every language registered today (PureScript's spago is both), so a single
             // toolName can drive every source in this list.
-            if (spec.projectBuildPathBinaryName != null) add(SystemPath)
+            if (spec.projectBuildPathBinaryName != null) add(SystemPath())
             add(
                 CachedPackage(
                     downloader.cacheDirFor(cacheKey, spec.projectBuildToolVersion),
@@ -204,18 +334,43 @@ class CompileToJsDispatcher(
     // Returns the directory `__mycelium_require__` should resolve `require(npmPackageName)`
     // from (see NpmJsApiBackend) — i.e. whichever directory directly contains a
     // `node_modules/<npmPackageName>` — not the package directory itself.
+    // Version-aware since the coordinator's own additional requirement: a project's own
+    // package.json can declare a version constraint for any npm-package-backed compile-to-JS
+    // compiler in its dependencies/devDependencies (e.g. `"coffeescript": "~2.7.0"`,
+    // `"typescript": "^5.0.0"` — see findPackageJsonConstraint in ToolResolver.kt), which takes
+    // precedence over CompilerSpec.defaultVersion. When present, an already-installed project
+    // node_modules copy is only trusted if its own package.json "version" actually satisfies
+    // the constraint (CompilerDownloader.installedPackageVersion + SemverResolver) — a
+    // mismatch falls through to Mycelium's own cache/download at the constraint-resolved
+    // version instead of silently using whatever happens to be installed.
     private fun resolveCompilerLocation(
         languageId: String,
         npmPackageName: String,
         version: String,
         sourcePath: Path
     ): Path {
-        findProjectNodeModulesDir(sourcePath.parent, npmPackageName)?.let { return it }
+        val constraint = findPackageJsonConstraint(sourcePath.parent, npmPackageName)
 
-        val cacheDir = downloader.cacheDirFor(languageId, version)
+        findProjectNodeModulesDir(sourcePath.parent, npmPackageName)?.let { dir ->
+            if (constraint == null) return dir
+            val installedVersion = downloader.installedPackageVersion(dir, npmPackageName)
+            val range = org.mycelium.library.registry.SemverResolver.parseRange(constraint.versionSpec)
+            val satisfies = installedVersion != null && (range == null || range.satisfies(installedVersion))
+            if (satisfies) return dir
+            // Mismatched (or unverifiable) project install — fall through to Mycelium's own
+            // cache/download at the constraint-resolved version below instead of trusting it.
+        }
+
+        val effectiveVersion = if (constraint != null) {
+            downloader.resolveVersion(npmPackageName, constraint.versionSpec) ?: constraint.versionSpec
+        } else {
+            version
+        }
+
+        val cacheDir = downloader.cacheDirFor(languageId, effectiveVersion)
         if (downloader.isInstalledAt(cacheDir, npmPackageName)) return cacheDir
 
-        return downloader.ensureDownloaded(languageId, npmPackageName, version)
+        return downloader.ensureDownloaded(languageId, npmPackageName, effectiveVersion)
     }
 
     // Walks `startDir` and its ancestors looking for a `node_modules/<npmPackageName>`

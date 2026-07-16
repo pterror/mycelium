@@ -103,6 +103,31 @@ object ReScriptSupport : LanguageSupport by JsSupport {
     override val jsCompilerId = "rescript"
 }
 
+// Gleam, compiled via SubprocessBackend (backed by a native `gleam` binary downloaded from
+// GitHub Releases — see CompilerRegistry's "gleam" registration and ToolResolver.kt's
+// GitHubRelease for the download workflow) — see CoffeeSupport's own doc comment for why
+// delegation (`by JsSupport`) is enough here. Unlike Elm/PureScript/ReScript, Gleam has no
+// single-file compile mode at all: importing a .gleam file with no gleam.toml anywhere above
+// it fails outright (see CompilerRegistry's "gleam" registration for the exact diagnostic).
+object GleamSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("gleam")
+    override val jsCompilerId = "gleam"
+}
+
+// Imba, compiled to plain JS via NpmJsApiBackend (backed by the real `imba` npm package's
+// `require('imba/compiler').compile`, whose Document-shaped result is unwrapped via
+// CompilerSpec.outputProperty = "js" — see CompilerRegistry's "imba" registration) — see
+// CoffeeSupport's own doc comment for why delegation (`by JsSupport`) is enough here.
+//
+// CAVEAT: Imba 2.x has never shipped a stable release — only alpha prereleases exist as of
+// this writing (the npm registry's own "latest" dist-tag is "2.0.0-alpha.252") — so this
+// support should be treated as experimental: breaking changes between alpha builds are
+// possible, and `defaultVersion` may need bumping more often than any other language here.
+object ImbaSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("imba")
+    override val jsCompilerId = "imba"
+}
+
 object RubySupport : LanguageSupport {
     override val languageId = "ruby"
     override val extensions = listOf("rb")

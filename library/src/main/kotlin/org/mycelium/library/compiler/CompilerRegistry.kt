@@ -288,35 +288,286 @@ class CompilerRegistry {
                 },
             )
         )
-        // Imba (`imba` on npm) was also investigated and NOT added: its
-        // `require('imba/compiler').compile(source, options)` function (confirmed present at
-        // ./dist/compiler.cjs, exports.compile) does not return a plain JS string or a
-        // `{code}`-shaped object the way NpmJsApiBackend's `outputIsObject` contract expects.
-        // Deobfuscating the (minified) 2.0.0-alpha compiler shows `compile()` returns a whole
-        // `Document` instance — compiled output lives on a `.js` field that is itself
-        // populated by further internal machinery, not a simple top-level `code` string —
-        // so NpmJsApiBackend.compile's single `result.getMember("code")` (or bare
-        // `result.asString()`) can't extract it without backend changes. Imba is also still
-        // shipping only alpha prereleases (no stable dist-tag) as of this writing, which
-        // would make `defaultVersion` unstable regardless. Left for future work alongside a
-        // NpmJsApiBackend enhancement (or a bespoke Imba backend) rather than guessed at here.
-        //
-        // Gleam, Dart, Kotlin/JS, Scala.js, and Fable were also investigated and NOT added —
-        // none has a compile path matching the existing JS_API/SUBPROCESS pattern without
-        // pulling in a dependency Mycelium otherwise avoids entirely:
-        //   - Gleam: the actual compiler is a Rust binary distributed via GitHub
-        //     releases/Hex, not published to npm at all (the `gleam` package on npm is an
-        //     unrelated isomorphic-entities JS library, confirmed by inspecting its registry
-        //     metadata).
-        //   - Dart (dart2js): requires the full Dart SDK; no self-contained npm package
-        //     exists that bundles a working dart2js — wrappers like `dart2jsaas` still
-        //     assume Dart is installed and reachable separately.
-        //   - Kotlin/JS (kotlinc-js): npm wrappers (`@jetbrains/kotlinc-js-api`,
-        //     `kotlin-node`) exist but need a full Kotlin/JS classpath plus stdlib jars
-        //     resolved alongside the compiler itself — the same "more than a single
-        //     binary/JS-function call" complexity class already ruled out for Imba above.
-        //   - Scala.js: needs `scala-cli`/sbt plus the Scala.js linker and library jars; no
-        //     simple single-binary or single-JS-API entry point exists.
+        register(
+            CompilerSpec(
+                languageId = "imba",
+                npmPackageName = "imba",
+                // Latest npm dist-tag as of this writing — Imba's 2.x line has never shipped
+                // a stable release, only alpha prereleases (confirmed against the registry:
+                // dist-tags.latest itself is "2.0.0-alpha.252"), so unlike every other
+                // JS_API-backed language here, `defaultVersion` is inherently as unstable as
+                // Imba's own release process is.
+                //
+                // CAVEAT: Imba 2.x is alpha-quality software — no stable release exists to
+                // pin to instead, breaking changes between alpha builds are possible, and
+                // this registration should be treated as experimental accordingly.
+                defaultVersion = "2.0.0-alpha.252",
+                // `require('imba/compiler').compile(code, options)` (confirmed against the
+                // published tarball's src/compiler/index.mjs / compiler.mjs) — a package
+                // *subpath* require, not `require('imba')` itself, resolved through imba's
+                // own package.json "exports" map (`"./compiler": {"require":
+                // "./dist/compiler.cjs", "default": "./dist/compiler.mjs", ...}`) by
+                // NodeModuleResolver.resolveSubpathExport; `__mycelium_require__`'s
+                // preferRequire=true path picks the "require" condition, landing on the CJS
+                // build rather than the ESM one.
+                compileFunction = "require('imba/compiler').compile",
+                // `compile()` returns a whole Compilation instance (confirmed against
+                // src/compiler/compilation.mjs: `this.js = ""`, populated during `compile()`)
+                // rather than a plain string or a `{code}`-shaped object — so unlike
+                // CoffeeScript/Civet/LiveScript's `outputIsObject`, Imba needs `outputProperty`
+                // to name its own differently-named output field instead.
+                outputProperty = "js",
+            )
+        )
+        register(
+            CompilerSpec(
+                languageId = "gleam",
+                // Gleam's actual compiler is a native Rust binary distributed only via
+                // GitHub Releases (https://github.com/gleam-lang/gleam/releases) — the
+                // `gleam` package that does exist on the npm registry is an unrelated
+                // isomorphic-entities JS library, confirmed by inspecting its registry
+                // metadata, so there's no npmPackageName here at all.
+                npmPackageName = null,
+                // Pinned to a real, published release tag — verified against
+                // https://github.com/gleam-lang/gleam/releases/tag/v1.5.1's own asset list
+                // (gleam-v1.5.1-{x86_64,aarch64}-{unknown-linux-musl,apple-darwin}.tar.gz,
+                // gleam-v1.5.1-x86_64-pc-windows-msvc.zip).
+                defaultVersion = "1.5.1",
+                backendType = BackendType.SUBPROCESS,
+                // Gleam has no notion of compiling a single loose file at all — every real
+                // compile needs a gleam.toml (package name, dependencies, target config all
+                // live there; there's no `gleam compile-one-file.gleam` equivalent to Elm's
+                // scaffolded-elm.json workaround or ReScript's standalone `bsc`). So this
+                // registration is project-aware-only: `projectFileNames` below is the only
+                // path this language ever compiles through. Importing a .gleam file with no
+                // gleam.toml anywhere above it hits CompileToJsDispatcher.compile's "not
+                // BUNDLED but has no npmPackageName" branch (since projectRoot is null and
+                // npmPackageName is null here) and throws a MyceliumException accordingly —
+                // an accurate diagnostic for "there's no single-file compile mode", even
+                // though its wording was written for the npm case.
+                projectFileNames = listOf("gleam.toml"),
+                projectBuildPathBinaryName = "gleam",
+                // GitHub-Releases-sourced, not npm-sourced — see ToolResolver.kt's
+                // GitHubRelease and CompilerSpec.projectBuildToolSources' own doc comments for
+                // why this needs its own ToolSource list rather than
+                // projectBuildNpmPackage/projectBuildBinaryPath's npm-node_modules-shaped
+                // resolution. Same "user's own install wins" precedence as every other
+                // language: project-local -> system PATH -> Mycelium's own GitHub-release
+                // download cache.
+                projectBuildToolSources = { sourcePath ->
+                    buildList {
+                        sourcePath.parent?.let { add(ProjectLocalBin(it)) }
+                        add(SystemPath())
+                        add(
+                            GitHubRelease(
+                                owner = "gleam-lang",
+                                repo = "gleam",
+                                tag = "v1.5.1",
+                                assetName = gleamReleaseAssetName("1.5.1"),
+                            )
+                        )
+                    }
+                },
+                projectBuildArgs = { _, _, _, _ -> listOf("build", "--target", "javascript") },
+                // `gleam build --target javascript` compiles every module in the project and
+                // writes each one's output to build/dev/javascript/<package_name>/<module
+                // path relative to src/>.mjs (module path preserving its own subdirectory
+                // structure — e.g. src/foo/bar.gleam -> .../foo/bar.mjs), <package_name>
+                // being gleam.toml's own "name" key, not the source file's own name.
+                resolveProjectOutput = { projectRoot, _, sourcePath ->
+                    val packageName = extractGleamPackageName(projectRoot)
+                    val srcDir = projectRoot.resolve("src").toAbsolutePath().normalize()
+                    val modulePath = srcDir.relativize(sourcePath.toAbsolutePath().normalize())
+                        .toString()
+                        .removeSuffix(".gleam")
+                    projectRoot.resolve("build/dev/javascript").resolve(packageName).resolve("$modulePath.mjs")
+                },
+            )
+        )
+        register(
+            CompilerSpec(
+                languageId = "dart",
+                // No npm package at all — the Dart SDK is Google's own multi-gigabyte
+                // per-platform archive (storage.googleapis.com), not published to any package
+                // registry Mycelium otherwise talks to. Resolved via ToolResolver/ToolSource
+                // instead (see toolBinaryName/toolSources below and ToolResolver.kt's
+                // DartSdkDownload), the same "third shape" CompilerSpec.projectBuildToolSources
+                // introduced for Gleam's GitHub-Releases-only `gleam` binary — just for
+                // single-file compilation rather than a project build, since `dart compile
+                // js`/`dart2js` (unlike Gleam) can compile one loose file directly with no
+                // pubspec.yaml required at all.
+                npmPackageName = null,
+                // Latest Dart stable release as of this writing
+                // (https://storage.googleapis.com/dart-archive/channels/stable/release/3.5.4/
+                // sdk/ — a real, published SDK build).
+                defaultVersion = "3.5.4",
+                backendType = BackendType.SUBPROCESS,
+                versionCommand = listOf("--version"),
+                // `dart2js --version` (and `dart --version`) print e.g. "Dart SDK version:
+                // 3.5.4 (stable) (...)" — to *stderr*, not stdout, which is why VersionCheck
+                // captures both streams combined rather than stdout alone.
+                versionExtractor = { output ->
+                    Regex("""Dart SDK version:\s*(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                        ?: Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                },
+                toolBinaryName = "dart2js",
+                toolSources = { sourcePath ->
+                    val constraint = findPackageJsonConstraint(sourcePath.parent, "dart")
+                    val versionCheck = VersionCheck(
+                        listOf("--version"),
+                        { output ->
+                            Regex("""Dart SDK version:\s*(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                                ?: Regex("""(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                        },
+                        constraint?.versionSpec ?: "*",
+                    )
+                    // An exact version to download when neither PATH nor a project-local
+                    // install satisfies the constraint (SemverResolver has no npm registry to
+                    // resolve a range against here — the Dart SDK isn't an npm package — so an
+                    // exact-version constraint is used as-is and anything else falls back to
+                    // this registration's own defaultVersion).
+                    val downloadVersion =
+                        constraint?.versionSpec?.let { org.mycelium.library.registry.SemverResolver.parseVersion(it)?.raw }
+                            ?: "3.5.4"
+                    buildList {
+                        sourcePath.parent?.let { add(ProjectLocalBin(it, versionCheck)) }
+                        add(SystemPath(versionCheck))
+                        add(DartSdkDownload(dartSdkCacheDir(downloadVersion), downloadVersion))
+                    }
+                },
+                subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
+                // `dart2js <source> -o <output>` compiles exactly one entry file (plus
+                // whatever it imports via relative `package:`-less imports) straight to JS —
+                // dart2js has always supported single-file compilation this way, unlike
+                // `dart compile js` (the newer, `pub`-aware wrapper subcommand under the main
+                // `dart` binary) which expects a full pub package (pubspec.yaml) around the
+                // entry point. Using dart2js directly avoids needing a scaffolded pubspec.yaml
+                // the way Elm's CompilerSpec scaffolds a minimal elm.json.
+                compileArgs = { sourcePath, outputPath, _ ->
+                    listOf(sourcePath.toString(), "-o", outputPath.toString())
+                },
+                // CAVEAT: like PureScript's single-file `purs compile` fallback, this only
+                // works for Dart source that imports nothing beyond Dart's own `dart:core`-ish
+                // implicitly-available libraries — a real multi-file/pub-package Dart program
+                // needs a pubspec.yaml-rooted `dart compile js` project build, which is out of
+                // scope for Mycelium's per-file compile-to-JS model (see PureScript's own
+                // CAVEAT above for the same limitation stated at more length).
+            )
+        )
+        register(
+            CompilerSpec(
+                languageId = "kotlinjs",
+                // Kotlin/JS is the one interesting case where Mycelium's own host language is
+                // also the guest language being compiled: `mycelium` itself is a Kotlin/JVM
+                // program on GraalVM, and the Kotlin compiler is already on its own classpath
+                // (kotlin-stdlib, transitively pulled in by the Kotlin Gradle plugin this
+                // project already builds with). Investigated calling kotlinc-js's actual
+                // compiler API (K2JSCompiler) as a direct in-process JVM library call — no
+                // subprocess at all, the same way NpmJsApiBackend calls into the shared GraalJS
+                // Context in-process rather than shelling out — but that needs the full
+                // Kotlin/JS *cross-compilation* classpath (kotlin-stdlib-js.klib, the JS IR
+                // backend, kotlinx-serialization-adjacent compiler plugins some real projects
+                // require, ...) as extra Gradle dependencies, none of which this module
+                // currently declares, and pinning a compiler-API-compatible Kotlin compiler
+                // version independently of whatever Kotlin version Gradle itself builds
+                // Mycelium with risks exactly the kind of classpath/ABI mismatch this project's
+                // own build.gradle.kts already flags for GraalVM's Truffle jars (see its own
+                // comment on graalVersion). So: falls back to the subprocess `kotlinc-js`
+                // binary instead, published on npm as `kotlin-compiler`
+                // (https://www.npmjs.com/package/kotlin-compiler — a JetBrains-adjacent
+                // wrapper that bundles a `kotlinc-js` distribution, `bin: {kotlinc-js: ...}`),
+                // resolved through the exact same npm node_modules/cache/download chain every
+                // other npm-backed SUBPROCESS language (Elm/PureScript/ReScript) already gets —
+                // no bespoke ToolSource needed here at all.
+                npmPackageName = "kotlin-compiler",
+                defaultVersion = "1.9.24",
+                backendType = BackendType.SUBPROCESS,
+                versionCommand = listOf("-version"),
+                // `kotlinc-js -version` prints e.g. "info: kotlinc-js 1.9.24 (JRE ...)" to
+                // stderr.
+                versionExtractor = { output ->
+                    Regex("""kotlinc-js\s+(\d+\.\d+\.\d+)""").find(output)?.groupValues?.get(1)
+                },
+                subprocessBinaryPath = { packageDir -> packageDir.resolve("bin/kotlinc-js") },
+                subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
+                // `kotlinc-js -output <outputPath> <sourcePath>` compiles one entry file (plus
+                // anything it imports from the same source set) to a single JS file exposing
+                // top-level declarations on a Kotlin/JS-generated module object — mirrors
+                // Elm/PureScript's OUTPUT_FILE shape.
+                compileArgs = { sourcePath, outputPath, _ ->
+                    listOf("-output", outputPath.toString(), sourcePath.toString())
+                },
+                // CAVEAT: single-file compilation only works for Kotlin source needing nothing
+                // beyond kotlin-stdlib-js (implicitly available) — a real Kotlin/JS project's
+                // multi-file/Gradle-module structure (build.gradle.kts-declared source sets and
+                // dependencies) is out of scope for Mycelium's per-file compile-to-JS model,
+                // the same limitation PureScript/Dart's single-file fallbacks document above.
+            )
+        )
+        register(
+            CompilerSpec(
+                languageId = "scalajs",
+                // scala-cli (https://scala-cli.virtuslab.org) is the modern, self-contained
+                // Scala CLI that resolves/drives the actual Scala.js compiler + linker
+                // internally (fetching them from Maven/Coursier on first use) — distributed as
+                // native platform binaries via GitHub Releases and Coursier, not npm; no
+                // self-contained npm package bundles a working Scala.js toolchain the way
+                // Elm/PureScript/ReScript's npm wrappers do, so there's no npmPackageName here.
+                // Auto-download (a GitHub-Releases ToolSource, the way Gleam's `gleam` gets
+                // one) is left as a follow-up: only ProjectLocalBin/SystemPath are wired up for
+                // now, so this registration only helps a project/environment (e.g. this
+                // codebase's own NixOS flake, or a Nix devShell) that already provides
+                // scala-cli on PATH or in node_modules/.bin — a real gap versus Dart/Kotlin-JS
+                // above, called out explicitly rather than silently.
+                npmPackageName = null,
+                defaultVersion = "1.5.0",
+                backendType = BackendType.SUBPROCESS,
+                versionCommand = listOf("version", "--offline"),
+                // `scala-cli version --offline` prints e.g. "Scala CLI version: 1.5.0" (the
+                // `--offline` flag skips scala-cli's own "check for updates" network call,
+                // which would otherwise slow down/flake every single resolution).
+                versionExtractor = { output ->
+                    Regex("""version:?\s*(\d+\.\d+\.\d+)""", RegexOption.IGNORE_CASE)
+                        .find(output)?.groupValues?.get(1)
+                },
+                toolBinaryName = "scala-cli",
+                toolSources = { sourcePath ->
+                    val constraint = findPackageJsonConstraint(sourcePath.parent, "scala-cli")
+                    val versionCheck = constraint?.let {
+                        VersionCheck(
+                            listOf("version", "--offline"),
+                            { output ->
+                                Regex("""version:?\s*(\d+\.\d+\.\d+)""", RegexOption.IGNORE_CASE)
+                                    .find(output)?.groupValues?.get(1)
+                            },
+                            it.versionSpec,
+                        )
+                    }
+                    buildList {
+                        sourcePath.parent?.let { add(ProjectLocalBin(it, versionCheck)) }
+                        add(SystemPath(versionCheck))
+                    }
+                },
+                subprocessOutputMode = SubprocessOutputMode.OUTPUT_FILE,
+                // `scala-cli package --js <source> -o <output> --force` compiles one entry
+                // file (scala-cli resolves whatever `//> using` directives/Scala.js version the
+                // source declares, downloading the Scala.js linker/library on first use — this
+                // is exactly the "scala-cli handles all the complexity" property that makes it
+                // the only realistic Scala.js entry point for Mycelium at all) to a single JS
+                // bundle. `--force` overwrites `outputPath` if scala-cli's own caching left a
+                // stale file at the same scratch path from an earlier compile.
+                compileArgs = { sourcePath, outputPath, _ ->
+                    listOf("package", "--js", sourcePath.toString(), "-o", outputPath.toString(), "--force")
+                },
+                // CAVEAT: single-file only, same limitation as Dart/Kotlin-JS/PureScript above
+                // — a real multi-file Scala.js project (its own project.scala/build.sbt,
+                // cross-module dependencies) is out of scope for Mycelium's per-file
+                // compile-to-JS model.
+            )
+        )
+        // Fable was also investigated and NOT added — it's the closest candidate among the
+        // languages considered but still doesn't fit the existing JS_API/SUBPROCESS pattern
+        // without pulling in a dependency Mycelium otherwise avoids entirely:
         //   - Fable: closest candidate. `@fable-org/fable-compiler-js` (verified against the
         //     npm registry: `"bin": {"fable": "index.js"}`, `"type": "module"`) needs no
         //     .NET SDK. But its `bin` is a plain ESM JS file that only runs via its own
@@ -398,6 +649,37 @@ class CompilerRegistry {
     private fun extractPureScriptModuleName(sourcePath: Path): String? =
         moduleNameRegex.find(Files.readString(sourcePath))?.groupValues?.get(1)
 
+    // Best-effort extraction of a Gleam project's own package name (gleam.toml's top-level
+    // `name = "..."` key) — used by the "gleam" CompilerSpec's `resolveProjectOutput` to find
+    // where `gleam build --target javascript` writes a given module's compiled output
+    // (build/dev/javascript/<package_name>/...), which is keyed by the *project's* declared
+    // name, not any particular source file's own name. Falls back to the project root
+    // directory's own name if gleam.toml has no (or a malformed) "name" key — `gleam build`
+    // itself will already have failed with a clearer diagnostic in that case, since every
+    // gleam.toml is required to declare one.
+    private val gleamPackageNameRegex = Regex("""(?m)^\s*name\s*=\s*"([^"]+)"""")
+    private fun extractGleamPackageName(projectRoot: Path): String =
+        gleamPackageNameRegex.find(Files.readString(projectRoot.resolve("gleam.toml")))?.groupValues?.get(1)
+            ?: projectRoot.fileName.toString()
+
+    // Maps this JVM's OS/architecture (plus the caller-supplied Gleam version) to the exact
+    // GitHub release asset name Gleam's own release workflow publishes — verified against
+    // https://github.com/gleam-lang/gleam/releases/tag/v1.5.1's actual asset list. Windows
+    // ships a .zip; every other platform ships a .tar.gz (both handled by
+    // ToolResolver.kt's GitHubRelease).
+    private fun gleamReleaseAssetName(version: String): String {
+        val os = System.getProperty("os.name").lowercase()
+        val arch = System.getProperty("os.arch").lowercase()
+        val isArm = arch.contains("aarch64") || arch.contains("arm")
+        val target = when {
+            os.contains("win") -> "x86_64-pc-windows-msvc"
+            os.contains("mac") || os.contains("darwin") -> if (isArm) "aarch64-apple-darwin" else "x86_64-apple-darwin"
+            else -> if (isArm) "aarch64-unknown-linux-musl" else "x86_64-unknown-linux-musl"
+        }
+        val extension = if (os.contains("win")) "zip" else "tar.gz"
+        return "gleam-v$version-$target.$extension"
+    }
+
     // Maps this JVM's OS/architecture to the platform-specific subdirectory name the
     // `rescript` npm package ships its native `bsc.exe`/`rescript.exe`/`bstracing.exe`
     // binaries under (mirrors the package's own `install.js`, which does this same
@@ -411,5 +693,17 @@ class CompilerRegistry {
             os.contains("mac") || os.contains("darwin") -> if (isArm) "darwinarm64" else "darwin"
             else -> if (isArm) "linuxarm64" else "linux"
         }
+    }
+
+    // Where a given version of the Dart SDK gets downloaded/extracted to (DartSdkDownload's
+    // own cacheDir) — mirrors CompilerDownloader.cacheDirFor's own
+    // "$XDG_CACHE_HOME/mycelium/..." convention, just under a "compilers/dart-sdk/<version>"
+    // subpath rather than CompilerDownloader's npm-shaped "compilers/<languageId>/<version>",
+    // since CompilerRegistry has no CompilerDownloader instance of its own to delegate to (a
+    // registry only describes languages declaratively; it doesn't own any download
+    // machinery).
+    private fun dartSdkCacheDir(version: String): Path {
+        val base = System.getenv("XDG_CACHE_HOME") ?: java.io.File(System.getProperty("user.home"), ".cache").path
+        return java.io.File(base, "mycelium/compilers/dart-sdk/$version").toPath()
     }
 }

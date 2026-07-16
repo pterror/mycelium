@@ -53,7 +53,15 @@ class CompilerDownloader(private val registry: PackageIndex) {
     // See PackageInstaller's own resolveVersion for the full rationale; this mirrors it
     // exactly (both classes independently talk to a PackageIndex, so neither depends on the
     // other, but the resolution policy is identical).
-    private fun resolveVersion(name: String, versionSpec: String): String? {
+    //
+    // Internal (not private) rather than a CompilerDownloader-only implementation detail: a
+    // project's own package.json can declare a version *constraint* (e.g.
+    // `"coffeescript": "^2.7.0"` in devDependencies) for a compile-to-JS compiler, taking
+    // precedence over CompilerSpec.defaultVersion — CompileToJsDispatcher.resolveCompilerLocation
+    // needs to resolve that constraint against the real registry the exact same way this class
+    // already does for `ensureDownloaded`'s own `version` parameter, so it's exposed here rather
+    // than duplicated.
+    internal fun resolveVersion(name: String, versionSpec: String): String? {
         exactVersionOrNull(versionSpec)?.let { return it }
         val range = SemverResolver.parseRange(versionSpec)
         if (range != null) {
@@ -62,6 +70,23 @@ class CompilerDownloader(private val registry: PackageIndex) {
                 ?: throw PackageNotFoundException(name, versionSpec)
         }
         return if (versionSpec == "latest") null else versionSpec
+    }
+
+    // Reads the installed "version" field out of `dir/node_modules/npmPackageName/package.json`
+    // — used by CompileToJsDispatcher.resolveCompilerLocation to check whether an
+    // already-installed compiler (a project's own node_modules, or Mycelium's own download
+    // cache) actually satisfies a version constraint the project's own package.json declares,
+    // rather than blindly trusting whatever happens to be on disk. Returns null if the
+    // directory/manifest doesn't exist or doesn't parse — treated by the caller as "can't
+    // verify, so don't trust this install" instead of throwing.
+    fun installedPackageVersion(dir: Path, npmPackageName: String): String? {
+        val pkgJson = dir.resolve("node_modules").resolve(npmPackageName).resolve("package.json")
+        if (!Files.isRegularFile(pkgJson)) return null
+        return try {
+            org.json.JSONObject(Files.readString(pkgJson)).optString("version", null)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // Downloads `npmPackageName@version` (plus, transitively, its own runtime dependencies)

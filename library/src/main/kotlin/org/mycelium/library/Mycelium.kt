@@ -411,7 +411,19 @@ class Mycelium(
         // which this drives to completion on the same (calling) thread that owns the
         // Context. A script that registered no timers (or only unref'd ones) returns
         // immediately, same as before this loop existed.
-        if (jsAvailable) {
+        //
+        // Gated on the *entry file's* resolved language being "js" — not merely on
+        // `jsAvailable` — because setTimeout/setInterval/setImmediate are a JS/Node
+        // runtime concept, not a universal one: `language` here is "js" for both plain
+        // JS/TS and every compile-to-JS language (Coffee/Civet/LiveScript/Elm/PureScript/
+        // ReScript/Dart/Kotlin-JS/Scala.js/Gleam/Imba all delegate their `languageId` to
+        // JsSupport — see Languages.kt), since their compiled output ultimately runs as an
+        // ordinary JS module on this same Context and may itself have scheduled timers.
+        // Ruby/Python/C/Rust (`llvm`)/Go (`wasm`) run to completion on their own and have
+        // no timer/event-loop concept at all — draining TimerManager for one of those
+        // would be pumping a queue nothing could ever have populated, so it's skipped
+        // entirely rather than running (harmlessly, but pointlessly) as a no-op.
+        if (language == "js") {
             runEventLoop()
         }
     }

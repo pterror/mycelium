@@ -98,16 +98,42 @@ data class CompilerSpec(
     // SubprocessBackend path instead of ever consulting the fields below.
     val projectFileNames: List<String> = emptyList(),
 
-    // Resolves the binary that drives the *whole-project* build command, given the same
-    // `packageDir` `subprocessBinaryPath` would receive (`<moduleResolutionDir>/node_modules/
-    // <npmPackageName>`). Defaults to `subprocessBinaryPath` itself when null, since for
-    // Elm/ReScript the project build is driven by the exact same binary as single-file
-    // compilation (`elm`, `rescript.exe`). PureScript is the one exception — spago (the
-    // actual project/dependency-manager tool) is a wholly separate CLI from `purs`
-    // (single-file/module-graph compiler) and isn't provided by the `purescript` npm package
-    // at all, so PureScriptSupport's registration overrides this to resolve `spago` via PATH
-    // instead of `packageDir` (see CompilerRegistry's own comment on that override for why).
+    // Resolves the binary that drives the *whole-project* build command, given the
+    // `packageDir` that whichever npm package actually provides it resolved to
+    // (`<moduleResolutionDir>/node_modules/<pkg>`) — `<npmPackageName>`'s own packageDir when
+    // `projectBuildNpmPackage` is null (Elm/ReScript: the project build is driven by the exact
+    // same binary as single-file compilation, `elm`/`rescript.exe`), or
+    // `projectBuildNpmPackage`'s packageDir otherwise (PureScript: `spago`, a wholly separate
+    // CLI/npm package from `purescript`/`purs` — see `projectBuildNpmPackage`'s own doc
+    // comment below).
     val projectBuildBinaryPath: ((packageDir: Path) -> Path)? = null,
+
+    // The npm package that provides the *project-build* tool `projectBuildBinaryPath`
+    // locates, when that tool is a wholly separate package from `npmPackageName` itself —
+    // PureScript's spago is the one case today (see the extended comment on
+    // `projectBuildBinaryPath` above for why: spago is a completely different CLI/project
+    // from `purescript`/`purs`). Null (the default) means the project-build tool is provided
+    // by `npmPackageName` itself (Elm's `elm`, ReScript's `rescript`), so
+    // CompileToJsDispatcher.compileProjectAware resolves it exactly like single-file
+    // compilation always has. When non-null, it's resolved independently, through the same
+    // "user's own install wins over Mycelium's auto-download" chain SubprocessBackend already
+    // gets via resolveCompilerLocation: project node_modules -> system PATH -> Mycelium's own
+    // download cache -> auto-download from npm — see
+    // CompileToJsDispatcher.resolveProjectBuildBinary.
+    val projectBuildNpmPackage: String? = null,
+
+    // Version to resolve/download `projectBuildNpmPackage` at; ignored when
+    // `projectBuildNpmPackage` is null. Deliberately independent of `defaultVersion` — when
+    // set, the project-build tool and the single-file compiler are entirely separate projects
+    // with their own release cadences/version numbers (spago 1.0.4 vs. purs 0.15.15).
+    val projectBuildToolVersion: String = defaultVersion,
+
+    // The bare executable name to look for on the system PATH when `projectBuildNpmPackage`
+    // is set (e.g. "spago") — a global install (`npm install -g spago`, the official
+    // installer, a system package manager, ...) is checked before ever falling back to
+    // Mycelium's own auto-download. Null (the default, and the only sensible value when
+    // `projectBuildNpmPackage` is also null) skips the PATH-search step entirely.
+    val projectBuildPathBinaryName: String? = null,
 
     // Builds the CLI arguments (everything after the resolved binary) for a whole-project
     // build, given the project root, the resolved build binary, the specific source file

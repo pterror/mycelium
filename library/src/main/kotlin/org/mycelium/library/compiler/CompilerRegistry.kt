@@ -182,21 +182,26 @@ class CompilerRegistry {
                 // binary than single-file compilation: spago (the package manager/build-tool
                 // CLI) is a separate project from `purs` (the compiler itself) and is not
                 // provided by the `purescript` npm package at all (that package only ships
-                // `purs`/`purs.bin`) — nor does Mycelium's CompilerDownloader know how to
-                // fetch it, since spago isn't resolved through the same npm-registry-package
-                // pipeline the rest of this file uses. `projectBuildBinaryPath` therefore
-                // ignores the resolved `packageDir` entirely and returns a bare "spago",
-                // left for the OS/ProcessBuilder to find on PATH — the same PATH-searched
-                // fallback approach InterceptingFileSystem.yoloInstall already uses for
-                // `npm`/`pnpm` when the pure-Kotlin install path doesn't apply. A user
-                // importing a real Spago-managed PureScript project is expected to have
-                // spago itself installed already (e.g. via `npm install -g spago`,
-                // a package manager, or the official installer) — Mycelium surfaces a clear
-                // "requires 'spago' — install it and try again" error (see
-                // ProjectBuildRunner.runBuild) rather than silently falling back to (or
-                // failing on) the single-file path when it's missing.
+                // `purs`/`purs.bin`). Unlike the old bare-"spago"-on-PATH-only approach, spago
+                // is itself published on npm (https://registry.npmjs.org/spago) as a
+                // self-contained ES module bundle (`bin/bundle.js`, no native/platform-specific
+                // binaries despite wrapping a Haskell-toolchain-era CLI — the current
+                // TypeScript rewrite ships as plain JS with a `#!/usr/bin/env -S node
+                // --no-warnings=...` shebang), so CompileToJsDispatcher.resolveProjectBuildBinary
+                // can resolve/download it through the exact same node_modules -> PATH -> cache
+                // -> auto-download chain SubprocessBackend already gets for every other
+                // language — see `projectBuildNpmPackage`'s own doc comment on CompilerSpec.
+                // A locally- or globally-installed spago (node_modules or PATH) still wins over
+                // Mycelium's own auto-downloaded copy, matching every other language's
+                // "user's own install takes precedence" precedent.
                 projectFileNames = listOf("spago.yaml", "spago.dhall"),
-                projectBuildBinaryPath = { _ -> Path.of("spago") },
+                projectBuildNpmPackage = "spago",
+                // Latest npm "spago" dist-tag as of this writing (the "Spago Next"/PureScript
+                // registry-era rewrite, entirely unrelated in version numbering to `purs`
+                // 0.15.15 above — see projectBuildToolVersion's own doc comment).
+                projectBuildToolVersion = "1.0.4",
+                projectBuildPathBinaryName = "spago",
+                projectBuildBinaryPath = { packageDir -> packageDir.resolve("bin/bundle.js") },
                 projectBuildArgs = { _, _, _, _ -> listOf("build") },
                 resolveProjectOutput = { projectRoot, _, sourcePath ->
                     val moduleName = extractPureScriptModuleName(sourcePath) ?: "Main"

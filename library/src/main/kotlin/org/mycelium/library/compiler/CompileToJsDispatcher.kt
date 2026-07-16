@@ -2,7 +2,6 @@ package org.mycelium.library.compiler
 
 import org.graalvm.polyglot.Context
 import org.mycelium.library.MyceliumException
-import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.readText
@@ -45,6 +44,12 @@ class CompileToJsDispatcher(
     // substitute a fake the same way they can for `downloader`/`cache`; defaults to a real
     // one so existing callers (Mycelium.kt) don't have to change.
     private val projectBuildRunner: ProjectBuildRunner = ProjectBuildRunner(),
+    // Drives the generic "project-local -> system PATH -> Mycelium's own download cache ->
+    // download" chain used by resolveProjectBuildBinary below — see ToolResolver.kt's own doc
+    // comments. A constructor param (defaulting to a fresh, stateless instance) for the same
+    // reason downloader/cache/projectBuildRunner are: so tests can substitute a fake without
+    // this dispatcher ever reaching for a concrete ToolResolver itself.
+    private val toolResolver: ToolResolver = ToolResolver(),
 ) {
     fun compile(languageId: String, sourcePath: Path, context: Context): String {
         val spec = registry.resolve(languageId)
@@ -129,11 +134,12 @@ class CompileToJsDispatcher(
     //     `subprocessBinaryPath` locating the binary inside that package's directory —
     //     unchanged from this dispatcher's pre-existing behavior.
     //   - non-null (PureScript's spago): a wholly separate npm package from `npmPackageName`,
-    //     resolved independently through the *same* "local install wins over Mycelium's own
-    //     auto-download" precedence, but with an extra step in between: a global install on
-    //     the system PATH (e.g. `npm install -g spago`) also wins over auto-downloading,
-    //     since it's just as much "the user's own install" as a local node_modules one is —
-    //       1. the compiled file's own project's node_modules (walking up ancestors)
+    //     resolved via the shared ToolResolver/ToolSource chain (see ToolResolver.kt) — the
+    //     same "local install wins over Mycelium's own auto-download" precedence, with a
+    //     global system-PATH install (e.g. `npm install -g spago`) also winning over
+    //     auto-downloading, since it's just as much "the user's own install" as a local
+    //     node_modules one is:
+    //       1. the compiled file's own project's node_modules/.bin (walking up ancestors)
     //       2. system PATH (only when projectBuildPathBinaryName is set)
     //       3. Mycelium's own download cache (a previous run, this or a different project)
     //       4. neither -> download it into the cache now, for this and every future compile
@@ -155,49 +161,34 @@ class CompileToJsDispatcher(
             return resolveBinaryFromPackageDir(packageDir)
         }
 
-        // 1. The compiled file's own project's node_modules — a locally-installed spago
-        // (e.g. `npm install spago` / declared as a devDependency) wins over everything else.
-        findProjectNodeModulesDir(sourcePath.parent, projectBuildNpmPackage)?.let { dir ->
-            val packageDir = dir.resolve("node_modules").resolve(projectBuildNpmPackage)
-            val candidate = resolveBinaryFromPackageDir(packageDir)
-            if (Files.exists(candidate)) return candidate
-        }
-
-        // 2. System PATH — a global install also counts as "the user's own", so it too wins
-        // over Mycelium auto-downloading its own copy.
-        spec.projectBuildPathBinaryName?.let { pathBinaryName ->
-            findOnPath(pathBinaryName)?.let { return it }
-        }
-
-        // 3/4. Mycelium's own download cache, downloading into it now if not already there.
         // Cache-keyed by "$languageId-projectbuild" (rather than plain $languageId) so this
         // never collides with $languageId's own single-file-compiler cache entry, which is
         // keyed by a wholly different npm package/version (e.g. purescript's `purs`
         // 0.15.15 vs. spago 1.0.4 here).
         val cacheKey = "$languageId-projectbuild"
-        val cacheDir = downloader.cacheDirFor(cacheKey, spec.projectBuildToolVersion)
-        val moduleResolutionDir = if (downloader.isInstalledAt(cacheDir, projectBuildNpmPackage)) {
-            cacheDir
-        } else {
-            downloader.ensureDownloaded(cacheKey, projectBuildNpmPackage, spec.projectBuildToolVersion)
+        val sources = buildList {
+            sourcePath.parent?.let { add(ProjectLocalBin(it)) }
+            // projectBuildPathBinaryName and projectBuildNpmPackage always name the same tool
+            // for every language registered today (PureScript's spago is both), so a single
+            // toolName can drive every source in this list.
+            if (spec.projectBuildPathBinaryName != null) add(SystemPath)
+            add(
+                CachedPackage(
+                    downloader.cacheDirFor(cacheKey, spec.projectBuildToolVersion),
+                    resolveBinaryFromPackageDir,
+                )
+            )
+            add(
+                RegistryDownload(
+                    downloader,
+                    projectBuildNpmPackage,
+                    spec.projectBuildToolVersion,
+                    resolveBinaryFromPackageDir,
+                    cacheKey,
+                )
+            )
         }
-        val packageDir = moduleResolutionDir.resolve("node_modules").resolve(projectBuildNpmPackage)
-        return resolveBinaryFromPackageDir(packageDir)
-    }
-
-    // Manual PATH search: unlike the bare-command-name-handed-to-ProcessBuilder approach used
-    // elsewhere in Mycelium (e.g. InterceptingFileSystem.yoloInstall's `npm`/`pnpm` fallback,
-    // which just lets the OS resolve the name and catches IOException if it can't), this needs
-    // to know *whether* the binary exists on PATH before deciding whether to fall back to
-    // Mycelium's own auto-download — so it has to walk PATH itself rather than defer to the OS.
-    private fun findOnPath(name: String): Path? {
-        val pathEnv = System.getenv("PATH") ?: return null
-        for (dir in pathEnv.split(File.pathSeparator)) {
-            if (dir.isBlank()) continue
-            val candidate = Path.of(dir, name)
-            if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) return candidate
-        }
-        return null
+        return toolResolver.resolve(projectBuildNpmPackage, sources)
     }
 
     // Implements the resolution chain described in the phase-3 design (steps 2-4; step 1 —

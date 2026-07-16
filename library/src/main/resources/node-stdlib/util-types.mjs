@@ -7,16 +7,20 @@
 import { types } from "util";
 
 export const isAnyArrayBuffer = types.isAnyArrayBuffer;
+export const isArgumentsObject = types.isArgumentsObject;
 export const isArrayBuffer = types.isArrayBuffer;
 export const isArrayBufferView = types.isArrayBufferView;
 export const isAsyncFunction = types.isAsyncFunction;
 export const isBigInt64Array = types.isBigInt64Array;
+export const isBigIntObject = types.isBigIntObject;
 export const isBigUint64Array = types.isBigUint64Array;
 export const isBooleanObject = types.isBooleanObject;
 export const isBoxedPrimitive = types.isBoxedPrimitive;
+export const isCryptoKey = types.isCryptoKey;
 export const isDataView = types.isDataView;
 export const isDate = types.isDate;
 export const isExternal = types.isExternal;
+export const isFloat16Array = types.isFloat16Array;
 export const isFloat32Array = types.isFloat32Array;
 export const isFloat64Array = types.isFloat64Array;
 export const isGeneratorFunction = types.isGeneratorFunction;
@@ -24,6 +28,7 @@ export const isGeneratorObject = types.isGeneratorObject;
 export const isInt8Array = types.isInt8Array;
 export const isInt16Array = types.isInt16Array;
 export const isInt32Array = types.isInt32Array;
+export const isKeyObject = types.isKeyObject;
 export const isMap = types.isMap;
 export const isMapIterator = types.isMapIterator;
 export const isModuleNamespaceObject = types.isModuleNamespaceObject;

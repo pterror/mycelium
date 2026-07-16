@@ -269,6 +269,22 @@ export function moveCursor(_stream, _dx, _dy, callback) {
 
 export { Interface, normalizeCreateInterfaceArgs as _normalizeCreateInterfaceArgs };
 
+// NOTE: Node also exposes the promise-returning API under `readline.promises` (same
+// object `require('readline/promises')` returns directly) — deliberately NOT added here.
+// readline-promises.mjs subclasses this module's `Interface` at its own top level (`class
+// Interface extends CallbackInterface`), so importing "readline/promises" back from this
+// module forms a true ESM import cycle: readline/promises needs this module's `Interface`
+// binding initialized before this module has finished evaluating it, which GraalJS (like
+// V8) fails with an evaluation error, breaking readline entirely. Routing through the
+// synchronous `__mycelium_require__` CJS-style bridge instead (module.mjs's
+// `createRequire()` uses that same bridge) doesn't fix it — requireCoreModule/
+// requireEsmModule still evaluate readline-promises.mjs's static ESM `import ... from
+// "readline"`, hitting the identical cycle one layer down. Fixing this for real requires
+// restructuring readline-promises.mjs to not depend on this module's `Interface` at its
+// own top level (e.g. moving the promise-Interface class into readline.mjs itself, mirroring
+// how dns.mjs/fs.mjs build their own `promises` object inline rather than importing it
+// back from a sibling module — see fs.mjs's `promises` export and fs-promises.mjs's
+// `import { promises } from "fs"`).
 export default {
     createInterface, Interface, emitKeypressEvents, clearLine, clearScreenDown, cursorTo, moveCursor,
 };

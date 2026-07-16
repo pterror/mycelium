@@ -48,7 +48,10 @@ class NodeParityTest {
         val MODULES = listOf(
             "assert", "buffer", "child_process", "crypto", "events", "fs", "http", "http2",
             "https", "net", "os", "path", "process", "querystring", "stream",
-            "string_decoder", "tls", "tty", "url", "util", "zlib"
+            "string_decoder", "tls", "tty", "url", "util", "zlib",
+            "dns", "dns/promises", "worker_threads", "readline", "readline/promises",
+            "node:module", "perf_hooks", "timers", "timers/promises", "util/types",
+            "dgram", "cluster"
         )
 
         private var resolvedNodeCommand: List<String>? = null

@@ -174,19 +174,27 @@ export function callbackify(fn) {
 // members, so this is the single source of truth for all of them.
 export const types = {
     isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer),
+    isArgumentsObject: (v) => typeof v === "object" && v !== null && Object.prototype.toString.call(v) === "[object Arguments]",
     isArrayBuffer: (v) => v instanceof ArrayBuffer,
     isArrayBufferView: (v) => ArrayBuffer.isView(v),
     isAsyncFunction: (v) => typeof v === "function" && v.constructor.name === "AsyncFunction",
     isBigInt64Array: (v) => typeof BigInt64Array !== "undefined" && v instanceof BigInt64Array,
+    isBigIntObject: (v) => typeof v === "object" && v !== null && typeof BigInt !== "undefined" && v.constructor === BigInt,
     isBigUint64Array: (v) => typeof BigUint64Array !== "undefined" && v instanceof BigUint64Array,
     isBooleanObject: (v) => typeof v === "object" && v !== null && v instanceof Boolean,
     isBoxedPrimitive: (v) =>
         typeof v === "object" &&
         v !== null &&
         (v instanceof Boolean || v instanceof Number || v instanceof String || v instanceof Symbol || (typeof BigInt !== "undefined" && v instanceof Object && v.constructor === BigInt)),
+    // Mycelium is JVM-backed (java.security), not OpenSSL-backed, so there's no native
+    // CryptoKey/KeyObject class to `instanceof`-check against — always false rather than
+    // throwing, matching how these two are the only `util.types` checks crypto.mjs has no
+    // backing representation for (see NodeParityTest's crypto gap report).
+    isCryptoKey: (v) => false,
     isDataView: (v) => v instanceof DataView,
     isDate: (v) => v instanceof Date,
     isExternal: (v) => false,
+    isFloat16Array: (v) => typeof Float16Array !== "undefined" && v instanceof Float16Array,
     isFloat32Array: (v) => v instanceof Float32Array,
     isFloat64Array: (v) => v instanceof Float64Array,
     isGeneratorFunction: (v) => typeof v === "function" && v.constructor.name === "GeneratorFunction",
@@ -199,6 +207,8 @@ export const types = {
     isInt8Array: (v) => v instanceof Int8Array,
     isInt16Array: (v) => v instanceof Int16Array,
     isInt32Array: (v) => v instanceof Int32Array,
+    // See isCryptoKey's comment — same "no native handle to check" reasoning.
+    isKeyObject: (v) => false,
     isMap: (v) => v instanceof Map,
     isMapIterator: (v) => typeof v === "object" && v !== null && v[Symbol.toStringTag] === "Map Iterator",
     isModuleNamespaceObject: (v) => typeof v === "object" && v !== null && Symbol.toStringTag in v && v[Symbol.toStringTag] === "Module",

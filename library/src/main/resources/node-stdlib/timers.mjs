@@ -18,6 +18,14 @@ export const clearInterval = globalThis.clearInterval;
 export const setImmediate = typeof globalThis.setImmediate !== "undefined" ? globalThis.setImmediate : undefined;
 export const clearImmediate = typeof globalThis.clearImmediate !== "undefined" ? globalThis.clearImmediate : undefined;
 
+// Node's `timers` module also exposes the promise-returning API under `timers.promises`
+// (identical object to what `require('timers/promises')` returns directly). Safe to
+// import here (unlike readline.mjs/readline-promises.mjs) because timers-promises.mjs has
+// no import back on "timers" — it only touches `globalThis` timer functions directly — so
+// there's no circular top-level dependency to worry about.
+import * as promises from "timers/promises";
+export { promises };
+
 export default {
     setTimeout,
     clearTimeout,
@@ -25,4 +33,5 @@ export default {
     clearInterval,
     setImmediate,
     clearImmediate,
+    promises,
 };

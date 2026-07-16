@@ -16,6 +16,12 @@ interface LanguageSupport {
     // the artifact gets loaded with.
     val outputExtension: String get() = "bc"
 
+    // The compile-to-JS language ID (see org.mycelium.library.compiler.CompilerRegistry)
+    // this LanguageSupport's source should be compiled through before GraalJS evaluates it
+    // — e.g. "typescript" for TypeScript. null (the default) for languages that need no
+    // compile-to-JS step, including plain JS/CJS/ESM and every non-JS-hosted language.
+    val jsCompilerId: String? get() = null
+
     fun detectFrame(frame: String): Boolean
     fun isValidExportName(name: String): Boolean
     fun generateShim(exports: Map<String, String>): String

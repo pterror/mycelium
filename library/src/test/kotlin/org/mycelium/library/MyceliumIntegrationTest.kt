@@ -679,6 +679,38 @@ class MyceliumIntegrationTest {
         assertEquals(9, result.asInt())
     }
 
+    // --- CoffeeScript / Civet, via the generalized compile-to-JS pipeline
+    // (org.mycelium.library.compiler.CompileToJsDispatcher/NpmJsApiBackend) ---
+    //
+    // Both gated on npm being on PATH, like yoloAutoInstallsMissingPackage/
+    // manifestInstallRunsNpmInstall above — CompilerDownloader needs real network access to
+    // the npm registry to fetch the `coffeescript`/`@danielx/civet` compiler packages into
+    // Mycelium's own compiler cache the first time either test runs anywhere on this machine.
+
+    @Test fun jsImportsCoffeeScript() {
+        val mc = vm
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping CoffeeScript compile-to-JS test")
+        val path = testResourcePath("typed.coffee")
+        runJsWithImports(mc, """
+            import { add } from "$path";
+            globalThis.__coffeeResult = add(4, 5);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__coffeeResult")
+        assertEquals(9, result.asInt())
+    }
+
+    @Test fun jsImportsCivet() {
+        val mc = vm
+        assumeTrue(isCommandAvailable("npm"), "npm not available in PATH — skipping Civet compile-to-JS test")
+        val path = testResourcePath("typed.civet")
+        runJsWithImports(mc, """
+            import { add } from "$path";
+            globalThis.__civetResult = add(4, 5);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__civetResult")
+        assertEquals(9, result.asInt())
+    }
+
     // --- CJS -> ESM transpilation (via esbuild, see CjsCompiler) ---
 
     @Test fun jsImportsCjsModule() {

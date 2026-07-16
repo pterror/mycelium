@@ -1,6 +1,7 @@
 package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
+import org.mycelium.library.compiler.CompileToJsDispatcher
 import java.io.File
 import java.net.URI
 import java.nio.channels.SeekableByteChannel
@@ -378,17 +379,26 @@ class InterceptingFileSystem : FileSystem {
             if (path.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) {
                 return CoreModuleRegistry.readCoreModule(path)
             }
-            // TypeScript is transpiled to plain JS via esbuild before GraalJS ever sees it —
-            // GraalJS itself has no TypeScript support. This only strips types/syntax (no
-            // bundling), so import specifiers inside the output are left for
+            // Compile-to-JS languages (TypeScript, CoffeeScript, Civet, ... — anything
+            // registered in CompilerRegistry) are compiled to plain JS before GraalJS ever
+            // sees them — GraalJS itself only understands plain JS. This only strips types/
+            // syntax (no bundling), so import specifiers inside the output are left for
             // InterceptingFileSystem's normal resolution to handle, same as any other JS file.
+            // JsSupport (which also owns plain .js/.mjs) reports a non-null jsCompilerId too
+            // ("typescript"), since the same LanguageSupport object covers both TypeScript
+            // and plain JS extensions — so "js"/"mjs" are excluded here explicitly rather
+            // than relying on jsCompilerId alone, which would otherwise route ordinary JS
+            // source through the compile-to-JS pipeline as well.
             if (!path.startsWith("/.mycelium/") &&
-                (path.extension == "ts" || path.extension == "mts") &&
+                path.extension != "js" && path.extension != "mjs" &&
                 !options.contains(StandardOpenOption.WRITE) &&
                 !options.contains(StandardOpenOption.CREATE)
             ) {
-                val js = TsCompiler.transpile(path)
-                return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
+                val compilerId = mycelium?.supportForExtension(path.extension)?.jsCompilerId
+                if (compilerId != null) {
+                    val js = CompileToJsDispatcher.compile(compilerId, path, context!!)
+                    return ReadOnlyBufferChannel(StandardCharsets.UTF_8.encode(js))
+                }
             }
             // CommonJS (require()/module.exports) source is never transpiled or evaluated
             // through GraalJS's ordinary ESM pipeline at all — instead, whenever GraalJS's

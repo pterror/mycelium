@@ -7,6 +7,13 @@ object JsSupport : LanguageSupport {
     override val extensions = listOf("js", "mjs", "ts", "mts")
     override val compilerCommand = null
 
+    // JsSupport is shared by both plain JS (.js/.mjs) and TypeScript (.ts/.mts) — this only
+    // ever applies to the latter. InterceptingFileSystem's dispatch logic additionally
+    // checks the file's own extension before consulting this, so plain .js/.mjs files are
+    // never routed through the compile-to-JS pipeline despite jsCompilerId being non-null
+    // here.
+    override val jsCompilerId = "typescript"
+
     override fun detectFrame(frame: String) =
         frame.startsWith("GraalJSEvaluator.ModuleScriptRoot@")
 
@@ -31,6 +38,28 @@ object JsSupport : LanguageSupport {
     override fun injectEvalModule(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {
         context.getBindings("js").getMember("Polyglot").putMember("evalModule", fn)
     }
+}
+
+// CoffeeScript, compiled to plain JS before GraalJS ever evaluates it (see
+// org.mycelium.library.compiler.CompileToJsDispatcher / NpmJsApiBackend, which `require()`s
+// the real `coffeescript` npm package into the shared Context). Delegates everything except
+// `extensions`/`jsCompilerId` to JsSupport (interface delegation, `by JsSupport`) since a
+// CoffeeScript file, once compiled, is executed as an ordinary ES module the exact same way
+// a .ts/.mts file is — same languageId ("js", for eval/frame-detection/generateShim
+// purposes), same Polyglot.evalModule wiring, same export-name validation rules. Only which
+// extension(s) this LanguageSupport owns, and which compile-to-JS compiler its source is
+// routed through, actually differ.
+object CoffeeSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("coffee")
+    override val jsCompilerId = "coffeescript"
+}
+
+// Civet, likewise compiled to plain JS via NpmJsApiBackend (backed by the real
+// `@danielx/civet` npm package) — see CoffeeSupport's own doc comment for why delegation
+// (`by JsSupport`) is enough here.
+object CivetSupport : LanguageSupport by JsSupport {
+    override val extensions = listOf("civet")
+    override val jsCompilerId = "civet"
 }
 
 object RubySupport : LanguageSupport {

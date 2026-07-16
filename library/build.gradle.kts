@@ -24,4 +24,13 @@ dependencies {
   implementation("org.graalvm.polyglot:llvm-native:$graalVersion")
   implementation("org.graalvm.ruby:ruby:$graalVersion")
   implementation("io.mvnpm:esbuild-java:1.5.1")
+
+  // Pure-Kotlin npm registry client + package cache (CompilerDownloader):
+  // org.json for registry response parsing, commons-compress for tar/gzip streaming
+  // extraction. Both are already transitively pulled in by the GraalVM artifacts above
+  // (org.graalvm.shadowed:json, commons-compress via native-image tooling) but are
+  // declared explicitly here since relying on an undeclared transitive dependency is
+  // fragile — it could disappear silently if those artifacts' own dependencies change.
+  implementation("org.json:json:20240303")
+  implementation("org.apache.commons:commons-compress:1.26.2")
 }

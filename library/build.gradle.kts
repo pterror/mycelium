@@ -36,8 +36,8 @@ val llvmLang: Configuration by configurations.creating { isCanBeConsumed = false
 val wasmLang: Configuration by configurations.creating { isCanBeConsumed = false }
 
 dependencies {
-  implementation("org.graalvm.truffle:truffle-api:$graalVersion")
-  implementation("org.graalvm.polyglot:polyglot:$graalVersion")
+  api("org.graalvm.truffle:truffle-api:$graalVersion")
+  api("org.graalvm.polyglot:polyglot:$graalVersion")
 
   compileOnly("org.graalvm.polyglot:js:$graalVersion")
   compileOnly("org.graalvm.polyglot:python:$graalVersion")

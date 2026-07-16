@@ -15,7 +15,8 @@ one shared GraalVM polyglot `Context`.
 
 ### Node stdlib completion
 Implemented as synthetic core modules backed by Java interop, cross-referencing Node/Deno/Bun
-source for exact semantics (mirror Node 1:1, not approximate).
+source for exact semantics (mirror Node 1:1, not approximate). **~30 modules implemented**,
+with `NodeParityTest.kt` harness verifying export-by-export parity against a real Node binary.
 
 - **Done / has parity coverage** (`NodeParityTest.kt`'s `MODULES` list, diffed against a real
   `node` binary export-by-export): `assert`, `buffer`, `child_process`, `crypto`, `events`,
@@ -30,7 +31,10 @@ source for exact semantics (mirror Node 1:1, not approximate).
   signal (`--info` output), not a gate. Hard failure is reserved for "module doesn't load in
   Mycelium at all but loads in Node" or a genuine behavioral mismatch.
 
-### npm acid testing (rounds 1–3 complete, round 4 next)
+### npm acid testing (27/28 passing)
+Cross-ecosystem compatibility test harness. Only failure is `sharp` (native addon requiring
+N-API; fundamentally blocked until native-addon FFI support is available).
+
 - **Round 1** (5/5 pass, unpinned versions): lodash, minimist, chalk, uuid, dotenv.
 - **Round 2** (2/5 pass): `semver` works; `ms`, `debug`, `axios`, `express` fail — see gaps
   below. Chalk also has a pre-existing flake risk (`sourceDirectoryStack` empty for subpath
@@ -122,6 +126,12 @@ process, no FFI, no serialization, no microservices.
 Any language that compiles to JS runs on Mycelium today via the existing esbuild-based
 TS pipeline pattern, and gets full JS-ecosystem access plus every other language Mycelium
 supports.
+
+**Note**: Potentially more tractable than FFI work, but NOT as simple as just wiring in a
+compiler command — significant design decisions pending around: module resolution semantics
+per language, source-map fidelity for cross-language debugging, error attribution, and
+per-language build-cache strategies. **Mark as needing design discussion before implementation.**
+
 - TypeScript — **done**.
 - CoffeeScript, Civet — planned.
 - ReScript, ReasonML — planned.
@@ -163,6 +173,30 @@ Direct Truffle support, no compile step.
 - Python — **blocked upstream** (see Medium term).
 - R (FastR) — GraalVM project exists, not yet integrated.
 - Espresso (Java-on-Truffle) — run Java as a guest language; not yet integrated.
+
+### Native addon / FFI support
+Enables calling native compiled code (C, C++, Rust) from polyglot contexts. Currently blocks
+packages like `sharp` (image processing) and `bcrypt` (native binding) from working — 27 of 28
+npm acid-test packages would pass if this were available.
+
+- **N-API compatibility layer** — **LOW PRIORITY**. ~400 API functions, massive effort. Both
+  Bun and Node are reference implementations, but N-API's sprawling scope (covering errno
+  handling, UTF-8 validation, native object wrapping, async job queues, etc.) makes this a
+  major undertaking. Before pursuing this, strongly consider WASM alternatives for most
+  use-cases (WASM FFI is safer and more portable).
+
+- **Bun FFI** (`bun:ffi`) — **medium priority**, potentially lower effort than N-API. Bun's FFI
+  API is more purposeful and smaller in scope — it provides a direct wrapper around dlopen/dlsym
+  semantics without the overhead of Node's object-wrapping machinery. Has working reference
+  implementation in Bun's source.
+
+- **Deno FFI** (`Deno.dlopen`) — **medium priority**, potentially lower effort than N-API.
+  Deno's FFI is similarly focused and well-scoped. Working reference implementation available
+  in Deno's source code.
+
+**Strategic framing**: Deferred beyond short-term roadmap because (1) WASM is preferred for
+new libraries, (2) most high-value npm packages that truly require native code are rare, and
+(3) N-API's surface area suggests tackling either Bun or Deno FFI first as a proof of concept.
 
 ### Distribution
 - Nix flake — **current**, but flake-only is explicitly considered unacceptable as the sole

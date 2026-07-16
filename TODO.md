@@ -1,6 +1,21 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-17 (session handoff #2: the daemon architecture scoped as an open thread
+*Updated 2026-07-17 (session handoff #3: Node stdlib completion. `dgram` and `cluster` — the
+last two modules with no implementation at all — are now implemented, closing that gap. 14
+niche/deprecated modules landed: `constants`, `domain`, `punycode`, `sys`, `repl`,
+`trace_events`, `v8`, `wasi`, `inspector`, `inspector/promises`, `node:test`,
+`node:test/reporters`, `node:sea`, `node:sqlite`. `NodeParityTest.kt`'s `MODULES` list — flagged
+as behind the implemented-module set in the previous handoff — now covers the full set (52
+dynamic parity tests), closing the test-coverage gap. Total module count: 50+ (up from ~30).
+Scala.js auto-download landed via a `GitHubRelease` `ToolSource` for scala-cli (same pattern as
+Gleam/Dart), which required `ToolResolver` to learn a new archive shape — a bare `.gz`-compressed
+binary, not wrapped in a tarball — since that's scala-cli's own release-asset convention. As of
+this update, stream/path submodules (`stream/promises`, `stream/consumers`, `stream/web`,
+`path/posix`, `path/win32`), a real `console` module, and a fix for the
+`readline`/`readline-promises` circular-import issue are **in flight, not yet confirmed
+landed/committed** — verify in-tree before treating as done. See "Open threads" at the end for
+full detail on all of the above. Previous handoff (session handoff #2: the daemon architecture
+scoped as an open thread
 earlier in the 2026-07-17 session is now fully implemented — Unix socket server, shared
 `Engine` across requests, per-request cwd/env/flags isolation, auto-start with config
 opt-out, 1h idle timeout, G1-tuned GC flags, XDG config with project-local override. The
@@ -299,18 +314,30 @@ All round 4 findings are cataloged as tests in `NpmCompatibilityTest.kt` (9 pass
 **Full acid-test tally across all 4 rounds: 27/28 (96%).** Only `sharp` fails, and only for
 the fundamental native-addon reason above.
 
-### Known npm/stdlib gaps remaining (small, none blocking a cataloged package)
-1. `dgram`, `cluster` core modules — not implemented (no cataloged package has hit these yet).
-2. `NodeParityTest.kt`'s `MODULES` list hasn't been extended to include `dns`,
-   `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types` — all
-   exist and work, just lack parity-harness coverage (test-coverage gap only).
-3. Console output could be improved beyond GraalJS's defaults (unchanged from earlier notes).
+### Known npm/stdlib gaps remaining — dgram/cluster and the parity-list gap both RESOLVED this session
+1. `dgram`, `cluster` core modules — **implemented this session**
+   (`library/src/main/resources/node-stdlib/dgram.mjs`, `cluster.mjs`); no longer missing.
+2. `NodeParityTest.kt`'s `MODULES` list — **extended this session** to include `dns`,
+   `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types`, `dgram`,
+   `cluster`, and all 14 niche/deprecated modules below (52 dynamic parity tests total). No
+   longer a test-coverage gap.
+3. Console output could be improved beyond GraalJS's defaults — a real `console` module is
+   in flight (see "Open threads" below) but not yet confirmed landed as of this update; deeper
+   formatting fidelity beyond module-surface parity remains open regardless.
 
-### Missing Node stdlib modules
-Only `dgram` and `cluster` remain unimplemented. Everything else previously tracked here —
-`net`, `dns`, `util/types`, `child_process`, `tty`, `diagnostics_channel`, `async_hooks`,
-`fs/promises`, `worker_threads`, `readline`, `module`, `perf_hooks`, `timers` — is now
-implemented (~30 core modules total; see `library/src/main/resources/node-stdlib/*.mjs`).
+### Missing Node stdlib modules — NONE remain unimplemented (this session)
+`dgram` and `cluster` — the last two modules with no implementation at all — are now
+implemented, closing that gap entirely. Everything previously tracked here — `net`, `dns`,
+`util/types`, `child_process`, `tty`, `diagnostics_channel`, `async_hooks`, `fs/promises`,
+`worker_threads`, `readline`, `module`, `perf_hooks`, `timers` — was already implemented.
+**Also landed this session**: 14 niche/deprecated modules previously not tracked at all —
+`constants`, `domain`, `punycode`, `sys`, `repl`, `trace_events`, `v8`, `wasi`, `inspector`,
+`inspector/promises`, `node:test`, `node:test/reporters`, `node:sea`, `node:sqlite`. Total:
+50+ core modules (up from ~30; see `library/src/main/resources/node-stdlib/*.mjs`).
+
+**In flight, not yet confirmed committed as of this update**: `stream/promises`,
+`stream/consumers`, `stream/web`, `path/posix`, `path/win32` submodules and a real `console`
+module — see "Open threads" below.
 
 ## Language support status
 
@@ -439,11 +466,32 @@ standalone LLVM-bitcode/WASM unit (`Compiler.compile`), with no dependency-graph
 multi-unit linking step at all — there's no compile-time seam an auto-fetched crate/module's
 compiled output could plug into today without that linking architecture existing first.
 
-### Scala.js auto-download — no download `ToolSource` yet
-Scala.js currently resolves via `SystemPath` only (must already be on the user's PATH via
-scala-cli/sbt). Unlike Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`), there's no
-download-based `ToolSource` wired up for it yet. Coursier or GitHub releases might work as the
-download source — natural next step, following the same pattern those two used.
+### Scala.js auto-download — RESOLVED this session
+A `GitHubRelease` `ToolSource` for scala-cli is now wired into Scala.js's `ToolSource` chain in
+`CompilerRegistry.kt` (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload` →
+`GitHubRelease`), the same pattern Gleam and Dart already used. This required extending
+`ToolResolver` with `extractPlainGzip` — scala-cli's own GitHub release assets (e.g.
+`scala-cli-x86_64-pc-linux-static.gz`) are a bare gzip-compressed binary, not a `.tar.gz`/`.tgz`
+tarball the way Gleam's release assets are, so the existing tar-extraction path in `ToolResolver`
+didn't cover this shape and needed a distinct code path. `scalaCliReleaseAssetName` in
+`CompilerRegistry.kt` maps this JVM's OS/arch to the exact asset name scala-cli's release
+workflow publishes (verified against the real GitHub release asset list), with Windows using
+`.zip` instead. `scala-cli version --offline` is used to validate the resolved binary's version
+against a project's own constraint, same as every other `ToolResolver`-mediated tool.
+
+### Stream/path submodules + console module, and the readline circular-import fix — IN FLIGHT
+As of this update: `stream/promises`, `stream/consumers`, `stream/web` (stream submodules),
+`path/posix`, `path/win32` (path submodules), and a real `console` module (not just relying on
+GraalJS's built-in console) were being added, alongside a fix for a `readline`/
+`readline-promises` circular-import issue (GraalJS, like V8, fails to evaluate a module cycle
+where a binding is imported before it's initialized — same class of bug the earlier
+`node:`-vs-bare-specifier dual-cache issue was adjacent to, but a distinct root cause here:
+`readline-promises.mjs` was trying to subclass `Interface` from `readline.mjs` while
+`readline.mjs` imported back from `readline-promises.mjs` to expose `readline.promises`).
+**Status as of this doc update: in progress, not confirmed landed or committed.** Verify by
+checking for `stream-promises.mjs`/`stream-consumers.mjs`/`stream-web.mjs`/`path-posix.mjs`/
+`path-win32.mjs`/`console.mjs` under `library/src/main/resources/node-stdlib/`, and whether
+`git status` shows them committed vs. still untracked/modified, before treating this as done.
 
 ### Fable (F# → JS) — closest remaining compile-to-JS candidate, still blocked
 `@fable-org/fable-compiler-js` needs no .NET runtime, but its npm `bin` is a plain JS file that

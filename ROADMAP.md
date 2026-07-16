@@ -1,6 +1,20 @@
 # Mycelium Roadmap
 
-*Last updated 2026-07-17 (session #2: the daemon architecture — the previous update's "open
+*Last updated 2026-07-17 (session #3: Node stdlib now effectively complete — `dgram` and
+`cluster` implemented (the only two modules previously missing entirely), 14
+niche/deprecated modules added (`constants`, `domain`, `punycode`, `sys`, `repl`,
+`trace_events`, `v8`, `wasi`, `inspector`, `inspector/promises`, `node:test`,
+`node:test/reporters`, `node:sea`, `node:sqlite`), and `NodeParityTest.kt`'s `MODULES` list
+extended to cover every implemented module (52 dynamic parity tests) — closing the
+test-coverage gap flagged in the previous session. Module count is now 50+ (up from ~30).
+Scala.js auto-download landed via a `GitHubRelease` `ToolSource` for scala-cli, which
+required teaching `ToolResolver` to extract a bare `.gz`-compressed binary (scala-cli's own
+release-asset convention, unlike Gleam's `.tar.gz`) — closes the "Scala.js auto-download"
+open thread from the previous session. Stream/path submodules (`stream/promises`,
+`stream/consumers`, `stream/web`, `path/posix`, `path/win32`) plus a real `console` module,
+and a fix for the `readline`/`readline-promises` circular-import issue, were in flight as
+this update was written — see "Open threads" below for current status. Previous update
+(session #2: the daemon architecture — the previous update's "open
 follow-on question" — is now DONE, not just scoped: Unix socket server, shared `Engine` with
 per-request `Context` cwd/env isolation, auto-start with config opt-out, 1h idle timeout,
 G1-tuned GC flags applied at launch, XDG config with project-local override. The
@@ -28,24 +42,29 @@ one shared GraalVM polyglot `Context`.
 
 ## Now (in progress)
 
-### Node stdlib completion
+### Node stdlib completion — effectively DONE this session
 Implemented as synthetic core modules backed by Java interop, cross-referencing Node/Deno/Bun
-source for exact semantics (mirror Node 1:1, not approximate). **~30 modules implemented**,
-with `NodeParityTest.kt` harness verifying export-by-export parity against a real Node binary.
+source for exact semantics (mirror Node 1:1, not approximate). **50+ modules implemented**
+(up from ~30), with `NodeParityTest.kt` harness verifying export-by-export parity against a
+real Node binary, and its `MODULES` list now covering the full implemented set (52 dynamic
+parity tests).
 
 - **Done / has parity coverage** (`NodeParityTest.kt`'s `MODULES` list, diffed against a real
   `node` binary export-by-export): `assert`, `buffer`, `child_process`, `crypto`, `events`,
   `fs`, `http`, `http2`, `https`, `net`, `os`, `path`, `process`, `querystring`, `stream`,
-  `string_decoder`, `tls`, `tty`, `url`, `util`, `zlib`.
-- **Implemented but not yet in the parity list**: `fs/promises` (as `fs-promises.mjs`),
-  `diagnostics_channel` (real pub/sub, not a stub), `async_hooks` (synchronous-only
-  `AsyncLocalStorage`, inert `createHook`/`AsyncResource`), `dns`/`dns/promises`,
-  `worker_threads`, `readline`/`readline/promises`, `node:module` (`builtinModules` etc.),
-  `perf_hooks`, `timers`/`timers/promises`, `util/types` (subpath of `util`). All landed
-  during round-3/round-4 npm acid-test gap-filling (see below) — `NodeParityTest.kt`'s
-  `MODULES` list (`library/src/test/kotlin/org/mycelium/library/NodeParityTest.kt`) simply
-  hasn't been extended to cover them yet, a follow-up task, not a functionality gap.
-- **Missing entirely**: `dgram`, `cluster`.
+  `string_decoder`, `tls`, `tty`, `url`, `util`, `zlib`, `dns`, `dns/promises`,
+  `worker_threads`, `readline`, `readline/promises`, `node:module`, `perf_hooks`, `timers`,
+  `timers/promises`, `util/types`, `dgram`, `cluster`, `constants`, `domain`, `punycode`,
+  `sys`, `repl`, `trace_events`, `v8`, `wasi`, `inspector`, `inspector/promises`, `node:test`,
+  `node:test/reporters`, `node:sea`, `node:sqlite`. Landed this session and the previous one
+  (round-3/round-4 npm acid-test gap-filling, then a dedicated stdlib-completion pass) —
+  `NodeParityTest.kt`'s `MODULES` list (`library/src/test/kotlin/org/mycelium/library/NodeParityTest.kt`)
+  now tracks the implemented set 1:1, closing what was previously a follow-up test-coverage gap.
+- **In flight as of this update, not yet landed**: `stream/promises`, `stream/consumers`,
+  `stream/web`, `path/posix`, `path/win32`, and a real `console` module, plus a fix for the
+  `readline`/`readline-promises` circular-import issue — see "Open threads" below.
+- **Nothing left missing entirely** — `dgram` and `cluster` (the last two modules with no
+  implementation at all) both landed this session.
 - Parity testing is deliberately not pass/fail per missing export — it's a gap-finding
   signal (`--info` output), not a gate. Hard failure is reserved for "module doesn't load in
   Mycelium at all but loads in Node" or a genuine behavioral mismatch.
@@ -162,18 +181,19 @@ following — all pure Kotlin, talking directly to each registry's HTTP API
 
 *Everything that was listed here as of the last update (extensionless `main`, `tty`, nested
 conditional exports, chalk regression, `node:module`/`worker_threads`/`readline`/global
-`URL`, Round 3 and Round 4 acid tests) has since been fixed — see "npm acid testing" above.
-Only genuinely open items remain below.*
+`URL`, Round 3 and Round 4 acid tests, the two missing modules `dgram`/`cluster`, the 14
+niche/deprecated modules, and the `NodeParityTest.kt` coverage gap) has since been fixed —
+see "npm acid testing" and "Node stdlib completion" above. Only genuinely open items remain
+below.*
 
-- **Remaining Node stdlib modules**: `dgram`, `cluster`. Console output improvements beyond
-  GraalJS's defaults.
+- **In-flight, not yet landed**: stream/path submodules (`stream/promises`,
+  `stream/consumers`, `stream/web`, `path/posix`, `path/win32`), a real `console` module, and
+  a fix for the `readline`/`readline-promises` circular-import issue.
+- Console output improvements beyond GraalJS's defaults (the `console` module above covers
+  the module-surface gap; deeper formatting fidelity is still open).
 - **`node:fs/promises` as first-class**, not a re-export shim over `fs`.
 - **`http.Agent` / `http.globalAgent`** — implemented (round 4 work); revisit only if a
   future package surfaces a gap in it.
-- **`NodeParityTest.kt`'s `MODULES` list is behind the actual implemented-module set** —
-  `dns`, `worker_threads`, `readline`, `node:module`, `perf_hooks`, `timers`, `util/types`
-  all exist as `.mjs` files but aren't yet in the parity harness's `MODULES` list. Purely a
-  test-coverage gap, not a functionality gap.
 - **Parity test hardening**: edge cases, behavioral fuzzing (today's parity test mostly
   diffs *export surface*, not deep behavior).
 - **Round 5 acid test**: webpack, prisma, next.js loader-class tooling — a deliberate
@@ -532,9 +552,14 @@ new libraries, (2) most high-value npm packages that truly require native code a
    `TinyGoSupport` each compile a single source file straight to one standalone unit with no
    multi-unit/dependency linking, so there's no seam an auto-fetched crate/module's compiled
    output could plug into today. Architecture gap, not a registry-client gap.
-5. **Scala.js auto-download** — resolved via `SystemPath` only right now; no download
-   `ToolSource` (no GitHub-release or SDK-download equivalent wired up) for Scala.js yet, unlike
-   Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`).
+5. **Scala.js auto-download — RESOLVED this session.** A `GitHubRelease` `ToolSource` for
+   scala-cli is now wired into Scala.js's `ToolSource` chain
+   (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload` → `GitHubRelease`),
+   matching the pattern Gleam and Dart already used. Required teaching `ToolResolver`
+   (`extractPlainGzip`) to handle a bare `.gz`-compressed binary as a distinct archive shape
+   from `.tar.gz`/`.tgz` — scala-cli's own GitHub release assets (e.g.
+   `scala-cli-x86_64-pc-linux-static.gz`) are the raw binary gzip'd directly, not wrapped in a
+   tarball the way Gleam's release assets are.
 6. **Fable (F# → JS)** — the closest remaining compile-to-JS candidate, still blocked because
    `@fable-org/fable-compiler-js`'s npm `bin` only runs via its own `#!/usr/bin/env node`
    shebang, requiring a real external Node install (the one thing every other compile-to-JS
@@ -544,6 +569,14 @@ new libraries, (2) most high-value npm packages that truly require native code a
    (`kotlinc-js`), but since Mycelium is itself a Kotlin/JVM application, it may be possible to
    invoke the Kotlin/JS compiler as an in-process library call instead of shelling out, saving
    process-spawn overhead per compile.
+8. **Stream/path submodules + console, and the readline circular-import fix — IN FLIGHT, not
+   yet landed as of this update.** `stream/promises`, `stream/consumers`, `stream/web`,
+   `path/posix`, `path/win32`, and a real `console` module were being added, and a fix for a
+   `readline`/`readline-promises` circular-import issue was in progress, at the time this doc
+   was last refreshed. Verify current status in-tree before relying on this as done or not
+   done — check for `stream-promises.mjs`/`stream-consumers.mjs`/`stream-web.mjs`/
+   `path-posix.mjs`/`path-win32.mjs`/`console.mjs` under
+   `library/src/main/resources/node-stdlib/` and whether they're committed.
 
 ## Open design questions
 

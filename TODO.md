@@ -253,116 +253,41 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 
 ## Open threads
 
-*The three items below were written when auto-install, pip/gem resolution, and the CLI
-binary didn't exist yet. All three have since shipped — descriptions updated to reflect
-what actually landed and what's still genuinely open (see ROADMAP.md's "Open design
-questions" for the longer-term unresolved angle on each).*
+*Open threads from a previous session. Treat as starting context, not instructions — verify
+relevance before acting.*
 
-### Package manager auto-install — landed (both eager and declarative), now pure-Kotlin-first
-Both options from the original open question shipped, not just one: **`--yolo`** does eager
-auto-install (installs on first missing bare specifier), and **manifest-based install** runs
-when a `package.json` with dependencies is found but `node_modules` isn't (suppressible with
-`--no-install`, e.g. for offline use or when the user manages `node_modules` themselves). npm
-bare-specifier resolution against an existing `node_modules` was already implemented and
-still works as before.
-
-Since then, both paths were rebuilt on top of `PackageInstaller` (pure Kotlin,
-`NpmRegistryClient` + `PackageCache`, no subprocess) as the primary path, falling back to
-shelling out to `npm install`/`pnpm install` only if that fails. `PackageInstaller` and
-`CompilerDownloader` now resolve real semver ranges (`^`/`~`/x-ranges/hyphen ranges/`||`/
-comparators) via `SemverResolver` against the registry's actual published versions, rather
-than falling back to "latest" — see `SemverResolver.kt`. So
-neither `--yolo` nor manifest-based install actually requires npm/pnpm on PATH anymore in the
-common case — `MyceliumIntegrationTest.kt`'s `yoloAutoInstallsMissingPackage` and
-`manifestInstallRunsNpmInstall` had this session's stale `assumeTrue(isCommandAvailable
-("npm"))` gate removed accordingly (both still need real network access to the npm registry,
-just not the npm binary itself).
-
-### pip / gem resolution — landed, including fetching (not just $LOAD_PATH/site-packages walk)
-Resolution for Python (site-packages) and Ruby (gem) packages is implemented, alongside the
-pre-existing npm resolution. Resolution order tries the host language's own ecosystem first,
-falling back to others. Python resolution is implemented but can't be exercised end-to-end
-in practice because of the GraalPython upstream bug (see "Python support" above) — the
-resolver itself is not what's blocked.
-
-Beyond the static walk, `--yolo` auto-install now covers Ruby/Python too, not just npm:
-`RubyGemsClient`/`PyPIClient` (pure-Kotlin `PackageIndex` implementations, mirroring
-`NpmRegistryClient`) are constructed in `Mycelium`'s composition root, each paired with its own
-`PackageInstaller`, and threaded into `InterceptingFileSystem` (`rubyGemsInstaller`/
-`pyPIInstaller` constructor params). A bare `require`/`import` that can't be resolved against
-`$LOAD_PATH`/`sys.path` (real or previously auto-installed) now fetches the gem/package from
-RubyGems/PyPI (`yoloInstallRubyGem`/`yoloInstallPyPIPackage`) into a project-local vendor
-directory (`.mycelium-vendor/gems/<name>` / `.mycelium-vendor/pypi/<name>`) and retries —
-`RubyModuleResolver`/`PythonModuleResolver` each gained a `vendorSearchPaths` list (consulted
-ahead of the real `$LOAD_PATH`/`sys.path`) and a `registerInstalledGem`/`registerInstalledPackage`
-method to register a freshly-installed package's actual importable directory (handling both a
-flat and a "src layout" sdist for Python; a gem's `lib/` convention for Ruby). No
-gem-install/pip-install subprocess fallback exists (unlike npm's yolo, which falls back to
-`npm install`/`pnpm install`) — there's no equivalent portable CLI story to shell out to, so a
-failed install just surfaces as the pre-existing "cannot find module" error.
-
-`PackageCache` gained real support for the archive shapes these ecosystems actually use beyond
-npm's `.tgz` — PyPI sdist `.tar.gz` (top-level-dir-stripped gzip tar, same as npm), a PyPI wheel
-`.whl` (flat ZIP, no stripping), a RubyGems `.gem` (an *outer* uncompressed tar wrapping an inner
-`data.tar.gz`, unwrapped via a new `extractGem`), and (support built, not yet exercised by an
-automatic resolver — see below) a Go module `.zip` (top-level-dir-stripped ZIP).
-
-`CratesIoClient`/`GoProxyClient` are constructed in `Mycelium`'s composition root
-(`cratesIoClient`/`cratesIoInstaller`, `goProxyClient`/`goProxyInstaller`) and fully able to
-resolve/download, but **not yet consulted by any automatic bare-specifier resolution** —
-`RustSupport`/`TinyGoSupport` compile a single source file straight to one standalone
-LLVM-bitcode/WASM unit (`Compiler.compile`) with no dependency-graph resolution or multi-unit
-linking step at all yet, so there's no compile-time seam an auto-fetched crate/module's
-compiled output could wire into today without that architecture existing first. That
-architecture gap — not the registry client — is what's actually blocking Rust/Go auto-install.
-
-### Distribution form — CLI binary works, weight still an open question
-`native-image` now produces a working standalone `mycelium` binary (~887MB, RAM-capped at
-build time via `-J-Xmx8g`) and `installDist` produces a ~709MB JRE-dependent alternative —
-both work via `./gradlew :app:installDist` / `:app:nativeCompile`, not just `:app:run`. The
-genuinely open question, tracked in ROADMAP.md's "Distribution" and "Open design questions"
-sections, is whether GraalVM's ~700-900MB footprint is acceptable long-term or worth
-trimming — and a substantial redesign direction was scoped this session (not yet
-implemented): don't bundle *any* Truffle language runtime or compiler in the core binary;
-fetch and cache them on demand per-language, JVM-mode only (native-image can't dynamically
-load Truffle languages post-build — see ROADMAP.md's "Distribution Architecture" section for
-the full native-image-vs-JVM tradeoff writeup).
-
-### Distribution architecture — THE big open decision for next session
+### Distribution architecture — the central unresolved question
 Current state: native-image on GraalVM CE, ~887MB binary, ~10ms startup, but slower peak
-throughput than the alternatives below. Key insight surfaced this session: **Oracle GraalVM
-(not just CE) is free to use under the GFTC license**, and is reported ~1.55x faster than CE
-at peak performance — this reopens native-image as a serious option if throughput was the
-main reason to lean toward JVM mode. Two directions to investigate next:
-1. **GraalVM native-image with runtime JIT compilation** (an experimental native-image
-   feature) — would give a V8-like model in a single native binary: fast (~10ms) startup *and*
-   JIT-quality peak performance, rather than forcing a choice between the two. V8 and LuaJIT
-   both achieve fast-startup-plus-peak-perf trivially; GraalVM should in principle be able to
-   match this, and this is the concrete mechanism to test.
-2. **Oracle GraalVM in JDK mode with dynamic Truffle-language loading** — smaller binary
-   (languages loaded as JARs on demand instead of baked in AOT), best peak performance of the
-   options considered, but JVM-class startup (~4-5s observed — needs re-measurement against a
-   properly warmed/tuned JVM cold start).
-
-Nothing here is benchmarked yet — binary size, startup time, peak throughput, and GFTC license
+throughput than the alternatives below. Oracle GraalVM (not just CE) is free to use under the
+GFTC license and is reported ~1.55x faster than CE at peak performance — this reopens
+native-image as a serious option if throughput was the main reason to lean toward JVM mode.
+The real question: can GraalVM native-image with runtime JIT compilation (an experimental
+native-image feature) give V8-like behavior — fast startup *and* JIT-quality peak
+performance — in a single binary, rather than forcing a choice between the two? V8 and LuaJIT
+both achieve fast-startup-plus-peak-perf trivially; GraalVM should in principle be able to
+match this, and this is the concrete mechanism to test. If it works, it would solve
+everything. Alternative fallback: Oracle GraalVM in JDK mode with dynamic Truffle-language
+loading — smaller binary, best peak performance of the options considered, but ~4-5s startup
+(unconfirmed, needs re-measurement against a properly warmed/tuned JVM cold start). Nothing
+here is benchmarked yet — binary size, startup time, peak throughput, and GFTC license
 compatibility with Mycelium's own distribution model all need real numbers before picking a
-lane. See ROADMAP.md's "Distribution Architecture" and "Open threads" sections for the
-longer writeup.
+lane. See ROADMAP.md's "Distribution Architecture" section for the longer writeup.
 
-### Rust/Go auto-install — architecture gap, not a registry-client gap
+### Rust/Go auto-install gap — architecture gap, not a registry-client gap
 `CratesIoClient`/`GoProxyClient` (pure-Kotlin `PackageIndex` implementations, same shape as
-the npm/RubyGems/PyPI clients) are constructed and fully able to resolve/download, but neither
-is consulted by any automatic bare-specifier resolution yet. The actual blocker:
-`RustSupport`/`TinyGoSupport` each compile a single source file straight to one standalone
-LLVM-bitcode/WASM unit (`Compiler.compile`), with no dependency-graph resolution or multi-unit
-linking step at all — there's no compile-time seam an auto-fetched crate/module's compiled
-output could plug into today without that linking architecture existing first.
+the npm/RubyGems/PyPI clients) exist and are fully able to resolve/download, but neither is
+consulted by any automatic bare-specifier resolution yet. Fetching crates/Go modules is easy;
+the hard part is integrating their compiled output into Mycelium's LLVM bitcode/WASM
+pipeline: `RustSupport`/`TinyGoSupport` each compile a single source file straight to one
+standalone LLVM-bitcode/WASM unit (`Compiler.compile`), with no dependency-graph resolution or
+multi-unit linking step at all — there's no compile-time seam an auto-fetched crate/module's
+compiled output could plug into today without that linking architecture existing first.
 
 ### Scala.js auto-download — no download `ToolSource` yet
 Scala.js currently resolves via `SystemPath` only (must already be on the user's PATH via
 scala-cli/sbt). Unlike Gleam (`GitHubRelease`) or Dart (`DartSdkDownload`), there's no
-download-based `ToolSource` wired up for it yet — the natural next step, following the same
-pattern those two used.
+download-based `ToolSource` wired up for it yet. Coursier or GitHub releases might work as the
+download source — natural next step, following the same pattern those two used.
 
 ### Fable (F# → JS) — closest remaining compile-to-JS candidate, still blocked
 `@fable-org/fable-compiler-js` needs no .NET runtime, but its npm `bin` is a plain JS file that
@@ -375,7 +300,7 @@ binary.
 Currently invoked as a `SUBPROCESS` backend (`kotlinc-js`). Since Mycelium is itself a
 Kotlin/JVM application, it may be possible to invoke the Kotlin/JS compiler in-process as a
 library call instead of shelling out to a separate `kotlinc-js` process — would save
-process-spawn overhead on every compile. Not yet investigated in depth.
+process-spawn overhead on every compile. Unexplored.
 
 ## User preferences (for future sessions)
 

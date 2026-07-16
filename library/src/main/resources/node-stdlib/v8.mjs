@@ -72,17 +72,34 @@ export function stopCoverage() {
     // no-op
 }
 
+// Real Node's `v8.serialize`/`Serializer`/`Deserializer` use V8's structured-clone wire
+// format (handles Maps, Sets, typed arrays, circular refs, Dates, RegExps, etc., and the
+// resulting bytes are NOT JSON — they carry a distinct binary tag/version header). Mycelium
+// runs on GraalJS/the JVM, not V8, so there is no real V8 serializer to call into. An
+// earlier version of this file silently substituted `JSON.stringify`/`JSON.parse`, which
+// LOOKS like it works for plain-object test cases but silently corrupts (or outright drops)
+// anything JSON can't represent — Maps, Sets, circular references, Dates (turned into
+// strings, not revived), undefined values, etc. That's worse than an error: code round-
+// tripping a Map through `v8.serialize`/`deserialize` would silently get `{}` back with no
+// indication anything went wrong. Throwing here is the honest behavior until a real
+// structured-clone-compatible implementation exists.
+const V8_SERIALIZE_UNSUPPORTED_MESSAGE =
+    "mycelium: v8.serialize()/deserialize() are not supported — Mycelium runs on GraalJS, " +
+    "not V8, so there is no V8 structured-clone wire format to produce/consume here. An " +
+    "earlier version silently substituted JSON.stringify/JSON.parse, which corrupts Maps, " +
+    "Sets, circular references, Dates, and other non-JSON-representable values without any " +
+    "indication of data loss; throwing instead of silently corrupting data.";
+
 export class Serializer {
     constructor() {
         this._chunks = [];
     }
     writeHeader() {}
     writeValue(value) {
-        this._chunks.push(value);
-        return true;
+        throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
     }
     releaseBuffer() {
-        return new Uint8Array(0);
+        throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
     }
 }
 
@@ -91,10 +108,10 @@ export class Deserializer {
         this._buffer = buffer;
     }
     readHeader() {
-        return true;
+        throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
     }
     readValue() {
-        return undefined;
+        throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
     }
 }
 
@@ -102,19 +119,11 @@ export class DefaultSerializer extends Serializer {}
 export class DefaultDeserializer extends Deserializer {}
 
 export function serialize(value) {
-    // Real Node uses V8's structured-clone wire format. Approximated here via JSON, which
-    // is enough for simple JSON-shaped values but doesn't round-trip everything V8's
-    // serializer supports (Maps, Sets, circular refs, etc.).
-    const json = JSON.stringify(value);
-    const bytes = new Uint8Array(json.length);
-    for (let i = 0; i < json.length; i++) bytes[i] = json.charCodeAt(i) & 0xff;
-    return bytes;
+    throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
 }
 
 export function deserialize(buffer) {
-    let str = "";
-    for (let i = 0; i < buffer.length; i++) str += String.fromCharCode(buffer[i]);
-    return JSON.parse(str);
+    throw new Error(V8_SERIALIZE_UNSUPPORTED_MESSAGE);
 }
 
 export const promiseHooks = {

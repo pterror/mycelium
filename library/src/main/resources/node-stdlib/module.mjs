@@ -45,11 +45,11 @@ export function createRequire(filename) {
         return globalThis.__mycelium_require__(specifier, fromDir);
     }
     requireFn.resolve = function resolve(specifier) {
-        // No standalone path-resolution entry point is exposed by the require bridge —
-        // approximated by returning the specifier unchanged (a reasonable fallback for
-        // bare/core specifiers, though real file resolution to an absolute path isn't
-        // performed here).
-        return specifier;
+        // Backed by the same resolution logic `__mycelium_require__` itself uses (relative
+        // paths, core modules, node_modules walk) via the `__mycelium_require_resolve__`
+        // bridge (see CjsRuntime.resolveRequireSpecifier) — returns the resolved path/
+        // specifier without evaluating the module, matching Node's own `require.resolve`.
+        return globalThis.__mycelium_require_resolve__(specifier, fromDir);
     };
     requireFn.cache = Object.create(null);
     requireFn.extensions = Object.create(null);
@@ -76,8 +76,11 @@ export class Module {
         return globalThis.__mycelium_require__(specifier, ".");
     }
 
-    static _resolveFilename(request) {
-        return request;
+    static _resolveFilename(request, parent) {
+        const fromDir = parent && parent.filename
+            ? parent.filename.slice(0, Math.max(parent.filename.lastIndexOf("/"), 0)) || "."
+            : ".";
+        return globalThis.__mycelium_require_resolve__(request, fromDir);
     }
 
     static _cache = Object.create(null);

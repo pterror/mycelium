@@ -459,13 +459,24 @@ export function fileURLToPath(url) {
     return String(new JFile(uri).getPath());
 }
 
+const JIDN = Java.type("java.net.IDN");
+
 export function domainToASCII(domain) {
-    // No IDNA implementation bundled; return input unchanged for ASCII-only domains.
-    return String(domain);
+    try {
+        return String(JIDN.toASCII(String(domain)));
+    } catch (e) {
+        // Real Node's domainToASCII returns an empty string for an invalid domain rather
+        // than throwing.
+        return "";
+    }
 }
 
 export function domainToUnicode(domain) {
-    return String(domain);
+    try {
+        return String(JIDN.toUnicode(String(domain)));
+    } catch (e) {
+        return "";
+    }
 }
 
 export default {

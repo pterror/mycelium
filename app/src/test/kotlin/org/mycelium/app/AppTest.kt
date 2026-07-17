@@ -35,6 +35,7 @@ class AppTest {
         val parsed = parseArgs(arrayOf())
         assertFalse(parsed.yolo)
         assertFalse(parsed.noInstall)
+        assertFalse(parsed.operatorOverloading)
         assertTrue(parsed.rest.isEmpty())
     }
 
@@ -59,6 +60,37 @@ class AppTest {
         val parsed = parseArgs(arrayOf("--yolo", "--no-install", "file.mjs"))
         assertTrue(parsed.yolo)
         assertTrue(parsed.noInstall)
+        assertEquals(listOf("file.mjs"), parsed.rest)
+    }
+
+    @Test fun operatorOverloadingFlagBeforeCommand() {
+        val parsed = parseArgs(arrayOf("--operator-overloading", "run", "file.mjs"))
+        assertTrue(parsed.operatorOverloading)
+        assertEquals(listOf("run", "file.mjs"), parsed.rest)
+    }
+
+    @Test fun operatorOverloadingFlagAfterRunCommand() {
+        val parsed = parseArgs(arrayOf("run", "--operator-overloading", "file.mjs"))
+        assertTrue(parsed.operatorOverloading)
+        assertEquals(listOf("run", "file.mjs"), parsed.rest)
+    }
+
+    @Test fun operatorOverloadingFlagWithImplicitRun() {
+        val parsed = parseArgs(arrayOf("--operator-overloading", "file.mjs"))
+        assertTrue(parsed.operatorOverloading)
+        assertEquals(listOf("file.mjs"), parsed.rest)
+    }
+
+    @Test fun operatorOverloadingFlagDefaultsToFalse() {
+        val parsed = parseArgs(arrayOf("run", "file.mjs"))
+        assertFalse(parsed.operatorOverloading)
+    }
+
+    @Test fun allFlagsCanCombine() {
+        val parsed = parseArgs(arrayOf("--yolo", "--no-install", "--operator-overloading", "file.mjs"))
+        assertTrue(parsed.yolo)
+        assertTrue(parsed.noInstall)
+        assertTrue(parsed.operatorOverloading)
         assertEquals(listOf("file.mjs"), parsed.rest)
     }
 }

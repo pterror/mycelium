@@ -56,13 +56,14 @@ object DaemonClient {
         env: Map<String, String> = System.getenv(),
         yolo: Boolean = false,
         noInstall: Boolean = false,
+        operatorOverloading: Boolean = false,
         stdout: OutputStream = System.out,
         stderr: OutputStream = System.err,
     ): Int? {
         connect(socketPath).use { channel ->
             val input = Channels.newInputStream(channel)
             val output = Channels.newOutputStream(channel)
-            val requestJson = DaemonRequest.Run(file, args, cwd, env, yolo, noInstall).toJson()
+            val requestJson = DaemonRequest.Run(file, args, cwd, env, yolo, noInstall, operatorOverloading).toJson()
                 .put("version", VERSION)
             FrameIO.writeFrame(output, requestJson)
             while (true) {

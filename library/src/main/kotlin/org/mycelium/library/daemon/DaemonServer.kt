@@ -222,6 +222,7 @@ class DaemonServer(
                 env = request.env.takeIf { it.isNotEmpty() },
                 yolo = request.yolo,
                 autoInstall = !request.noInstall,
+                operatorOverloading = request.operatorOverloading,
             )
             vm.runFile(request.file)
         } catch (e: ProcessExitException) {

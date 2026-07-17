@@ -30,6 +30,7 @@ internal data class ParsedArgs(
     val yolo: Boolean,
     val noInstall: Boolean,
     val insightScript: String?,
+    val operatorOverloading: Boolean,
     val rest: List<String>,
 )
 
@@ -37,8 +38,9 @@ internal fun parseArgs(args: Array<String>): ParsedArgs {
     val yolo = args.contains("--yolo")
     val noInstall = args.contains("--no-install")
     val insightScript = args.firstOrNull { it.startsWith("--insight=") }?.removePrefix("--insight=")
-    val rest = args.filterNot { it == "--yolo" || it == "--no-install" || it.startsWith("--insight=") }
-    return ParsedArgs(yolo, noInstall, insightScript, rest)
+    val operatorOverloading = args.contains("--operator-overloading")
+    val rest = args.filterNot { it == "--yolo" || it == "--no-install" || it.startsWith("--insight=") || it == "--operator-overloading" }
+    return ParsedArgs(yolo, noInstall, insightScript, operatorOverloading, rest)
 }
 
 fun main(args: Array<String>) {
@@ -46,6 +48,7 @@ fun main(args: Array<String>) {
     val yolo = parsed.yolo
     val noInstall = parsed.noInstall
     val insightScript = parsed.insightScript
+    val operatorOverloading = parsed.operatorOverloading
     val rest = parsed.rest
 
     if (rest.isEmpty()) {
@@ -61,7 +64,7 @@ fun main(args: Array<String>) {
                 System.exit(1)
                 return
             }
-            runFile(rest[1], yolo, noInstall, insightScript)
+            runFile(rest[1], yolo, noInstall, insightScript, operatorOverloading)
         }
         "version" -> println("mycelium 0.1.0-dev")
         "compiler" -> runCompilerCommand(rest.drop(1))
@@ -70,7 +73,7 @@ fun main(args: Array<String>) {
         else -> {
             // If it looks like a file path, treat it as implicit `run`
             if (rest[0].contains('.')) {
-                runFile(rest[0], yolo, noInstall, insightScript)
+                runFile(rest[0], yolo, noInstall, insightScript, operatorOverloading)
             } else {
                 System.err.println("mycelium: unknown command '${rest[0]}'")
                 printUsage()
@@ -90,34 +93,34 @@ private fun areModsActive(): Boolean {
     return jarFiles != null && jarFiles.isNotEmpty()
 }
 
-private fun runFile(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
+private fun runFile(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?, operatorOverloading: Boolean) {
     // JVM-level features (GraalVM Insight instrumentation scripts and the mod loader's
     // -javaagent bytecode patches) can't work through the daemon — the daemon's shared
     // Engine/Context wasn't started with them, so routing through it would silently drop
     // the feature. Skip straight to in-process.
     if (insightScript != null) {
-        runFileInProcess(path, yolo, noInstall, insightScript)
+        runFileInProcess(path, yolo, noInstall, insightScript, operatorOverloading)
         return
     }
 
     if (areModsActive()) {
-        runFileInProcess(path, yolo, noInstall, insightScript)
+        runFileInProcess(path, yolo, noInstall, insightScript, operatorOverloading)
         return
     }
 
     val config = Config.load()
     val absolutePath = File(path).absolutePath
-    val exitCode = tryRunViaDaemon(config.daemon, absolutePath, yolo, noInstall)
+    val exitCode = tryRunViaDaemon(config.daemon, absolutePath, yolo, noInstall, operatorOverloading)
     if (exitCode != null) {
         if (exitCode != 0) System.exit(exitCode)
         return
     }
-    runFileInProcess(path, yolo, noInstall, insightScript)
+    runFileInProcess(path, yolo, noInstall, insightScript, operatorOverloading)
 }
 
-private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
+private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?, operatorOverloading: Boolean) {
     try {
-        val vm = Mycelium(yolo = yolo, autoInstall = !noInstall, insightScript = insightScript)
+        val vm = Mycelium(yolo = yolo, autoInstall = !noInstall, insightScript = insightScript, operatorOverloading = operatorOverloading)
         vm.runFile(path)
     } catch (e: MyceliumException) {
         System.err.println(e.message)
@@ -134,14 +137,14 @@ private fun runFileInProcess(path: String, yolo: Boolean, noInstall: Boolean, in
 // at all (disabled in config, or couldn't be reached even after an auto-start attempt) —
 // callers fall back to `runFileInProcess` in that case, so this never leaves the user
 // without a way to run their file.
-private fun tryRunViaDaemon(daemonConfig: DaemonConfig, absolutePath: String, yolo: Boolean, noInstall: Boolean): Int? {
+private fun tryRunViaDaemon(daemonConfig: DaemonConfig, absolutePath: String, yolo: Boolean, noInstall: Boolean, operatorOverloading: Boolean): Int? {
     if (!daemonConfig.enabled) return null
     val socketPath = DaemonPaths.socketFile(daemonConfig.socketDir)
     if (!DaemonClient.isRunning(socketPath)) {
         if (!DaemonLauncher.startAndWait(daemonConfig, socketPath)) return null
     }
     return try {
-        DaemonClient.runFile(socketPath, absolutePath, yolo = yolo, noInstall = noInstall)
+        DaemonClient.runFile(socketPath, absolutePath, yolo = yolo, noInstall = noInstall, operatorOverloading = operatorOverloading)
     } catch (e: IOException) {
         // Daemon vanished between the isRunning check and the actual request (e.g. hit
         // its idle timeout in that window) — fall back rather than erroring out.
@@ -167,9 +170,10 @@ private fun printUsage() {
           mycelium help                  Show this help
 
         flags:
-          --yolo                 Auto-install missing npm packages on import
-          --no-install           Skip auto-installing dependencies declared in package.json
-          --insight=<script>     Attach a GraalVM Insight instrumentation script
+          --yolo                       Auto-install missing npm packages on import
+          --no-install                 Skip auto-installing dependencies declared in package.json
+          --insight=<script>           Attach a GraalVM Insight instrumentation script
+          --operator-overloading       Enable GraalJS's experimental operator overloading
 
         `mycelium run`/`mycelium <file>` auto-start a background daemon on first use
         (amortizes JVM/GraalVM startup across runs) unless disabled via

@@ -72,6 +72,10 @@ class Mycelium(
     // is attached. A no-op if the insight-tool jar isn't on the classpath — see
     // `insightAvailable`.
     private val insightScript: String? = null,
+    // When true (the CLI's `--operator-overloading` flag), enables GraalJS's experimental
+    // operator overloading via the Context option `js.operator-overloading`. This is a
+    // Context-level option and works fine with the daemon (doesn't need to bypass it).
+    val operatorOverloading: Boolean = false,
 ) {
     // JVM-mode support: library/build.gradle.kts splits the GraalVM language runtimes
     // (ruby/python/java/llvm/wasm) into separate, non-transitive Gradle Configurations
@@ -234,6 +238,10 @@ class Mycelium(
                 // "wasm" language to be both available *and* permitted so it can delegate to
                 // it internally.
                 .option("js.webassembly", ("wasm" in permittedLanguageIds).toString())
+                // Enables GraalJS's experimental operator overloading, allowing custom
+                // operator implementations via the Operators API (`--operator-overloading`
+                // CLI flag, or Mycelium's `operatorOverloading` constructor param).
+                .option("js.operator-overloading", operatorOverloading.toString())
         }
         builder.build()
     }

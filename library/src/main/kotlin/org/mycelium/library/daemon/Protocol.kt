@@ -24,6 +24,7 @@ sealed class DaemonRequest {
         // gets identical behavior whether it runs via the daemon or in-process.
         val yolo: Boolean = false,
         val noInstall: Boolean = false,
+        val operatorOverloading: Boolean = false,
     ) : DaemonRequest()
 
     object Stop : DaemonRequest()
@@ -38,6 +39,7 @@ sealed class DaemonRequest {
             .put("env", JSONObject(env as Map<String, Any?>))
             .put("yolo", yolo)
             .put("noInstall", noInstall)
+            .put("operatorOverloading", operatorOverloading)
         Stop -> JSONObject().put("command", "stop")
         Status -> JSONObject().put("command", "status")
     }
@@ -53,6 +55,7 @@ sealed class DaemonRequest {
                     ?: emptyMap(),
                 yolo = obj.optBoolean("yolo", false),
                 noInstall = obj.optBoolean("noInstall", false),
+                operatorOverloading = obj.optBoolean("operatorOverloading", false),
             )
             "stop" -> Stop
             "status" -> Status

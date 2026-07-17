@@ -368,10 +368,6 @@ value proposition above. Open questions/gaps:
 - **Mixin integration** — EVALUATED and ruled out (`docs/research/java-modding-systems.md`):
   realistic but not worth the dependency. Decision: enhance PatchDsl instead (add COMPUTE_FRAMES
   mode to eliminate manual StackMapTable frame boilerplate ~160 lines across existing mods).
-- **`obj[x]` computed access gap** — RESOLVED this session, now patched via ReadElementNode in
-  the null-safe mod (5 Object-returning overloads).
-- **Mod authoring docs** — RESOLVED this session (`docs/mod-authoring.md` exists), documents
-  how to find the right Truffle node class and use the helper DSL, worked examples from all mods.
 - **GraalJS constant-folds literal arithmetic at parse time** — mod patches on arithmetic nodes
   only affect *non-constant* operands (`x + y` where `x`/`y` are variables), not literal
   expressions like `1 + 1` that the parser folds before any node-level patch point exists. This
@@ -395,20 +391,7 @@ there. Not a current priority, but the specific working/broken cases above are w
 this gets picked back up, since none of it is written down anywhere except this note.
 
 ### Daemon reliability
-Changes from sessions #5-#7, addressing stale-daemon and file-handle issues:
-- **Version handshake added to the wire protocol** — the client now sends its version on
-  connect; the daemon rejects (and auto-shuts-down) on a version mismatch instead of silently
-  serving requests with stale code. This is the fix for the recurring "stale daemon intercepts
-  every test run" problem.
-- **Daemon bypass for JVM-level features** — RESOLVED this session. `--insight` and mod-loader
-  invocations skip the daemon and run in-process instead, since both need direct access to the
-  `Engine`/`Context` under construction. App.kt checks for mods directory with jars; if present,
-  bypasses daemon entirely (same pattern as --insight bypass). This fixed the silent mod-drop
-  bug and is now solid.
-- **ZipFile "invalid LOC header" bug** — DIAGNOSED this session. Root cause: Unix file-handle
-  race when daemon holds stale JarFile handles via Instrumentation.appendToSystemClassLoaderSearch
-  while Gradle rebuilds jars with overwrite:true. Mitigated by daemon bypass (mods always run
-  in-process now, so this race no longer occurs in normal mod-dev workflow).
+Settled from sessions #5-#7 via version handshake (client rejects stale daemons on version mismatch), daemon bypass for JVM-level features (`--insight`/mod-loader run in-process for direct Engine/Context access), and ZIP-file race mitigation (diagnosed: Unix file-handle race when daemon holds stale JarFile handles while Gradle rebuilds; mitigated by daemon bypass keeping mods in-process).
 
 ### Rust/Go auto-install gap — architecture gap, not a registry-client gap
 `CratesIoClient`/`GoProxyClient` (pure-Kotlin `PackageIndex` implementations, same shape as
@@ -500,10 +483,6 @@ acceptable for now). Open question: `sqlite` might warrant a real implementation
 See "Kotlin/JS as an in-process JVM library call" above — still just a subprocess call to
 `kotlinc-js`, could be a direct JVM library call to save process-spawn overhead. Not started
 this session either.
-
-### Fable (F# → JS) — unchanged, still blocked
-See "Fable" entries above — blocked on needing a real `node` binary for its `bin` shebang. Not
-attempted this session; the GraalJS-as-node-substitute idea remains the proposed unblock.
 
 ### Round 5 npm acid test — not started
 Next tier up from the 27/28-pass Round 1-4 acid tests: webpack, prisma, next.js. Significant

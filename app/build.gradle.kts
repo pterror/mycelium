@@ -82,16 +82,19 @@ val jvmRun by tasks.registering(JavaExec::class) {
     }
 
     // `-Pmod`: attaches the mod-loader jar as a `-javaagent:` and points it at a mods
-    // directory containing example-mod's jar (which, via ASM, patches GraalJS's
-    // JSAddNodeGen at class-load time so int addition returns one extra — e.g.
-    // `1 + 1 === 3`). See mod-loader/ for the generic loader and example-mod/ for that
-    // mod. Pass `-PmodsDir=<path>` to point at a different mods directory instead of the
-    // default (a `mods/` staging directory under the build dir, populated with
-    // example-mod's jar).
+    // directory containing example-mod's and null-safe-mod's jars. example-mod, via ASM,
+    // patches GraalJS's JSAddNodeGen at class-load time so int addition returns one extra
+    // — e.g. `1 + 1 === 3`. null-safe-mod patches
+    // PropertyGetNode$TypeErrorPropertyGetNode.getValue so that `null.foo`/`undefined.foo`
+    // return `undefined` instead of throwing a TypeError. See mod-loader/ for the generic
+    // loader, example-mod/ and null-safe-mod/ for those mods. Pass `-PmodsDir=<path>` to
+    // point at a different mods directory instead of the default (a `mods/` staging
+    // directory under the build dir, populated with both mods' jars).
     if (project.hasProperty("mod")) {
-        dependsOn(":mod-loader:jar", ":example-mod:jar")
+        dependsOn(":mod-loader:jar", ":example-mod:jar", ":null-safe-mod:jar")
         val agentJar = project(":mod-loader").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val exampleModJar = project(":example-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val nullSafeModJar = project(":null-safe-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val modsDirProp = project.findProperty("modsDir") as String?
         val stagedModsDir = layout.buildDirectory.dir("mods")
         doFirst {
@@ -101,6 +104,7 @@ val jvmRun by tasks.registering(JavaExec::class) {
                 val dir = stagedModsDir.get().asFile
                 dir.mkdirs()
                 exampleModJar.get().asFile.copyTo(File(dir, "example-mod.jar"), overwrite = true)
+                nullSafeModJar.get().asFile.copyTo(File(dir, "null-safe-mod.jar"), overwrite = true)
                 dir
             }
             jvmArgs(

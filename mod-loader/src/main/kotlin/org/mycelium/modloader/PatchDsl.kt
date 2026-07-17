@@ -39,7 +39,21 @@ import org.objectweb.asm.tree.VarInsnNode
 fun patchClass(classfileBuffer: ByteArray, block: ClassPatcher.() -> Unit): ByteArray? {
     val classNode = ClassNode()
     val classReader = ClassReader(classfileBuffer)
-    classReader.accept(classNode, 0)
+    // EXPAND_FRAMES: normalizes every StackMapTable entry (including ones this class
+    // doesn't touch) into the uniform "full frame" (F_NEW) representation instead of
+    // leaving them in the class file's original compressed encoding (F_SAME/F_APPEND/
+    // F_CHOP/...). Compressed frames encode their offset_delta implicitly via which frame
+    // "family" was chosen at compile time, relative to whatever the previous frame in the
+    // method happened to be — splicing new instructions (and, worse, new branch targets
+    // that need their OWN new frames — see [ClassPatcher.atMethodEntry] docs for the
+    // "expecting a stackmap frame at branch target" failure mode this avoids) shifts byte
+    // offsets and can shift which frame is "previous," silently invalidating a compressed
+    // frame's meaning. Expanded frames carry the full local/stack type lists explicitly, so
+    // they stay correct regardless of what mod authors splice in around them, and
+    // ClassWriter re-compresses them automatically on output (independent of read-side
+    // expansion) since [ClassWriter] here still runs in `COMPUTE_MAXS` mode, not
+    // `COMPUTE_FRAMES` — see the comment on that below for why.
+    classReader.accept(classNode, ClassReader.EXPAND_FRAMES)
 
     val patcher = ClassPatcher(classNode)
     patcher.block()

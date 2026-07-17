@@ -1,0 +1,14 @@
+{
+  "id": "null-safe",
+  "name": "Null-Safe Property Access",
+  "version": "1.0.0",
+  "description": "Makes null.foo and undefined.foo return undefined instead of throwing TypeError",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": [
+    "org.mycelium.nullsafe.NullSafeTransformer"
+  ],
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
+}

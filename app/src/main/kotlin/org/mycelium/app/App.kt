@@ -80,13 +80,27 @@ fun main(args: Array<String>) {
     }
 }
 
+private fun areModsActive(): Boolean {
+    val modsDir = System.getProperty("mycelium.mods.dir")
+        ?: System.getenv("MYCELIUM_MODS_DIR")
+        ?: "mods"
+    val dir = java.io.File(modsDir)
+    if (!dir.isDirectory) return false
+    val jarFiles = dir.listFiles { f -> f.isFile && f.extension == "jar" }
+    return jarFiles != null && jarFiles.isNotEmpty()
+}
+
 private fun runFile(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
-    // JVM-level features (the GraalVM Insight instrumentation script) can't work through the
-    // daemon — the daemon's shared Engine/Context wasn't started with them, so routing
-    // through it would silently drop the feature. Skip straight to in-process. (The mod
-    // loader, `-Pmod`, is a Gradle/JVM-level concern handled by the `jvmRun` task rather than
-    // by this CLI's argument parsing, so it never reaches here and needs no equivalent check.)
+    // JVM-level features (GraalVM Insight instrumentation scripts and the mod loader's
+    // -javaagent bytecode patches) can't work through the daemon — the daemon's shared
+    // Engine/Context wasn't started with them, so routing through it would silently drop
+    // the feature. Skip straight to in-process.
     if (insightScript != null) {
+        runFileInProcess(path, yolo, noInstall, insightScript)
+        return
+    }
+
+    if (areModsActive()) {
         runFileInProcess(path, yolo, noInstall, insightScript)
         return
     }

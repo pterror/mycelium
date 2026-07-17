@@ -81,15 +81,32 @@ val jvmRun by tasks.registering(JavaExec::class) {
         classpath += project(":library").configurations.getByName(configName)
     }
 
-    // `-Pmod`: proof-of-concept mod loader — attaches the mod-loader-poc jar as a
-    // `-javaagent:` that ASM-patches GraalJS's JSAddNodeGen at class-load time so int
-    // addition returns one extra (e.g. `1 + 1 === 3`). See mod-loader-poc/README or its
-    // ModLoaderAgent.kt for how the patch works.
+    // `-Pmod`: attaches the mod-loader jar as a `-javaagent:` and points it at a mods
+    // directory containing example-mod's jar (which, via ASM, patches GraalJS's
+    // JSAddNodeGen at class-load time so int addition returns one extra — e.g.
+    // `1 + 1 === 3`). See mod-loader/ for the generic loader and example-mod/ for that
+    // mod. Pass `-PmodsDir=<path>` to point at a different mods directory instead of the
+    // default (a `mods/` staging directory under the build dir, populated with
+    // example-mod's jar).
     if (project.hasProperty("mod")) {
-        dependsOn(":mod-loader-poc:jar")
-        val agentJar = project(":mod-loader-poc").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        dependsOn(":mod-loader:jar", ":example-mod:jar")
+        val agentJar = project(":mod-loader").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val exampleModJar = project(":example-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val modsDirProp = project.findProperty("modsDir") as String?
+        val stagedModsDir = layout.buildDirectory.dir("mods")
         doFirst {
-            jvmArgs("-javaagent:${agentJar.get().asFile.absolutePath}")
+            val modsDir = if (modsDirProp != null) {
+                File(modsDirProp)
+            } else {
+                val dir = stagedModsDir.get().asFile
+                dir.mkdirs()
+                exampleModJar.get().asFile.copyTo(File(dir, "example-mod.jar"), overwrite = true)
+                dir
+            }
+            jvmArgs(
+                "-javaagent:${agentJar.get().asFile.absolutePath}",
+                "-Dmycelium.mods.dir=${modsDir.absolutePath}",
+            )
         }
     }
 }

@@ -5,4 +5,4 @@ plugins {
 
 rootProject.name = "mycelium"
 
-include("app", "library", "mod-loader-poc")
+include("app", "library", "mod-loader", "example-mod")

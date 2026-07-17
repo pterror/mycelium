@@ -1,0 +1,12 @@
+{
+  "id": "cursed-addition",
+  "name": "Cursed Addition",
+  "version": "1.0.0",
+  "description": "Makes 1+1=3",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": [
+    "com.example.CursedAdditionTransformer"
+  ],
+  "priority": 1000
+}

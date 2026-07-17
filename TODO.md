@@ -1,29 +1,32 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-17 (session handoff #6: mod authoring polish, integer division mod, null-safe
-computed access. This session extended the mod-loader infrastructure built in #5: null-safe mod
-now covers bracket/computed property access (`obj[x]` on null/undefined) via ReadElementNode
-patching; integer-division mod landed as the fourth working mod (C-style `/` truncation,
-patches JSDivideNode); mod authoring documentation (`docs/mod-authoring.md`) was written to guide
-future mod authors; and `PatchDsl.recordPatch()` was made public for mods that drop to raw
-classNode iteration. Discovered daemon gotcha: mods don't take effect if a stale daemon is
-running without the javaagent — kill it first or disable it for mod testing.* Previous handoff
-(session handoff #5: GraalVM Insight integration, mod loader, daemon reliability. Pivoted from
-Node-stdlib/compat sweeps toward JVM-level extensibility: `--insight=<script>` dynamic
-instrumentation landed; a full mod loader (discovery, descriptors, transformers, priority
-dispatch, dependency resolution, version checking, a helper DSL) was built and shipped with three
-working example mods; the daemon gained a version handshake and a bypass path for JVM-level
-features; hybrid cross-language metaprogramming was explored experimentally (findings only, not
-committed). Previous handoff #4: stub audit + Truffle-embedding-JAR visibility fix — silent-
-wrong-answer stubs replaced with real implementations, `polyglot`/`truffle-api` exposed as `api`
-deps for `Engine` visibility, stream/path submodules and Scala.js auto-download confirmed landed.
-Previous handoffs (#1-#3): daemon architecture (Unix socket, shared `Engine`, per-request
-isolation), inter-core-module import fix, native-image removal, distribution architecture
-resolution (JVM mode over native-image), Node stdlib completion (dgram/cluster, 14 niche
-modules), compile-to-JS growth to 12 languages. All committed and in git history — condensed
-out of this file per the "remove RESOLVED cruft" rule. This file is the project's institutional
-memory — written to survive context compaction. Treat as reliable background, but verify against
-code before relying on specifics that could have drifted.*
+*Updated 2026-07-17 (session handoff #7: mod ecosystem matured — 3 new mods shipped, daemon
+bypass solidified, mod authoring docs complete. This session shipped three new working mods:
+integer-division-mod (C-style `/` truncation via JSDivideNode patching), operator-overloading-mod
+(unlocks GraalJS's built-in Operators API, default-false gate removed), and ptc-mod (proper tail
+calls via trampoline — self-recursive tail calls work without stack overflow). Extended null-safe
+mod to cover bracket/computed access (`null[x]`, `undefined["key"]`) via ReadElementNode patching
+(5 Object-returning overloads). Daemon bypass for mod-loader is now confirmed solid: App.kt skips
+daemon when mods directory has jars (same pattern as --insight bypass), fixing the silent
+mod-drop bug that plagued earlier sessions. Landed `--operator-overloading` CLI flag threading
+`js.operator-overloading` Context option through daemon protocol. Diagnosed ZipFile bug root
+cause (Unix file-handle race when daemon holds stale JarFile handles via Instrumentation
+.appendToSystemClassLoaderSearch while Gradle rebuilds with overwrite:true) — mitigated by daemon
+bypass (mods always in-process now). Mixin integration evaluated and ruled out; decision: enhance
+PatchDsl instead. Mod authoring docs (`docs/mod-authoring.md`) and research output (mixin
+evaluation) both shipped.* Previous handoff (session handoff #6: mod authoring polish, integer
+division mod, null-safe computed access. Extended mod-loader infrastructure: null-safe now covers
+bracket access via ReadElementNode; integer-division mod was the fourth working mod; mod authoring
+docs written; PatchDsl.recordPatch() made public. Daemon gotcha discovered: mods don't take effect
+if stale daemon runs without javaagent). Previous handoff #5: GraalVM Insight integration, mod
+loader, daemon reliability. Pivoted toward JVM-level extensibility: --insight=<script> landed;
+full mod loader built with three working example mods; daemon gained version handshake + bypass
+path. Previous handoff #4: stub audit + Truffle-embedding-JAR visibility fix. Previous handoffs
+(#1-#3): daemon architecture, inter-core-module import fix, native-image removal, Node stdlib
+completion, compile-to-JS growth. All committed and in git history — condensed out of this file
+per the "remove RESOLVED cruft" rule. This file is the project's institutional memory — written to
+survive context compaction. Treat as reliable background, but verify against code before relying
+on specifics that could have drifted.*
 
 ## Native-image build removed — reconfirmed this session (see also below, same item)
 
@@ -355,24 +358,27 @@ bring-your-own-script?
 Infrastructure is complete: mod discovery, descriptors, transformers, priority-ordered
 dispatch, dependency resolution, version checking, and a helper DSL (`patchClass`,
 `afterCallsTo`, `redirectCallsTo`) for writing mods without touching Truffle internals
-directly. Four working example mods ship: cursed-addition (`1 + 1 = 3`), null-safe property
-access (`null.foo` returns `undefined` instead of throwing), strict equality (`==` behaves
-like `===`), and integer division (`/` truncates toward zero like C, patches JSDivideNode).
-This is the concrete instance behind the "mod loader for language runtimes" value
-proposition above. Open questions/gaps:
-- **Mixin integration** — research done (`docs/research/java-modding-systems.md`): realistic,
-  but Mycelium would be the first non-Minecraft consumer of Mixin-style bytecode weaving.
-  Unevaluated whether it's worth the dependency.
+directly. **Seven working mods now ship** (up from four): cursed-addition (`1 + 1 = 3`),
+null-safe property access (`null.foo` and `null[x]` return `undefined` instead of throwing),
+strict equality (`==` behaves like `===`), integer division (`/` truncates toward zero like C),
+operator-overloading (`Operators({...})` API unlocked, plus `--operator-overloading` CLI flag),
+proper tail calls (self-recursive tail calls via trampoline, no stack overflow on `sum(1e7, 0)`),
+and the example mod. This is the concrete instance behind the "mod loader for language runtimes"
+value proposition above. Open questions/gaps:
+- **Mixin integration** — EVALUATED and ruled out (`docs/research/java-modding-systems.md`):
+  realistic but not worth the dependency. Decision: enhance PatchDsl instead (add COMPUTE_FRAMES
+  mode to eliminate manual StackMapTable frame boilerplate ~160 lines across existing mods).
 - **`obj[x]` computed access gap** — RESOLVED this session, now patched via ReadElementNode in
-  the null-safe mod.
+  the null-safe mod (5 Object-returning overloads).
 - **Mod authoring docs** — RESOLVED this session (`docs/mod-authoring.md` exists), documents
-  how to find the right Truffle node class and use the helper DSL.
+  how to find the right Truffle node class and use the helper DSL, worked examples from all mods.
 - **GraalJS constant-folds literal arithmetic at parse time** — mod patches on arithmetic nodes
   only affect *non-constant* operands (`x + y` where `x`/`y` are variables), not literal
   expressions like `1 + 1` that the parser folds before any node-level patch point exists. This
   is why cursed-addition works as a demo but wouldn't intercept every `+` in a real program —
-  worth documenting explicitly for mod authors so it isn't discovered the hard way.
-- **More mod ideas floated, not started**: proper tail calls, operator overloading.
+  now documented with workaround (redirect to `createUnoptimized()`) for mod authors.
+- **PatchDsl COMPUTE_FRAMES mode** — next improvement, should eliminate manual StackMapTable
+  boilerplate currently ~160 lines across existing mods.
 
 ### Hybrid metaprogramming — partial results, not committed
 Experimental session exploring cross-language metaprogramming across the shared polyglot
@@ -389,22 +395,20 @@ there. Not a current priority, but the specific working/broken cases above are w
 this gets picked back up, since none of it is written down anywhere except this note.
 
 ### Daemon reliability
-Two changes from session #5, both aimed at a specific failure mode where a stale daemon kept
-intercepting test runs during development:
+Changes from sessions #5-#7, addressing stale-daemon and file-handle issues:
 - **Version handshake added to the wire protocol** — the client now sends its version on
   connect; the daemon rejects (and auto-shuts-down) on a version mismatch instead of silently
   serving requests with stale code. This is the fix for the recurring "stale daemon intercepts
-  every test run" problem, but it was not tested end-to-end against the new code by the end of
-  the session — verify it actually triggers the shutdown path before relying on it.
-- **Daemon bypass for JVM-level features** — `--insight` and mod-loader invocations skip the
-  daemon and run in-process instead, since both need direct access to the `Engine`/`Context`
-  under construction (see "GraalVM Insight" above).
-- **Daemon gotcha (discovered this session)**: mods don't take effect if a stale daemon is
-  running without the javaagent — the bypass path isn't triggered. Kill the daemon first or
-  disable it (`--no-daemon`) for mod testing.
-- **Still open, undiagnosed**: a "ZipFile invalid LOC header" daemon bug surfaced repeatedly
-  during this session's testing. Not root-caused. Worth investigating first if daemon flakiness
-  shows up again next session.
+  every test run" problem.
+- **Daemon bypass for JVM-level features** — RESOLVED this session. `--insight` and mod-loader
+  invocations skip the daemon and run in-process instead, since both need direct access to the
+  `Engine`/`Context` under construction. App.kt checks for mods directory with jars; if present,
+  bypasses daemon entirely (same pattern as --insight bypass). This fixed the silent mod-drop
+  bug and is now solid.
+- **ZipFile "invalid LOC header" bug** — DIAGNOSED this session. Root cause: Unix file-handle
+  race when daemon holds stale JarFile handles via Instrumentation.appendToSystemClassLoaderSearch
+  while Gradle rebuilds jars with overwrite:true. Mitigated by daemon bypass (mods always run
+  in-process now, so this race no longer occurs in normal mod-dev workflow).
 
 ### Rust/Go auto-install gap — architecture gap, not a registry-client gap
 `CratesIoClient`/`GoProxyClient` (pure-Kotlin `PackageIndex` implementations, same shape as
@@ -518,6 +522,34 @@ upstream activity was 2023 — effectively abandoned as a path to R support. Alt
 discussed but not investigated: Renjin (pure-Java R implementation, published on Maven
 Central), R-to-WASM, or a subprocess call to a real `Rscript` binary (same category of
 tradeoff as the Fable/`node` situation). None investigated this session.
+
+### PatchDsl COMPUTE_FRAMES mode — next infrastructure improvement
+Mixin research recommended enhancing PatchDsl instead of integrating Mixin itself. Next step:
+add a COMPUTE_FRAMES mode to PatchDsl that eliminates manual StackMapTable frame boilerplate
+(currently ~160 lines of noise across all existing mods). This would be a pure infrastructure
+improvement with no language-feature impact, just developer ergonomics. Worth starting next
+session if mod authoring is the focus.
+
+### Mutual-recursion PTC — current mod limitation to document
+ptc-mod patches self-recursive tail calls successfully (no stack overflow), but mutual recursion
+(A calls B calls A) is limited to moderate depth — current implementation only trampolines
+single-function tail calls. Whether to extend to mutual recursion is an open design question;
+it's a well-understood problem (the value stack can grow until one function returns) but adds
+complexity. Current behavior is honest/documented; no user surprise, just a limitation to call out.
+
+### Operator-overloading: mod vs built-in flag — design question unresolved
+Both now exist: operator-overloading-mod (discoverable via mod loader) and --operator-overloading
+CLI flag (threads js.operator-overloading through daemon protocol). Should Mycelium keep both,
+or standardize on one? Mod gives you operator semantics even without the flag; flag is more
+direct/discoverable. No strong opinion yet. Worth revisiting if this feature gets production use.
+
+### TODO.md itself is getting long — consider condensing resolved items
+This file has grown to 530 lines. Most of it is reliable background (architecture decisions,
+language support status, hard constraints), but the "Open threads" section keeps accumulating
+closed items converted to "RESOLVED this session". Consider next session: which items can be
+moved to git history (as closed findings in commit messages or session branches) vs kept here
+(architectural context that survives refactors)? The current rule is "remove RESOLVED cruft"
+but we've been conservative about applying it. Might be worth a refresh pass.
 
 ## User preferences (for future sessions)
 

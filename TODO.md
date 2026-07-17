@@ -1,23 +1,29 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-17 (session handoff #5: GraalVM Insight integration, mod loader, daemon
-reliability. This session pivoted from Node-stdlib/compat sweeps toward JVM-level extensibility:
-`--insight=<script>` dynamic instrumentation landed; a full mod loader (discovery, descriptors,
-transformers, priority dispatch, dependency resolution, version checking, a helper DSL) was
-built and shipped with three working example mods; the daemon gained a version handshake and a
-bypass path for JVM-level features; hybrid cross-language metaprogramming was explored
-experimentally (findings only, not committed). See "Open threads" below for full detail on all
-of this session's work, plus everything still open from before.* Previous handoff (session
-handoff #4: stub audit + Truffle-embedding-JAR visibility fix — silent-wrong-answer stubs
-replaced with real implementations, `polyglot`/`truffle-api` exposed as `api` deps for `Engine`
-visibility, stream/path submodules and Scala.js auto-download confirmed landed). Previous
-handoffs (#1-#3): daemon architecture (Unix socket, shared `Engine`, per-request isolation),
-inter-core-module import fix, native-image removal, distribution architecture resolution
-(JVM mode over native-image), Node stdlib completion (dgram/cluster, 14 niche modules),
-compile-to-JS growth to 12 languages. All of that is committed and in git history — condensed
-out of this file per the "remove RESOLVED cruft" rule below. This file is the project's
-institutional memory — written to survive context compaction. Treat as reliable background, but
-verify against code before relying on specifics that could have drifted.*
+*Updated 2026-07-17 (session handoff #6: mod authoring polish, integer division mod, null-safe
+computed access. This session extended the mod-loader infrastructure built in #5: null-safe mod
+now covers bracket/computed property access (`obj[x]` on null/undefined) via ReadElementNode
+patching; integer-division mod landed as the fourth working mod (C-style `/` truncation,
+patches JSDivideNode); mod authoring documentation (`docs/mod-authoring.md`) was written to guide
+future mod authors; and `PatchDsl.recordPatch()` was made public for mods that drop to raw
+classNode iteration. Discovered daemon gotcha: mods don't take effect if a stale daemon is
+running without the javaagent — kill it first or disable it for mod testing.* Previous handoff
+(session handoff #5: GraalVM Insight integration, mod loader, daemon reliability. Pivoted from
+Node-stdlib/compat sweeps toward JVM-level extensibility: `--insight=<script>` dynamic
+instrumentation landed; a full mod loader (discovery, descriptors, transformers, priority
+dispatch, dependency resolution, version checking, a helper DSL) was built and shipped with three
+working example mods; the daemon gained a version handshake and a bypass path for JVM-level
+features; hybrid cross-language metaprogramming was explored experimentally (findings only, not
+committed). Previous handoff #4: stub audit + Truffle-embedding-JAR visibility fix — silent-
+wrong-answer stubs replaced with real implementations, `polyglot`/`truffle-api` exposed as `api`
+deps for `Engine` visibility, stream/path submodules and Scala.js auto-download confirmed landed.
+Previous handoffs (#1-#3): daemon architecture (Unix socket, shared `Engine`, per-request
+isolation), inter-core-module import fix, native-image removal, distribution architecture
+resolution (JVM mode over native-image), Node stdlib completion (dgram/cluster, 14 niche
+modules), compile-to-JS growth to 12 languages. All committed and in git history — condensed
+out of this file per the "remove RESOLVED cruft" rule. This file is the project's institutional
+memory — written to survive context compaction. Treat as reliable background, but verify against
+code before relying on specifics that could have drifted.*
 
 ## Native-image build removed — reconfirmed this session (see also below, same item)
 
@@ -349,26 +355,24 @@ bring-your-own-script?
 Infrastructure is complete: mod discovery, descriptors, transformers, priority-ordered
 dispatch, dependency resolution, version checking, and a helper DSL (`patchClass`,
 `afterCallsTo`, `redirectCallsTo`) for writing mods without touching Truffle internals
-directly. Three working example mods ship: cursed-addition (`1 + 1 = 3`), null-safe property
-access (`null.foo` returns `undefined` instead of throwing), and strict equality (`==` behaves
-like `===`). This is the concrete instance behind the "mod loader for language runtimes" value
+directly. Four working example mods ship: cursed-addition (`1 + 1 = 3`), null-safe property
+access (`null.foo` returns `undefined` instead of throwing), strict equality (`==` behaves
+like `===`), and integer division (`/` truncates toward zero like C, patches JSDivideNode).
+This is the concrete instance behind the "mod loader for language runtimes" value
 proposition above. Open questions/gaps:
 - **Mixin integration** — research done (`docs/research/java-modding-systems.md`): realistic,
   but Mycelium would be the first non-Minecraft consumer of Mixin-style bytecode weaving.
   Unevaluated whether it's worth the dependency.
-- **Mod authoring docs** — nothing written yet on how a mod author finds the right Truffle
-  node class to patch, or how to use the helper DSL in practice. Currently only discoverable by
-  reading the three example mods' source.
-- **`obj[x]` computed access not covered by the null-safe mod** — it patches a different node
-  than property access (`.foo`); computed/bracket access goes through `ReadElementNode`, not
-  yet handled.
+- **`obj[x]` computed access gap** — RESOLVED this session, now patched via ReadElementNode in
+  the null-safe mod.
+- **Mod authoring docs** — RESOLVED this session (`docs/mod-authoring.md` exists), documents
+  how to find the right Truffle node class and use the helper DSL.
 - **GraalJS constant-folds literal arithmetic at parse time** — mod patches on arithmetic nodes
   only affect *non-constant* operands (`x + y` where `x`/`y` are variables), not literal
   expressions like `1 + 1` that the parser folds before any node-level patch point exists. This
   is why cursed-addition works as a demo but wouldn't intercept every `+` in a real program —
   worth documenting explicitly for mod authors so it isn't discovered the hard way.
-- **More mod ideas floated, not started**: proper tail calls, operator overloading, integer
-  division.
+- **More mod ideas floated, not started**: proper tail calls, operator overloading.
 
 ### Hybrid metaprogramming — partial results, not committed
 Experimental session exploring cross-language metaprogramming across the shared polyglot
@@ -385,7 +389,7 @@ there. Not a current priority, but the specific working/broken cases above are w
 this gets picked back up, since none of it is written down anywhere except this note.
 
 ### Daemon reliability
-Two changes this session, both aimed at a specific failure mode where a stale daemon kept
+Two changes from session #5, both aimed at a specific failure mode where a stale daemon kept
 intercepting test runs during development:
 - **Version handshake added to the wire protocol** — the client now sends its version on
   connect; the daemon rejects (and auto-shuts-down) on a version mismatch instead of silently
@@ -395,6 +399,9 @@ intercepting test runs during development:
 - **Daemon bypass for JVM-level features** — `--insight` and mod-loader invocations skip the
   daemon and run in-process instead, since both need direct access to the `Engine`/`Context`
   under construction (see "GraalVM Insight" above).
+- **Daemon gotcha (discovered this session)**: mods don't take effect if a stale daemon is
+  running without the javaagent — the bypass path isn't triggered. Kill the daemon first or
+  disable it (`--no-daemon`) for mod testing.
 - **Still open, undiagnosed**: a "ZipFile invalid LOC header" daemon bug surfaced repeatedly
   during this session's testing. Not root-caused. Worth investigating first if daemon flakiness
   shows up again next session.

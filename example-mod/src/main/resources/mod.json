@@ -6,7 +6,7 @@
   "targetRuntime": "graaljs",
   "targetVersion": "25.0.0",
   "transformers": [
-    "com.example.CursedAdditionTransformer"
+    "org.mycelium.example.CursedAdditionTransformer"
   ],
   "priority": 1000,
   "depends": {},

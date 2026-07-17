@@ -80,4 +80,16 @@ val jvmRun by tasks.registering(JavaExec::class) {
             )
         classpath += project(":library").configurations.getByName(configName)
     }
+
+    // `-Pmod`: proof-of-concept mod loader — attaches the mod-loader-poc jar as a
+    // `-javaagent:` that ASM-patches GraalJS's JSAddNodeGen at class-load time so int
+    // addition returns one extra (e.g. `1 + 1 === 3`). See mod-loader-poc/README or its
+    // ModLoaderAgent.kt for how the patch works.
+    if (project.hasProperty("mod")) {
+        dependsOn(":mod-loader-poc:jar")
+        val agentJar = project(":mod-loader-poc").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        doFirst {
+            jvmArgs("-javaagent:${agentJar.get().asFile.absolutePath}")
+        }
+    }
 }

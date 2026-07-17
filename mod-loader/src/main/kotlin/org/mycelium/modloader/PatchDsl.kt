@@ -143,8 +143,14 @@ class ClassPatcher(val classNode: ClassNode) {
         return RedirectBuilder(this, sites)
     }
 
-    /** Records one successful patch. Called by [RedirectBuilder.to] on this same instance. */
-    internal fun recordPatch() {
+    /**
+     * Records one successful patch. Called by [RedirectBuilder.to] on this same instance.
+     * Also public so mod authors who drop down to raw [classNode] iteration (e.g. to inject
+     * differently-shaped instructions per overload, which the uniform [atMethodEntry] can't
+     * express) can still register their patch(es) with [patchCount] — otherwise [patchClass]
+     * would conclude nothing changed and discard the (correctly) rewritten bytecode.
+     */
+    fun recordPatch() {
         patchCount++
     }
 

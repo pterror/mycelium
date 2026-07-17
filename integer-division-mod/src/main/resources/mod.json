@@ -1,0 +1,14 @@
+{
+  "id": "integer-division",
+  "name": "Integer Division",
+  "version": "1.0.0",
+  "description": "Makes / truncate to integer (C-style integer division)",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": [
+    "org.mycelium.intdiv.IntegerDivisionTransformer"
+  ],
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
+}

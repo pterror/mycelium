@@ -82,22 +82,30 @@ val jvmRun by tasks.registering(JavaExec::class) {
     }
 
     // `-Pmod`: attaches the mod-loader jar as a `-javaagent:` and points it at a mods
-    // directory containing example-mod's, null-safe-mod's, and strict-equality-mod's jars.
-    // example-mod, via ASM, patches GraalJS's JSAddNodeGen at class-load time so int
-    // addition returns one extra — e.g. `1 + 1 === 3`. null-safe-mod patches
-    // PropertyGetNode$TypeErrorPropertyGetNode.getValue so that `null.foo`/`undefined.foo`
-    // return `undefined` instead of throwing a TypeError. strict-equality-mod patches
-    // NodeFactory.createBinaryEqual so `==`/`!=` behave like `===`/`!==`. See mod-loader/
-    // for the generic loader, example-mod/, null-safe-mod/, and strict-equality-mod/ for
-    // those mods. Pass `-PmodsDir=<path>` to point at a different mods directory instead of
-    // the default (a `mods/` staging directory under the build dir, populated with all
-    // mods' jars).
+    // directory containing example-mod's, null-safe-mod's, strict-equality-mod's, and
+    // integer-division-mod's jars. example-mod, via ASM, patches GraalJS's JSAddNodeGen at
+    // class-load time so int addition returns one extra — e.g. `1 + 1 === 3`. null-safe-mod
+    // patches PropertyGetNode$TypeErrorPropertyGetNode.getValue so that
+    // `null.foo`/`undefined.foo` return `undefined` instead of throwing a TypeError.
+    // strict-equality-mod patches NodeFactory.createBinaryEqual so `==`/`!=` behave like
+    // `===`/`!==`. integer-division-mod patches JSDivideNode so `/` truncates to integer,
+    // C-style. See mod-loader/ for the generic loader, example-mod/, null-safe-mod/,
+    // strict-equality-mod/, and integer-division-mod/ for those mods. Pass
+    // `-PmodsDir=<path>` to point at a different mods directory instead of the default (a
+    // `mods/` staging directory under the build dir, populated with all mods' jars).
     if (project.hasProperty("mod")) {
-        dependsOn(":mod-loader:jar", ":example-mod:jar", ":null-safe-mod:jar", ":strict-equality-mod:jar")
+        dependsOn(
+            ":mod-loader:jar",
+            ":example-mod:jar",
+            ":null-safe-mod:jar",
+            ":strict-equality-mod:jar",
+            ":integer-division-mod:jar",
+        )
         val agentJar = project(":mod-loader").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val exampleModJar = project(":example-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val nullSafeModJar = project(":null-safe-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val strictEqualityModJar = project(":strict-equality-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val integerDivisionModJar = project(":integer-division-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val modsDirProp = project.findProperty("modsDir") as String?
         val stagedModsDir = layout.buildDirectory.dir("mods")
         doFirst {
@@ -109,6 +117,7 @@ val jvmRun by tasks.registering(JavaExec::class) {
                 exampleModJar.get().asFile.copyTo(File(dir, "example-mod.jar"), overwrite = true)
                 nullSafeModJar.get().asFile.copyTo(File(dir, "null-safe-mod.jar"), overwrite = true)
                 strictEqualityModJar.get().asFile.copyTo(File(dir, "strict-equality-mod.jar"), overwrite = true)
+                integerDivisionModJar.get().asFile.copyTo(File(dir, "integer-division-mod.jar"), overwrite = true)
                 dir
             }
             jvmArgs(
@@ -116,5 +125,12 @@ val jvmRun by tasks.registering(JavaExec::class) {
                 "-Dmycelium.mods.dir=${modsDir.absolutePath}",
             )
         }
+    }
+}
+
+tasks.register("printJvmRunClasspath") {
+    dependsOn(jvmRun)
+    doLast {
+        println(jvmRun.get().classpath.asPath)
     }
 }

@@ -1,0 +1,14 @@
+{
+  "id": "strict-equality",
+  "name": "Strict Equality",
+  "version": "1.0.0",
+  "description": "Makes == behave like === and != behave like !==",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": [
+    "org.mycelium.stricteq.StrictEqualityTransformer"
+  ],
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
+}

@@ -82,19 +82,22 @@ val jvmRun by tasks.registering(JavaExec::class) {
     }
 
     // `-Pmod`: attaches the mod-loader jar as a `-javaagent:` and points it at a mods
-    // directory containing example-mod's and null-safe-mod's jars. example-mod, via ASM,
-    // patches GraalJS's JSAddNodeGen at class-load time so int addition returns one extra
-    // — e.g. `1 + 1 === 3`. null-safe-mod patches
+    // directory containing example-mod's, null-safe-mod's, and strict-equality-mod's jars.
+    // example-mod, via ASM, patches GraalJS's JSAddNodeGen at class-load time so int
+    // addition returns one extra — e.g. `1 + 1 === 3`. null-safe-mod patches
     // PropertyGetNode$TypeErrorPropertyGetNode.getValue so that `null.foo`/`undefined.foo`
-    // return `undefined` instead of throwing a TypeError. See mod-loader/ for the generic
-    // loader, example-mod/ and null-safe-mod/ for those mods. Pass `-PmodsDir=<path>` to
-    // point at a different mods directory instead of the default (a `mods/` staging
-    // directory under the build dir, populated with both mods' jars).
+    // return `undefined` instead of throwing a TypeError. strict-equality-mod patches
+    // NodeFactory.createBinaryEqual so `==`/`!=` behave like `===`/`!==`. See mod-loader/
+    // for the generic loader, example-mod/, null-safe-mod/, and strict-equality-mod/ for
+    // those mods. Pass `-PmodsDir=<path>` to point at a different mods directory instead of
+    // the default (a `mods/` staging directory under the build dir, populated with all
+    // mods' jars).
     if (project.hasProperty("mod")) {
-        dependsOn(":mod-loader:jar", ":example-mod:jar", ":null-safe-mod:jar")
+        dependsOn(":mod-loader:jar", ":example-mod:jar", ":null-safe-mod:jar", ":strict-equality-mod:jar")
         val agentJar = project(":mod-loader").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val exampleModJar = project(":example-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val nullSafeModJar = project(":null-safe-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val strictEqualityModJar = project(":strict-equality-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val modsDirProp = project.findProperty("modsDir") as String?
         val stagedModsDir = layout.buildDirectory.dir("mods")
         doFirst {
@@ -105,6 +108,7 @@ val jvmRun by tasks.registering(JavaExec::class) {
                 dir.mkdirs()
                 exampleModJar.get().asFile.copyTo(File(dir, "example-mod.jar"), overwrite = true)
                 nullSafeModJar.get().asFile.copyTo(File(dir, "null-safe-mod.jar"), overwrite = true)
+                strictEqualityModJar.get().asFile.copyTo(File(dir, "strict-equality-mod.jar"), overwrite = true)
                 dir
             }
             jvmArgs(

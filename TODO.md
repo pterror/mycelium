@@ -1,119 +1,23 @@
 # Mycelium — Project State & Open Threads
 
-*Updated 2026-07-17 (session handoff #4: stub audit + Truffle-embedding-JAR visibility fix.
-Silent-wrong-answer stubs (modules that returned plausible-looking but incorrect results
-instead of throwing/erroring) were replaced with real implementations (`253ae14`) following an
-audit of every Node core module's implementation depth: 27 FULL, 20 PARTIAL, 7 STUB, 3 THROWS
-— see "Open threads" below for the remaining stub/throws inventory. Separately, `polyglot` and
-`truffle-api` are now exposed as `api` (not `implementation`) dependencies so the `Engine` type
-is visible to consumers embedding the `library` module (`ecd6c39`) — a Gradle
-visibility/encapsulation fix, not a behavior change. The previously in-flight stream/path
-submodules and `console` module (flagged unconfirmed in the prior handoff) are now confirmed
-committed in `eb0611a`, along with the readline circular-import fix — see the dedicated
-"Stream/path submodules" open-thread entry below, now marked resolved. Roadmap doc updated to
-reflect Node core module parity as complete and Scala.js as resolved (`bb92be9`). See "Open
-threads" for what's newly open this session (Truffle embedding JAR gap, Bun/Deno runtime
-compat, value proposition, stub/throws inventory, and others).* Previous handoff (session
-handoff #3: Node stdlib completion. `dgram` and `cluster` — the
-last two modules with no implementation at all — are now implemented, closing that gap. 14
-niche/deprecated modules landed: `constants`, `domain`, `punycode`, `sys`, `repl`,
-`trace_events`, `v8`, `wasi`, `inspector`, `inspector/promises`, `node:test`,
-`node:test/reporters`, `node:sea`, `node:sqlite`. `NodeParityTest.kt`'s `MODULES` list — flagged
-as behind the implemented-module set in the previous handoff — now covers the full set (52
-dynamic parity tests), closing the test-coverage gap. Total module count: 50+ (up from ~30).
-Scala.js auto-download landed via a `GitHubRelease` `ToolSource` for scala-cli (same pattern as
-Gleam/Dart), which required `ToolResolver` to learn a new archive shape — a bare `.gz`-compressed
-binary, not wrapped in a tarball — since that's scala-cli's own release-asset convention. As of
-this update, stream/path submodules (`stream/promises`, `stream/consumers`, `stream/web`,
-`path/posix`, `path/win32`), a real `console` module, and a fix for the
-`readline`/`readline-promises` circular-import issue are **in flight, not yet confirmed
-landed/committed** — verify in-tree before treating as done. See "Open threads" at the end for
-full detail on all of the above. Previous handoff (session handoff #2: the daemon architecture
-scoped as an open thread
-earlier in the 2026-07-17 session is now fully implemented — Unix socket server, shared
-`Engine` across requests, per-request cwd/env/flags isolation, auto-start with config
-opt-out, 1h idle timeout, G1-tuned GC flags, XDG config with project-local override. The
-inter-core-module-import architecture gap is also fixed — GraalJS's dual-cache bug
-(`node:`-URI vs bare-specifier cache entries for the same module) found and fixed via
-specifier normalization in `CoreModuleRegistry`, and `EventEmitter` deduplicated out of
-`stream.mjs`/`http.mjs`/`https.mjs` into a single shared `events.mjs` import. Native-image
-build config fully removed (see below — was already noted earlier this session, reconfirmed).
-The event loop is now gated to JS only (`runEventLoop()` checks `language == "js"`);
-compile-to-JS languages still drain it via `JsSupport` delegation since their output runs as
-JS under the hood. See "Open threads" at the end for what's still unresolved.* Earlier
-2026-07-17 handoff (distribution architecture): GraalJS guest JIT confirmed already-on in
-native image, GraalJS-vs-V8 and native-image-vs-JVM-mode gaps measured, the "Oracle GraalVM
-1.55x" claim traced to a bad comparison and corrected; core runtime split into per-language
-Gradle configurations, cutting the baked-in binary from 887MB to a 22MB core with languages
-loaded on demand; G1 GC memory-reclamation flags benchmarked; setTimeout/setInterval event
-loop bug fixed. Previous handoff (2026-07-16): compile-to-JS grew from 7 to 12 languages —
-Gleam, Imba, Dart, Kotlin/JS, Scala.js all landed, no longer "investigated, not added";
-pure-Kotlin registry infrastructure gained a content-addressable store, `HttpMetadataCache`
-ETag/conditional-GET, version-aware `ToolResolver` with resolution caching. This file is the
-project's institutional memory — written to survive context compaction. Treat as reliable
-background, but verify against code before relying on specifics that could have drifted.*
-
-## Daemon architecture — RESOLVED/implemented this session (was "new, unresolved" above)
-
-Fully implemented, not just scoped. Code lives in
-`library/src/main/kotlin/org/mycelium/library/daemon/` (`DaemonServer.kt`, `DaemonClient.kt`,
-`DaemonPaths.kt`, `Protocol.kt`) plus `library/src/main/kotlin/org/mycelium/library/config/Config.kt`
-and `app/src/main/kotlin/org/mycelium/app/App.kt`/`DaemonLauncher.kt`:
-
-- **Unix socket transport**: `DaemonServer` listens on a `UnixDomainSocketAddress`; socket/PID
-  paths resolved by `DaemonPaths` (`$XDG_RUNTIME_DIR/mycelium`, falling back to a per-user
-  `/tmp/mycelium-$USER` if `XDG_RUNTIME_DIR` isn't set).
-- **Shared `Engine`, per-request isolation**: one GraalVM `Engine` is reused across every
-  request the daemon serves (this is the whole point — amortizing JVM/Context/Engine startup),
-  but each request gets its own `Context` built with `Context.Builder.currentWorkingDirectory(Path)`
-  and `.environment(Map)` so concurrent/sequential invocations from different cwds or with
-  different env vars never leak state into each other. This is the same
-  `currentWorkingDirectory`/`environment` builder API `Mycelium.kt` already used for
-  single-shot (non-daemon) runs — the daemon path reuses it per-request rather than inventing a
-  separate isolation mechanism.
-- **Auto-start with config opt-out**: `mycelium run`/`mycelium <file>` auto-starts a background
-  daemon on first use unless disabled; `App.kt`'s `maybeStartDaemon`-equivalent checks
-  `daemonConfig.enabled` (from `Config.kt`, defaults `true`) and returns early (no daemon,
-  falls back to a cold in-process run) if the user opted out via config.
-- **1h idle timeout**: `DaemonServer`'s idle-check thread shuts the daemon down after
-  `idleTimeoutSeconds` (default `3600L`, i.e. 1 hour) of inactivity since the last request —
-  configurable via the daemon's own launch args.
-- **G1-tuned GC flags applied at daemon launch**: `App.kt` launches the daemon subprocess with
-  `-XX:+UseG1GC -XX:G1PeriodicGCInterval=1000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=20`
-  — the exact flags benchmarked earlier this session (see "Memory reclamation" below), now
-  actually wired into the daemon's own JVM invocation rather than just a benchmarking note.
-- **XDG-compliant config with project-local override**: `Config.kt` loads
-  `$XDG_CONFIG_HOME/mycelium/config.toml` (default `~/.config/mycelium/config.toml`) first,
-  then merges in the nearest `.mycelium/config.toml` found walking up from the working
-  directory — project-local settings win over the user-global file, per the constraint scoped
-  earlier this session. Config is a hand-rolled parser for the small TOML subset Mycelium
-  actually needs (no external TOML dependency).
-- All four constraints scoped earlier this session before implementation are satisfied: works
-  with or without the daemon (opt-out via config, cold single-shot path unchanged), XDG config
-  with project-local override, memory reclamation via the G1 flags, and IPC
-  transport/framing/lifecycle are now actually designed and built (Unix socket + a small
-  length-prefixed frame protocol in `Protocol.kt` + idle-timeout lifecycle), not just scoped.
-
-## Inter-core-module imports — RESOLVED this session (was "architectural gap, not started")
-
-Root cause found: GraalJS maintains **two separate module-cache entries for the same core
-module** depending on how it was imported — once under the `node:`-prefixed URI form and once
-under the bare specifier form (e.g. `"node:events"` vs `"events"`) — so `import { EventEmitter }
-from "events"` inside one core-module shim and `import ... from "node:events"` inside another
-loaded two different module instances instead of sharing one, breaking `instanceof`/shared-state
-assumptions between them. Fixed with specifier normalization in `CoreModuleRegistry.kt`
-(`normalizeCoreModuleSpecifiers`): every `node:`-prefixed *import/export specifier* in a core
-module's source text is rewritten to the bare form before the source is handed to GraalJS, so
-both forms resolve to the same cache entry. The normalization is specifier-aware (only rewrites
-actual `import`/`export ... from` specifiers, not arbitrary string data that happens to contain
-`"node:events"`).
-
-With that fixed, `EventEmitter` — previously duplicated inline in every core module that needed
-it — is now genuinely shared: `stream.mjs`, `http.mjs`, and `https.mjs` all `import { EventEmitter }
-from "events"` from the single `events.mjs` implementation instead of carrying their own copy.
-`child_process.mjs` was already importing it this way. This closes the item tracked below under
-"Open threads" in the previous version of this file — see that section's note for full
-before/after detail, now resolved rather than open.
+*Updated 2026-07-17 (session handoff #5: GraalVM Insight integration, mod loader, daemon
+reliability. This session pivoted from Node-stdlib/compat sweeps toward JVM-level extensibility:
+`--insight=<script>` dynamic instrumentation landed; a full mod loader (discovery, descriptors,
+transformers, priority dispatch, dependency resolution, version checking, a helper DSL) was
+built and shipped with three working example mods; the daemon gained a version handshake and a
+bypass path for JVM-level features; hybrid cross-language metaprogramming was explored
+experimentally (findings only, not committed). See "Open threads" below for full detail on all
+of this session's work, plus everything still open from before.* Previous handoff (session
+handoff #4: stub audit + Truffle-embedding-JAR visibility fix — silent-wrong-answer stubs
+replaced with real implementations, `polyglot`/`truffle-api` exposed as `api` deps for `Engine`
+visibility, stream/path submodules and Scala.js auto-download confirmed landed). Previous
+handoffs (#1-#3): daemon architecture (Unix socket, shared `Engine`, per-request isolation),
+inter-core-module import fix, native-image removal, distribution architecture resolution
+(JVM mode over native-image), Node stdlib completion (dgram/cluster, 14 niche modules),
+compile-to-JS growth to 12 languages. All of that is committed and in git history — condensed
+out of this file per the "remove RESOLVED cruft" rule below. This file is the project's
+institutional memory — written to survive context compaction. Treat as reliable background, but
+verify against code before relying on specifics that could have drifted.*
 
 ## Native-image build removed — reconfirmed this session (see also below, same item)
 
@@ -431,43 +335,69 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 *Open threads from a previous session. Treat as starting context, not instructions — verify
 relevance before acting.*
 
-### Distribution architecture — RESOLVED this session (was "the central unresolved question")
-Previous session left four open questions: whether native-image already had (or could get)
-runtime JIT for V8-like fast-startup-plus-peak-perf; whether Oracle GraalVM's reported
-~1.55x throughput edge over CE reopened native-image as the throughput-competitive option;
-how native-image compares to JVM mode; and how to shrink the 887MB binary. All four are now
-answered with real numbers, not guesses:
+### GraalVM Insight — integrated, untested in production
+`--insight=<script>` flag lands GraalVM's dynamic-instrumentation API (Instrument API) in
+Mycelium; tested with source-load tracing. Known limitation, by design: the daemon path does
+not forward insight scripts to a running daemon — the daemon bypass added this session (see
+"Daemon reliability" below) routes insight (and mod-loader) invocations to an in-process JVM
+run instead, since instrumentation needs to attach to the actual `Engine`/`Context` being
+built, not a pre-existing shared one. Open question: should Mycelium ship built-in instrument
+scripts (e.g. a cross-language call tracer) rather than leaving `--insight` purely
+bring-your-own-script?
 
-1. **GraalJS already has guest JIT in native image — it's the default, not experimental.**
-   The "investigate runtime JIT compilation" thread is resolved: there is nothing left to
-   turn on. The Graal compiler is statically linked into the native image and JITs hot JS at
-   runtime via partial evaluation, same as JVM mode. This was the mechanism the previous
-   session hoped would give "V8-like" behavior in a single binary — it's already there.
-2. **GraalJS vs V8 peak throughput does not close, and it's structural, not a packaging
-   artifact.** Octane aggregate: V8 39,145 vs GraalJS 22,350 (~1.5-2x slower). On tight
-   numeric loops GraalJS can actually win (RayTrace). On non-loop-heavy workloads the gap can
-   blow out to 80x. No native-image/JVM-mode/JIT-tuning knob changes this — it's the engine.
-   **Conclusion: JS performance is conceded.** The polyglot story (one process, every
-   ecosystem, no FFI) is the value proposition, not JS execution speed.
-3. **Native image has lower peak throughput than JVM mode, even after guest JIT warmup** —
-   confirmed, not just asserted. The gap traces to Substrate VM's simpler GC, lack of
-   compressed OOPs, and general HotSpot maturity that Substrate VM hasn't caught up to.
-   TruffleRuby's own docs explicitly recommend `--jvm` over native-image for
-   throughput-sensitive production use — this matches what Mycelium found independently.
-4. **The "Oracle GraalVM ~1.55x faster than CE" claim from the previous session was wrong —
-   corrected, not just re-verified.** The 1.55x number was Oracle GraalVM in **JVM mode**
-   vs **OpenJDK 8** on the Renaissance benchmark (geomean) — not Oracle **native image** vs
-   CE **native image**, which is the comparison that would have actually mattered for the
-   native-image-vs-JVM-mode decision. Any doc or note elsewhere citing "Oracle GraalVM 1.55x
-   faster than CE at peak performance" is repeating this error; there is no confirmed
-   Oracle-vs-CE native-image throughput multiplier as of this session.
+### Mod loader — functional, room to grow
+Infrastructure is complete: mod discovery, descriptors, transformers, priority-ordered
+dispatch, dependency resolution, version checking, and a helper DSL (`patchClass`,
+`afterCallsTo`, `redirectCallsTo`) for writing mods without touching Truffle internals
+directly. Three working example mods ship: cursed-addition (`1 + 1 = 3`), null-safe property
+access (`null.foo` returns `undefined` instead of throwing), and strict equality (`==` behaves
+like `===`). This is the concrete instance behind the "mod loader for language runtimes" value
+proposition above. Open questions/gaps:
+- **Mixin integration** — research done (`docs/research/java-modding-systems.md`): realistic,
+  but Mycelium would be the first non-Minecraft consumer of Mixin-style bytecode weaving.
+  Unevaluated whether it's worth the dependency.
+- **Mod authoring docs** — nothing written yet on how a mod author finds the right Truffle
+  node class to patch, or how to use the helper DSL in practice. Currently only discoverable by
+  reading the three example mods' source.
+- **`obj[x]` computed access not covered by the null-safe mod** — it patches a different node
+  than property access (`.foo`); computed/bracket access goes through `ReadElementNode`, not
+  yet handled.
+- **GraalJS constant-folds literal arithmetic at parse time** — mod patches on arithmetic nodes
+  only affect *non-constant* operands (`x + y` where `x`/`y` are variables), not literal
+  expressions like `1 + 1` that the parser folds before any node-level patch point exists. This
+  is why cursed-addition works as a demo but wouldn't intercept every `+` in a real program —
+  worth documenting explicitly for mod authors so it isn't discovered the hard way.
+- **More mod ideas floated, not started**: proper tail calls, operator overloading, integer
+  division.
 
-**Net direction**: JVM mode is the path forward, not native-image. `./gradlew :app:jvmRun`
-already works (~0.9s cold startup) and is the vehicle for on-demand per-language JAR loading
-(see "Architecture decisions" above — core runtime is now 22MB with zero languages baked in,
-addressing the old 887MB-binary complaint independently of the native-image-vs-JVM question).
-The open follow-on from this resolution is *how* to make JVM-mode startup cost disappear for
-CLI-style single-shot invocations — see "Daemon architecture" in the new open threads below.
+### Hybrid metaprogramming — partial results, not committed
+Experimental session exploring cross-language metaprogramming across the shared polyglot
+`Context` — findings only, nothing landed in git. Tested: Ruby `method_missing` on JS objects,
+Python `__getattr__` on Ruby hashes, JS `Proxy` on Ruby objects, Ruby `Enumerable` duck-typing
+(`each`/`map`/`respond_to?`) on JS arrays. What works: `method_missing`, `__getattr__`, `Proxy`
+get/set traps, and the duck-typing cases. What's flattened/broken: Ruby singleton classes don't
+survive being applied to a foreign (non-Ruby) object; JS `Proxy`'s `has` trap returns the wrong
+answer when the target is a Ruby hash's keys; Ruby's `send` to a missing member on a foreign
+object throws an uncatchable *internal* error rather than a catchable Ruby exception.
+JS-to-Python interop is entirely blocked by the pre-existing GraalPython `FileSystem` bug (see
+"Python — blocked upstream" above) — couldn't even get far enough to test hybrid patterns
+there. Not a current priority, but the specific working/broken cases above are worth knowing if
+this gets picked back up, since none of it is written down anywhere except this note.
+
+### Daemon reliability
+Two changes this session, both aimed at a specific failure mode where a stale daemon kept
+intercepting test runs during development:
+- **Version handshake added to the wire protocol** — the client now sends its version on
+  connect; the daemon rejects (and auto-shuts-down) on a version mismatch instead of silently
+  serving requests with stale code. This is the fix for the recurring "stale daemon intercepts
+  every test run" problem, but it was not tested end-to-end against the new code by the end of
+  the session — verify it actually triggers the shutdown path before relying on it.
+- **Daemon bypass for JVM-level features** — `--insight` and mod-loader invocations skip the
+  daemon and run in-process instead, since both need direct access to the `Engine`/`Context`
+  under construction (see "GraalVM Insight" above).
+- **Still open, undiagnosed**: a "ZipFile invalid LOC header" daemon bug surfaced repeatedly
+  during this session's testing. Not root-caused. Worth investigating first if daemon flakiness
+  shows up again next session.
 
 ### Rust/Go auto-install gap — architecture gap, not a registry-client gap
 `CratesIoClient`/`GoProxyClient` (pure-Kotlin `PackageIndex` implementations, same shape as
@@ -478,28 +408,6 @@ pipeline: `RustSupport`/`TinyGoSupport` each compile a single source file straig
 standalone LLVM-bitcode/WASM unit (`Compiler.compile`), with no dependency-graph resolution or
 multi-unit linking step at all — there's no compile-time seam an auto-fetched crate/module's
 compiled output could plug into today without that linking architecture existing first.
-
-### Scala.js auto-download — RESOLVED this session
-A `GitHubRelease` `ToolSource` for scala-cli is now wired into Scala.js's `ToolSource` chain in
-`CompilerRegistry.kt` (`ProjectLocalBin` → `SystemPath` → `CachedPackage` → `RegistryDownload` →
-`GitHubRelease`), the same pattern Gleam and Dart already used. This required extending
-`ToolResolver` with `extractPlainGzip` — scala-cli's own GitHub release assets (e.g.
-`scala-cli-x86_64-pc-linux-static.gz`) are a bare gzip-compressed binary, not a `.tar.gz`/`.tgz`
-tarball the way Gleam's release assets are, so the existing tar-extraction path in `ToolResolver`
-didn't cover this shape and needed a distinct code path. `scalaCliReleaseAssetName` in
-`CompilerRegistry.kt` maps this JVM's OS/arch to the exact asset name scala-cli's release
-workflow publishes (verified against the real GitHub release asset list), with Windows using
-`.zip` instead. `scala-cli version --offline` is used to validate the resolved binary's version
-against a project's own constraint, same as every other `ToolResolver`-mediated tool.
-
-### Stream/path submodules + console module, and the readline circular-import fix — RESOLVED
-Landed in `eb0611a` (confirmed via `git log` on the files and a clean `git status`):
-`stream-promises.mjs`, `stream-consumers.mjs`, `stream-web.mjs`, `path-posix.mjs`,
-`path-win32.mjs`, `console.mjs` all exist under `library/src/main/resources/node-stdlib/` and
-are committed. The `readline`/`readline-promises` circular-import fix (GraalJS failing to
-evaluate a module cycle where a binding is imported before it's initialized —
-`readline-promises.mjs` subclassing `Interface` from `readline.mjs` while `readline.mjs`
-imported back from `readline-promises.mjs`) landed in the same commit.
 
 ### Fable (F# → JS) — closest remaining compile-to-JS candidate, still blocked
 `@fable-org/fable-compiler-js` needs no .NET runtime, but its npm `bin` is a plain JS file that
@@ -514,13 +422,6 @@ Kotlin/JVM application, it may be possible to invoke the Kotlin/JS compiler in-p
 library call instead of shelling out to a separate `kotlinc-js` process — would save
 process-spawn overhead on every compile. Unexplored.
 
-### Daemon architecture — RESOLVED/implemented this session
-See "Daemon architecture — RESOLVED/implemented this session" near the top of this file for
-full detail: Unix socket transport, shared `Engine` with per-request `Context`
-cwd/env isolation, auto-start with config opt-out, 1h idle timeout, G1-tuned GC flags applied
-at launch, XDG config with project-local override. All constraints scoped when this thread was
-first opened earlier in the same 2026-07-17 session are now satisfied.
-
 ### Memory reclamation — benchmarked this session, informs the daemon design above
 G1 GC with tuned flags reclaims aggressively after a load spike: peak 1914MB → 187MB idle
 within 30s, using `-XX:+UseG1GC -XX:G1PeriodicGCInterval=1000 -XX:MinHeapFreeRatio=10
@@ -530,14 +431,6 @@ for this workload (held more memory, not less) — counter to the general expect
 is the "give memory back" collector; not re-investigated further this session, just noted as
 a negative result. These flags are the starting point for daemon-mode JVM tuning once the
 daemon architecture above is actually built.
-
-### Inter-core-module import problem — RESOLVED this session
-See "Inter-core-module imports — RESOLVED this session" near the top of this file for full
-detail: root cause was GraalJS's dual module-cache-entry bug (`node:`-prefixed URI vs bare
-specifier resolving to two separate cached module instances for the same core module), fixed
-via specifier normalization in `CoreModuleRegistry.kt`. `EventEmitter` is now genuinely shared
-(imported from `events.mjs`) by `stream.mjs`, `http.mjs`, `https.mjs`, and `child_process.mjs`
-rather than duplicated inline.
 
 ### Node stdlib `.mjs` shims — confirmed intentional, not tech debt
 Revisited this session: the choice to implement Node core modules as JS-side `.mjs` shims
@@ -565,16 +458,23 @@ tested fallback) — see "Bun/Deno Compatibility Strategy" above for the fuller 
 rationale already agreed on. The API surface for `Bun.*`/`Deno.*` globals is well-documented
 upstream but large. No implementation work started yet.
 
-### Value proposition — still unclear, worth sitting with
-Genuinely unclear beyond "it's funny." Candidates discussed: universal *host* (as opposed to
-WASM's universal *target* — WASM strips a package out of its ecosystem, Mycelium preserves
-it), cross-ecosystem package reuse, "you have code, we run code." None felt definitive as of
-this session. Matters because it shapes which open threads are worth prioritizing next.
+### Value proposition — advanced this session, not settled
+Previously "genuinely unclear beyond 'it's funny.'" This session explored it extensively and
+landed on a new candidate: **mod loader for programming language runtimes**. No prior art
+exists for this — Minecraft-style mod loading (discovery, descriptors, dependency resolution,
+version checking, priority-ordered dispatch) applied to a JVM language runtime instead of a
+game. The framing that stuck: *because it's funny / because it's technically possible* — not a
+business case, not (yet) a technical necessity, but a genuinely novel angle that the polyglot
+story alone didn't have. Older candidates (universal *host* vs WASM's universal *target*,
+cross-ecosystem package reuse, "you have code, we run code") are still live but felt less
+distinctive once the mod loader angle showed up. Not resolved as THE identity — worth sitting
+with further — but significantly advanced from "unclear" to "strong candidate with a name."
 
 ### GraalJS vs V8 throughput — settled, not open, noted for context
-Structural ~1.5-2x gap, conceded (see "Distribution architecture — RESOLVED" above for the
-numbers). JS execution speed is not the value proposition; polyglot interop is. Listed here
-only so a future session doesn't reopen it as if unresolved.
+Structural ~1.5-2x gap, conceded (Octane aggregate: V8 39,145 vs GraalJS 22,350; on non-loop-heavy
+workloads the gap can blow out to 80x — no native-image/JVM-mode/JIT-tuning knob changes this,
+it's the engine). JS execution speed is not the value proposition; polyglot interop is. Listed
+here only so a future session doesn't reopen it as if unresolved.
 
 ### Stub/throws inventory — known remainder after this session's fixes
 Full-codebase audit found 27 FULL, 20 PARTIAL, 7 STUB, 3 THROWS implementations across Node

@@ -5,4 +5,4 @@ plugins {
 
 rootProject.name = "mycelium"
 
-include("app", "library", "mod-loader", "example-mod", "null-safe-mod", "strict-equality-mod", "integer-division-mod")
+include("app", "library", "mod-loader", "example-mod", "null-safe-mod", "strict-equality-mod", "integer-division-mod", "operator-overloading-mod", "ptc-mod")

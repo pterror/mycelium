@@ -82,17 +82,25 @@ val jvmRun by tasks.registering(JavaExec::class) {
     }
 
     // `-Pmod`: attaches the mod-loader jar as a `-javaagent:` and points it at a mods
-    // directory containing example-mod's, null-safe-mod's, strict-equality-mod's, and
-    // integer-division-mod's jars. example-mod, via ASM, patches GraalJS's JSAddNodeGen at
-    // class-load time so int addition returns one extra — e.g. `1 + 1 === 3`. null-safe-mod
-    // patches PropertyGetNode$TypeErrorPropertyGetNode.getValue so that
+    // directory containing example-mod's, null-safe-mod's, strict-equality-mod's,
+    // integer-division-mod's, operator-overloading-mod's, and ptc-mod's jars. example-mod,
+    // via ASM, patches GraalJS's JSAddNodeGen at class-load time so int addition returns one
+    // extra — e.g. `1 + 1 === 3`. null-safe-mod patches
+    // PropertyGetNode$TypeErrorPropertyGetNode.getValue so that
     // `null.foo`/`undefined.foo` return `undefined` instead of throwing a TypeError.
     // strict-equality-mod patches NodeFactory.createBinaryEqual so `==`/`!=` behave like
     // `===`/`!==`. integer-division-mod patches JSDivideNode so `/` truncates to integer,
-    // C-style. See mod-loader/ for the generic loader, example-mod/, null-safe-mod/,
-    // strict-equality-mod/, and integer-division-mod/ for those mods. Pass
-    // `-PmodsDir=<path>` to point at a different mods directory instead of the default (a
-    // `mods/` staging directory under the build dir, populated with all mods' jars).
+    // C-style. operator-overloading-mod patches JSContextOptions.isOperatorOverloading
+    // (and, belt-and-suspenders, OperatorsBuiltins.checkOverloadedOperatorsAllowed) so
+    // GraalJS's built-in (but normally opt-in) `Operators(...)` overloading API is always
+    // exposed as a JS global. ptc-mod patches ReturnNode$TerminalPositionReturnNode,
+    // JSFunctionCallNode, and FunctionRootNode to trampoline self tail-recursive calls
+    // (`return f(...)` inside `f`) so they run in a loop instead of growing the stack. See
+    // mod-loader/ for the generic loader, example-mod/, null-safe-mod/,
+    // strict-equality-mod/, integer-division-mod/, operator-overloading-mod/, and ptc-mod/
+    // for those mods. Pass `-PmodsDir=<path>` to point at a
+    // different mods directory instead of the default (a `mods/` staging directory under
+    // the build dir, populated with all mods' jars).
     if (project.hasProperty("mod")) {
         dependsOn(
             ":mod-loader:jar",
@@ -100,12 +108,16 @@ val jvmRun by tasks.registering(JavaExec::class) {
             ":null-safe-mod:jar",
             ":strict-equality-mod:jar",
             ":integer-division-mod:jar",
+            ":operator-overloading-mod:jar",
+            ":ptc-mod:jar",
         )
         val agentJar = project(":mod-loader").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val exampleModJar = project(":example-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val nullSafeModJar = project(":null-safe-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val strictEqualityModJar = project(":strict-equality-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val integerDivisionModJar = project(":integer-division-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val operatorOverloadingModJar = project(":operator-overloading-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
+        val ptcModJar = project(":ptc-mod").tasks.named<Jar>("jar").flatMap { it.archiveFile }
         val modsDirProp = project.findProperty("modsDir") as String?
         val stagedModsDir = layout.buildDirectory.dir("mods")
         doFirst {
@@ -118,6 +130,8 @@ val jvmRun by tasks.registering(JavaExec::class) {
                 nullSafeModJar.get().asFile.copyTo(File(dir, "null-safe-mod.jar"), overwrite = true)
                 strictEqualityModJar.get().asFile.copyTo(File(dir, "strict-equality-mod.jar"), overwrite = true)
                 integerDivisionModJar.get().asFile.copyTo(File(dir, "integer-division-mod.jar"), overwrite = true)
+                operatorOverloadingModJar.get().asFile.copyTo(File(dir, "operator-overloading-mod.jar"), overwrite = true)
+                ptcModJar.get().asFile.copyTo(File(dir, "ptc-mod.jar"), overwrite = true)
                 dir
             }
             jvmArgs(

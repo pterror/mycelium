@@ -378,6 +378,8 @@ Mod patches on arithmetic nodes only affect the second case. Your patch will int
 
 Plan your mods with this in mind. Test with real code, not just contrived constant examples.
 
+**This is fixable, though rarely needed.** Each binary operation node class (JSAddNode, JSSubtractNode, etc.) exposes a static `createUnoptimized()` method that bypasses constant folding entirely. A mod can redirect all calls to `NodeFactory.create()` factory methods toward their `createUnoptimized()` counterparts — using the same `redirectCallsTo` pattern as the strict-equality mod. This would require redirects for roughly 15–20 binary operation classes. The tradeoff: constant arithmetic expressions evaluate at runtime instead of at parse time. For most programs this performance difference is negligible, but it's worth understanding if you're intercepting arithmetic for some reason and find yourself surprised by missing constants.
+
 ## Tips and Patterns
 
 ### Debugging patches

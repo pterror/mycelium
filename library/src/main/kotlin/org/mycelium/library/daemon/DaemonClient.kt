@@ -14,6 +14,13 @@ import java.nio.channels.SocketChannel
  * fully read — matching DaemonServer.handleClient's one-request-per-connection protocol.
  */
 object DaemonClient {
+    // Sent as a top-level "version" field on every request frame so the daemon can detect a
+    // client/daemon mismatch (e.g. the CLI was upgraded but an old daemon is still running
+    // from before the upgrade) — see DaemonServer.handleClient for the check. Matches the
+    // string App.kt's `version` command prints; kept as a constant (not derived at runtime)
+    // so client and server always compare the same literal.
+    const val VERSION = "0.1.0-dev"
+
     private fun connect(socketPath: File): SocketChannel =
         SocketChannel.open(UnixDomainSocketAddress.of(socketPath.toPath()))
 
@@ -31,9 +38,11 @@ object DaemonClient {
 
     /** Runs `file` via the daemon, writing `stdout`/`stderr` response frames to the given
      * streams as they arrive. Returns the exit code the daemon reports, or 1 with a message
-     * on `stderr` if the connection drops before an `exit` frame arrives. Throws IOException
-     * if the daemon can't be reached at all, so the caller can decide whether to fall back
-     * to running in-process.
+     * on `stderr` if the connection drops before an `exit` frame arrives, or null if the
+     * daemon rejected the request over a version mismatch or announced it's shutting down —
+     * in both of those cases the caller (see App.kt's `tryRunViaDaemon`) should fall back to
+     * running in-process. Throws IOException if the daemon can't be reached at all, so the
+     * caller can decide whether to fall back to running in-process.
      *
      * `cwd`/`env` default to this (client) process's own working directory/environment —
      * i.e. the caller's, not the daemon's — so a plain call here already makes the request
@@ -49,11 +58,13 @@ object DaemonClient {
         noInstall: Boolean = false,
         stdout: OutputStream = System.out,
         stderr: OutputStream = System.err,
-    ): Int {
+    ): Int? {
         connect(socketPath).use { channel ->
             val input = Channels.newInputStream(channel)
             val output = Channels.newOutputStream(channel)
-            FrameIO.writeFrame(output, DaemonRequest.Run(file, args, cwd, env, yolo, noInstall).toJson())
+            val requestJson = DaemonRequest.Run(file, args, cwd, env, yolo, noInstall).toJson()
+                .put("version", VERSION)
+            FrameIO.writeFrame(output, requestJson)
             while (true) {
                 val frame = FrameIO.readFrame(input) ?: run {
                     stderr.write("mycelium: daemon closed connection unexpectedly\n".toByteArray(Charsets.UTF_8))
@@ -69,6 +80,19 @@ object DaemonClient {
                         stderr.flush()
                     }
                     "exit" -> return frame.optInt("code", 0)
+                    "error" -> {
+                        stderr.write(
+                            "mycelium: ${frame.optString("message", "daemon reported an error")}\n"
+                                .toByteArray(Charsets.UTF_8),
+                        )
+                        return null
+                    }
+                    "shutdown" -> {
+                        System.err.println(
+                            "mycelium: daemon is shutting down (${frame.optString("reason")}), falling back",
+                        )
+                        return null
+                    }
                 }
             }
         }
@@ -77,7 +101,10 @@ object DaemonClient {
     /** Asks the daemon to stop; returns false if it couldn't be reached (already down). */
     fun stop(socketPath: File): Boolean = try {
         connect(socketPath).use { channel ->
-            FrameIO.writeFrame(Channels.newOutputStream(channel), DaemonRequest.Stop.toJson())
+            FrameIO.writeFrame(
+                Channels.newOutputStream(channel),
+                DaemonRequest.Stop.toJson().put("version", VERSION),
+            )
         }
         true
     } catch (e: IOException) {
@@ -89,7 +116,7 @@ object DaemonClient {
         connect(socketPath).use { channel ->
             val input = Channels.newInputStream(channel)
             val output = Channels.newOutputStream(channel)
-            FrameIO.writeFrame(output, DaemonRequest.Status.toJson())
+            FrameIO.writeFrame(output, DaemonRequest.Status.toJson().put("version", VERSION))
             FrameIO.readFrame(input)?.let { DaemonStatus.fromJson(it) }
         }
     } catch (e: IOException) {

@@ -36,6 +36,16 @@ class DaemonServer(
     private val pidPath: File,
     private val idleTimeoutSeconds: Long,
 ) {
+    companion object {
+        // Must match DaemonClient.VERSION — see handleClient for the compatibility check
+        // this backs. Kept as its own constant (rather than a shared reference) since
+        // DaemonClient and DaemonServer are meant to be independently deployable binaries
+        // (client is embedded in the CLI jar, server is forked as its own JVM process), so
+        // a mismatch between the two literals is exactly the scenario this check exists to
+        // catch.
+        const val VERSION = "0.1.0-dev"
+    }
+
     private val engine: Engine = Engine.newBuilder().build()
     private val startedAtMillis = System.currentTimeMillis()
     @Volatile private var lastActivityMillis = System.currentTimeMillis()
@@ -112,6 +122,42 @@ class DaemonServer(
         val input = Channels.newInputStream(channel)
         val output = Channels.newOutputStream(channel)
         val requestJson = FrameIO.readFrame(input) ?: return
+
+        // Version handshake: every request frame carries a top-level "version" field (see
+        // DaemonClient's request builders). A client without one is an old build predating
+        // this check — proceed anyway (backwards compat) but warn, since it means the
+        // client/daemon pairing can't be verified. A client with a *different* version is
+        // rejected outright: request/response shapes aren't guaranteed compatible across
+        // versions, so honoring the request risks a confusing failure deeper in handling
+        // rather than a clear error here.
+        val clientVersion = if (requestJson.has("version")) requestJson.optString("version") else null
+        if (clientVersion == null) {
+            System.err.println(
+                "mycelium daemon: client sent no version (pre-handshake build) — proceeding anyway",
+            )
+        } else if (clientVersion != VERSION) {
+            FrameIO.writeFrame(
+                output,
+                JSONObject()
+                    .put("type", "error")
+                    .put("message", "version mismatch: client=$clientVersion daemon=$VERSION"),
+            )
+            if (clientVersion > VERSION) {
+                // The client was upgraded but this daemon is still running the old build —
+                // it can never serve this (or any future) client correctly again, so tell
+                // the client to fall back for this request and take the whole daemon down
+                // rather than leaving a stale daemon around to keep failing every request.
+                FrameIO.writeFrame(
+                    output,
+                    JSONObject()
+                        .put("type", "shutdown")
+                        .put("reason", "stale daemon — client is newer"),
+                )
+                stopListening()
+            }
+            return
+        }
+
         val request = DaemonRequest.fromJson(requestJson)
         requestCount++
         when (request) {

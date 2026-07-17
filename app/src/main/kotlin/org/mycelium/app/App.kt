@@ -81,6 +81,16 @@ fun main(args: Array<String>) {
 }
 
 private fun runFile(path: String, yolo: Boolean, noInstall: Boolean, insightScript: String?) {
+    // JVM-level features (the GraalVM Insight instrumentation script) can't work through the
+    // daemon — the daemon's shared Engine/Context wasn't started with them, so routing
+    // through it would silently drop the feature. Skip straight to in-process. (The mod
+    // loader, `-Pmod`, is a Gradle/JVM-level concern handled by the `jvmRun` task rather than
+    // by this CLI's argument parsing, so it never reaches here and needs no equivalent check.)
+    if (insightScript != null) {
+        runFileInProcess(path, yolo, noInstall, insightScript)
+        return
+    }
+
     val config = Config.load()
     val absolutePath = File(path).absolutePath
     val exitCode = tryRunViaDaemon(config.daemon, absolutePath, yolo, noInstall)

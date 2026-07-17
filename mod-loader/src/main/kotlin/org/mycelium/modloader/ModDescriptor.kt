@@ -14,6 +14,10 @@ package org.mycelium.modloader
  * - [transformers]: fully-qualified class names implementing [ModTransformer]
  * - [priority]: numeric priority, default 1000, higher runs later (same convention as
  *   Mixin)
+ * - [depends]: map of mod id -> semver range string (see [SemVer]) that must be present
+ *   and match for this mod to load
+ * - [breaks]: map of mod id -> semver range string (see [SemVer]) that, if present and
+ *   matching, prevents this mod from loading
  */
 data class ModDescriptor(
     val id: String,
@@ -24,6 +28,8 @@ data class ModDescriptor(
     val targetVersion: String?,
     val transformers: List<String>,
     val priority: Int,
+    val depends: Map<String, String> = emptyMap(),
+    val breaks: Map<String, String> = emptyMap(),
 ) {
     companion object {
         const val DEFAULT_PRIORITY = 1000
@@ -56,6 +62,8 @@ data class ModDescriptor(
                 is Int -> p
                 else -> throw ModDescriptorException("mod.json 'priority' must be a number")
             }
+            val depends = parseStringMap(root["depends"], id, "depends")
+            val breaks = parseStringMap(root["breaks"], id, "breaks")
 
             return ModDescriptor(
                 id = id,
@@ -66,7 +74,21 @@ data class ModDescriptor(
                 targetVersion = targetVersion,
                 transformers = transformers,
                 priority = priority,
+                depends = depends,
+                breaks = breaks,
             )
+        }
+
+        /** Parses an optional `{ "modId": "range" }` object field, e.g. `depends`/`breaks`. */
+        private fun parseStringMap(value: Any?, modId: String, fieldName: String): Map<String, String> {
+            if (value == null) return emptyMap()
+            @Suppress("UNCHECKED_CAST")
+            val map = value as? Map<String, Any?>
+                ?: throw ModDescriptorException("mod.json '$modId' field '$fieldName' must be an object")
+            return map.mapValues { (key, v) ->
+                v as? String
+                    ?: throw ModDescriptorException("mod.json '$modId' field '$fieldName.$key' must be a string")
+            }
         }
     }
 }

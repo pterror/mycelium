@@ -8,5 +8,7 @@
   "transformers": [
     "com.example.CursedAdditionTransformer"
   ],
-  "priority": 1000
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
 }

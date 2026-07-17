@@ -1,0 +1,14 @@
+{
+  "id": "ptc",
+  "name": "Proper Tail Calls",
+  "version": "1.0.0",
+  "description": "Trampoline-based proper tail calls: self tail-recursive functions (return f(...) inside f) no longer grow the stack and won't stack-overflow",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": [
+    "org.mycelium.ptc.TailCallTransformer"
+  ],
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
+}

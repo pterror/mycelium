@@ -1,0 +1,12 @@
+{
+  "id": "operator-overloading",
+  "name": "Operator Overloading",
+  "version": "1.0.0",
+  "description": "Unlocks GraalJS's built-in operator overloading for user objects",
+  "targetRuntime": "graaljs",
+  "targetVersion": "25.0.0",
+  "transformers": ["org.mycelium.opoverload.OperatorOverloadingTransformer"],
+  "priority": 1000,
+  "depends": {},
+  "breaks": {}
+}

@@ -344,6 +344,16 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 *Open threads from a previous session. Treat as starting context, not instructions — verify
 relevance before acting.*
 
+### Truffle Lua implementation — high-priority upcoming work
+Full from-scratch Lua interpreter on GraalVM Truffle with polyglot interop. Not blocked by
+upstream (unlike Python). Complements existing language support (JS/Ruby native, compile-to-JS
+languages, LLVM/WASM compiled languages). Covers parser, AST with Truffle specializations,
+tables with metatables, standard libraries (string/math/table/io/os), coroutines via Truffle
+continuations, and polyglot interop annotations. Code should reference specific Lua spec
+sections. Value: Lua is widely used for config/scripting (embedded contexts, game engines);
+native Truffle implementation brings that entire ecosystem into Mycelium's shared polyglot
+Context alongside npm/PyPI/RubyGems.
+
 ### GraalVM Insight — integrated, untested in production
 `--insight=<script>` flag lands GraalVM's dynamic-instrumentation API (Instrument API) in
 Mycelium; tested with source-load tracing. Known limitation, by design: the daemon path does

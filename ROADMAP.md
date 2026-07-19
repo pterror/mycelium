@@ -186,6 +186,22 @@ niche/deprecated modules, and the `NodeParityTest.kt` coverage gap) has since be
 see "npm acid testing" and "Node stdlib completion" above. Only genuinely open items remain
 below.*
 
+### Truffle Lua implementation — high priority
+Full from-scratch Lua interpreter on GraalVM Truffle with polyglot interop. Covers:
+- Parser and AST nodes with Truffle specializations (direct/computed assignment, locals vs globals)
+- Table implementation (Lua's unified hash/array data structure with metatables)
+- Standard libraries: string, math, table, io, os (API surface matching Lua 5.3+)
+- Metatables and metamethods (custom operators, indexing, arithmetic)
+- Coroutines (via Truffle continuation integration, `coroutine.create`/`resume`/`yield`)
+- Polyglot interop annotations for seamless Java/JS/Ruby/Python calls from Lua scripts
+- Code comments should reference specific Lua spec sections where relevant
+
+Rationale: Lua is widely used in embedded contexts (game scripting, config files, extensions);
+a native Truffle implementation unifies Lua's ecosystem with Node/PyPI/RubyGems in Mycelium's
+polyglot context. Not blocked by upstream (unlike Python). Complements existing language
+coverage (JS native, Ruby native, Go/Rust/C as compile-to-LLVM/WASM; Lua would be the third
+native language after JS/Ruby).
+
 - **In-flight, not yet landed**: stream/path submodules (`stream/promises`,
   `stream/consumers`, `stream/web`, `path/posix`, `path/win32`), a real `console` module, and
   a fix for the `readline`/`readline-promises` circular-import issue.

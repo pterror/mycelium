@@ -2,11 +2,36 @@ package org.mycelium.library
 
 import org.graalvm.polyglot.Context
 
+// The cross-ecosystem package registries InterceptingFileSystem can resolve a bare import
+// specifier against — see LanguageSupport.packageEcosystemOrder.
+enum class PackageEcosystem { NPM, RUBYGEMS, PYPI }
+
 interface LanguageSupport {
     val languageId: String
     val extensions: List<String>
     val compilerCommand: List<String>?
     val needsCompilation: Boolean get() = compilerCommand != null
+
+    // The order in which InterceptingFileSystem.parsePath tries package ecosystems when
+    // resolving a bare specifier while this language is the guest call stack's own host
+    // language. Defaults to npm-first since that's the only ecosystem most LanguageSupports
+    // (JS itself, plus every compile-to-JS language) actually import from; RubySupport/
+    // PythonSupport override this to put their own ecosystem first instead, since a bare
+    // specifier encountered while the stack is inside Ruby/Python is far more likely to be
+    // a gem/PyPI package than an npm one, and checking it first avoids walking a
+    // node_modules tree that will never exist for it.
+    val packageEcosystemOrder: List<PackageEcosystem>
+        get() = DEFAULT_PACKAGE_ECOSYSTEM_ORDER
+
+    // The extension (with leading dot) Mycelium.evalModule writes its temp file with, so
+    // GraalVM's own source-sniffing (which keys off file extension for some languages) picks
+    // the right parser. Defaults to this language's first declared `extensions` entry;
+    // JsSupport overrides this to ".mjs" since a bare ".js" temp file can be ambiguously
+    // treated as CommonJS depending on the nearest ancestor package.json's "type" field,
+    // while ".mjs" is unambiguously ESM. Every JsSupport-delegating LanguageSupport (Coffee,
+    // Civet, ...) inherits ".mjs" too via `by JsSupport`, since none of them override this
+    // property themselves.
+    val moduleExtension: String get() = extensions.firstOrNull()?.let { ".$it" } ?: ".tmp"
 
     // Extension (without the dot) Compiler.compile should give the cached compiled
     // artifact. Defaults to "bc" (LLVM bitcode) since that's what every existing compiled
@@ -38,4 +63,9 @@ interface LanguageSupport {
     // evaluates it in this language, returning whether it actually ran (vs.
     // already-required) — the same true/false contract as Kernel#require's own return value.
     fun injectHttpRequire(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {}
+
+    companion object {
+        val DEFAULT_PACKAGE_ECOSYSTEM_ORDER =
+            listOf(PackageEcosystem.NPM, PackageEcosystem.RUBYGEMS, PackageEcosystem.PYPI)
+    }
 }

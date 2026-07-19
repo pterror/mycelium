@@ -227,44 +227,39 @@ class InterceptingFileSystem : FileSystem {
             val fromDir = currentResolutionDir()
             val hostLang = detectHostLanguageFromCallStack()
 
-            // "Try all, ordered by host language": a bare specifier encountered while the
-            // guest call stack is inside Ruby or Python is checked against that language's
-            // own package ecosystem (gems / site-packages) first, since that's by far the
-            // most likely match and doesn't require walking a node_modules tree that will
-            // never exist for it. Node's own resolution (below) is still attempted
-            // afterwards for every host language — a Ruby file might, e.g., import a
+            // Ordered by host language (see LanguageSupport.packageEcosystemOrder): a bare
+            // specifier encountered while the guest call stack is inside Ruby or Python is
+            // checked against that language's own package ecosystem (gems / site-packages)
+            // first, since that's by far the most likely match and doesn't require walking a
+            // node_modules tree that will never exist for it. Node's own resolution is still
+            // attempted for every host language — a Ruby file might, e.g., import a
             // cross-language JS package — and whichever of gem/site-packages resolution
             // wasn't already tried up front is attempted last, as a final fallback.
-            if (hostLang?.languageId == "ruby") {
-                rubyModuleResolver.resolveRubyGem(path)?.let { return it }
-            } else if (hostLang?.languageId == "python") {
-                pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
-            }
-
-            when (val resolution = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
-                is NodeModuleResolver.Resolution.Found -> return resolution.path
-                is NodeModuleResolver.Resolution.PackageNotFound -> {
-                    if (yolo) {
-                        val (packageName, _) = nodeModuleResolver.splitSpecifier(path)
-                        yoloInstall(packageName)
-                        when (val retry = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
-                            is NodeModuleResolver.Resolution.Found -> return retry.path
-                            else -> {}
+            val ecosystemOrder = hostLang?.packageEcosystemOrder ?: LanguageSupport.DEFAULT_PACKAGE_ECOSYSTEM_ORDER
+            for (ecosystem in ecosystemOrder) {
+                when (ecosystem) {
+                    PackageEcosystem.NPM ->
+                        when (val resolution = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
+                            is NodeModuleResolver.Resolution.Found -> return resolution.path
+                            is NodeModuleResolver.Resolution.PackageNotFound -> {
+                                if (yolo) {
+                                    val (packageName, _) = nodeModuleResolver.splitSpecifier(path)
+                                    yoloInstall(packageName)
+                                    when (val retry = nodeModuleResolver.resolveNodeModule(path, fromDir)) {
+                                        is NodeModuleResolver.Resolution.Found -> return retry.path
+                                        else -> {}
+                                    }
+                                }
+                                throw MyceliumException(
+                                    "mycelium: cannot find module '$path' — no node_modules/$path found from " +
+                                        "'$fromDir' or any parent directory"
+                                )
+                            }
+                            NodeModuleResolver.Resolution.NoNodeModulesTree -> {}
                         }
-                    }
-                    throw MyceliumException(
-                        "mycelium: cannot find module '$path' — no node_modules/$path found from " +
-                            "'$fromDir' or any parent directory"
-                    )
+                    PackageEcosystem.RUBYGEMS -> rubyModuleResolver.resolveRubyGem(path)?.let { return it }
+                    PackageEcosystem.PYPI -> pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
                 }
-                NodeModuleResolver.Resolution.NoNodeModulesTree -> {}
-            }
-
-            if (hostLang?.languageId != "ruby") {
-                rubyModuleResolver.resolveRubyGem(path)?.let { return it }
-            }
-            if (hostLang?.languageId != "python") {
-                pythonModuleResolver.resolvePythonPackage(path)?.let { return it }
             }
 
             // `--yolo` support for Ruby/Python, mirroring npm's own yoloInstall above: a

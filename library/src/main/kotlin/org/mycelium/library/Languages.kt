@@ -6,6 +6,7 @@ object JsSupport : LanguageSupport {
     override val languageId = "js"
     override val extensions = listOf("js", "mjs", "ts", "mts")
     override val compilerCommand = null
+    override val moduleExtension = ".mjs"
 
     // JsSupport is shared by both plain JS (.js/.mjs) and TypeScript (.ts/.mts) — this only
     // ever applies to the latter. InterceptingFileSystem's dispatch logic additionally
@@ -160,6 +161,8 @@ object RubySupport : LanguageSupport {
     override val languageId = "ruby"
     override val extensions = listOf("rb")
     override val compilerCommand = null
+    override val packageEcosystemOrder =
+        listOf(PackageEcosystem.RUBYGEMS, PackageEcosystem.NPM, PackageEcosystem.PYPI)
 
     override fun detectFrame(frame: String) =
         frame.startsWith("Kernel#require") ||
@@ -216,6 +219,8 @@ object PythonSupport : LanguageSupport {
     override val languageId = "python"
     override val extensions = listOf("py")
     override val compilerCommand = null
+    override val packageEcosystemOrder =
+        listOf(PackageEcosystem.PYPI, PackageEcosystem.NPM, PackageEcosystem.RUBYGEMS)
 
     // Placeholder — never validated against a real GraalPython call stack. Python-as-host
     // support is blocked before frame detection even matters: evaluating Python from JS

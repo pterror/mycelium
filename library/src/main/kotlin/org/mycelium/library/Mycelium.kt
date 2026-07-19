@@ -580,14 +580,7 @@ class Mycelium(
         context.getBindings(languageId)
 
     private fun moduleExtensionForLanguage(languageId: String): String =
-        when (languageId) {
-            "js" -> ".mjs"
-            else ->
-                languages.firstOrNull { it.languageId == languageId }
-                    ?.extensions?.firstOrNull()
-                    ?.let { ".$it" }
-                    ?: ".tmp"
-        }
+        languages.firstOrNull { it.languageId == languageId }?.moduleExtension ?: ".tmp"
 
     // Walks up from `startDir` (inclusive) looking for the nearest ancestor directory
     // containing a `package.json` — mirrors Node's own package-scope lookup, and matches

@@ -8,28 +8,48 @@ import java.nio.file.NoSuchFileException
 import java.util.zip.GZIPInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 
-// Handles gzip-compressed tar archives (.tar.gz, .tgz). Unlike ZipVfsProvider, tar has no
-// central directory to seek into — TarArchiveInputStream must walk every entry's header to
-// find the next one, and gzip on top means even byte-range seeking within the compressed
-// stream isn't possible. Every list/read/attributes call below re-decompresses and re-scans
-// from the start; callers that need repeated lookups against the same archive should cache
-// results themselves (VfsPathResolver already does path-segment-level caching upstream).
-class TarGzVfsProvider : VfsProvider {
+// Handles both gzip-compressed tar archives (.tar.gz, .tgz) and plain uncompressed tar
+// archives (.tar). Unlike ZipVfsProvider, tar has no central directory to seek into —
+// TarArchiveInputStream must walk every entry's header to find the next one, and gzip on top
+// means even byte-range seeking within the compressed stream isn't possible. Every
+// list/read/attributes call below re-decompresses (when gzipped) and re-scans from the start;
+// callers that need repeated lookups against the same archive should cache results themselves
+// (VfsPathResolver already does path-segment-level caching upstream).
+class TarVfsProvider : VfsProvider {
+    // Position of the "ustar" magic within a tar header block — POSIX/GNU/ustar tar formats
+    // all place it here, even though old-style V7 tars (no magic at all) don't. Plain tars
+    // without a "ustar" magic aren't detected by this provider.
+    private val USTAR_MAGIC_OFFSET = 257
+    private val USTAR_MAGIC = byteArrayOf('u'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(), 'a'.code.toByte(), 'r'.code.toByte())
+
     override fun canOpen(channel: SeekableByteChannel): Boolean {
         val originalPosition = channel.position()
         try {
-            channel.position(0)
-            val header = ByteBuffer.allocate(2)
-            while (header.hasRemaining()) {
-                if (channel.read(header) < 0) return false
-            }
-            // 0x1f 0x8b — the gzip magic number. Doesn't distinguish a .tar.gz from any other
-            // gzipped file, but VfsProviderRegistry only reaches this provider once the
-            // resolver has already decided the path segment names an archive to open.
-            return header[0] == 0x1f.toByte() && header[1] == 0x8b.toByte()
+            return isGzip(channel) || isUstarTar(channel)
         } finally {
             channel.position(originalPosition)
         }
+    }
+
+    // 0x1f 0x8b — the gzip magic number. Doesn't distinguish a .tar.gz from any other gzipped
+    // file, but VfsProviderRegistry only reaches this provider once the resolver has already
+    // decided the path segment names an archive to open.
+    private fun isGzip(channel: SeekableByteChannel): Boolean {
+        channel.position(0)
+        val header = ByteBuffer.allocate(2)
+        while (header.hasRemaining()) {
+            if (channel.read(header) < 0) return false
+        }
+        return header[0] == 0x1f.toByte() && header[1] == 0x8b.toByte()
+    }
+
+    private fun isUstarTar(channel: SeekableByteChannel): Boolean {
+        channel.position(USTAR_MAGIC_OFFSET.toLong())
+        val magic = ByteBuffer.allocate(USTAR_MAGIC.size)
+        while (magic.hasRemaining()) {
+            if (channel.read(magic) < 0) return false
+        }
+        return magic.array().contentEquals(USTAR_MAGIC)
     }
 
     override fun list(channel: SeekableByteChannel, internalPath: String): List<VfsEntry> {
@@ -106,7 +126,10 @@ class TarGzVfsProvider : VfsProvider {
     }
 
     private fun withTarStream(channel: SeekableByteChannel, block: (TarArchiveInputStream) -> Unit) {
+        val gzip = isGzip(channel)
         channel.position(0)
-        TarArchiveInputStream(GZIPInputStream(NonClosingInputStream(Channels.newInputStream(channel)))).use(block)
+        val raw: InputStream = NonClosingInputStream(Channels.newInputStream(channel))
+        val stream = if (gzip) GZIPInputStream(raw) else raw
+        TarArchiveInputStream(stream).use(block)
     }
 }

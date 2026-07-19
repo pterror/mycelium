@@ -10,7 +10,7 @@ class VfsProviderRegistry {
 
     init {
         register(ZipVfsProvider())
-        register(TarGzVfsProvider())
+        register(TarVfsProvider())
         // Asar has no magic bytes (see AsarVfsProvider.canOpen), so it's registered last —
         // it's only reached once every provider with a real signature has already declined.
         register(AsarVfsProvider())

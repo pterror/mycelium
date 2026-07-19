@@ -10,6 +10,7 @@ class VfsProviderRegistry {
 
     init {
         register(ZipVfsProvider())
+        register(TarGzVfsProvider())
     }
 
     fun register(provider: VfsProvider) {

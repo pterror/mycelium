@@ -7,9 +7,9 @@ import java.nio.channels.SeekableByteChannel
 // (e.g. "read a file that lives at /project/assets/bundle.zip/icons/logo.png" without the
 // caller needing to know bundle.zip is a zip rather than a directory) — mirrors
 // LanguageSupport/CompilerRegistry/PackageIndex's "typed registry of pluggable
-// implementations" shape elsewhere in this module. ZipVfsProvider is the only built-in
-// implementation today; more (tar, 7z, ...) register with VfsProviderRegistry the same
-// way without touching this interface.
+// implementations" shape elsewhere in this module. ZipVfsProvider and TarGzVfsProvider are
+// the built-in implementations today; more (7z, ...) register with VfsProviderRegistry the
+// same way without touching this interface.
 interface VfsProvider {
     // Probe whether this provider can open the file backing `channel` — must check magic
     // bytes rather than trusting a file extension, since VfsPathResolver doesn't know

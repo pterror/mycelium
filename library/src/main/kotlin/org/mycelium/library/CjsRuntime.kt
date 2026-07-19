@@ -329,8 +329,8 @@ class CjsRuntime(
         "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
     private fun readChannelToString(channel: SeekableByteChannel): String {
-        // Both SeekableByteChannel implementations InterceptingFileSystem hands out
-        // (ReadOnlyBufferChannel, HttpChannel) fill the destination buffer's backing
+        // ReadOnlyBufferChannel (the only SeekableByteChannel InterceptingFileSystem hands
+        // out that isn't backed by a real file) fills the destination buffer's backing
         // array directly without advancing its position — relying on `hasRemaining()`
         // to drive the read loop (as ordinary SeekableByteChannel consumers do) would
         // spin the buffer's position at 0 forever. Advance it manually from each call's

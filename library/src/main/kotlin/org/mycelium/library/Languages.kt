@@ -189,6 +189,27 @@ object RubySupport : LanguageSupport {
         """.trimIndent())
         context.polyglotBindings.putMember("__mycelium_eval_module__", fn)
     }
+
+    // Monkeypatches Kernel#require so `require 'https://.../foo.rb'` (and `http://`) is
+    // special-cased to `fn` before falling through to Ruby's own require — see
+    // LanguageSupport.injectHttpRequire's own doc comment for why this can't just be
+    // handled by FileSystem.parsePath the way JS's `import` is.
+    override fun injectHttpRequire(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {
+        context.polyglotBindings.putMember("__mycelium_require_http__", fn)
+        context.eval("ruby", """
+            module Kernel
+                alias_method :__mycelium_original_require__, :require
+                def require(path)
+                    if path.is_a?(String) && (path.start_with?("http://") || path.start_with?("https://"))
+                        Polyglot.import("__mycelium_require_http__").call(path)
+                    else
+                        __mycelium_original_require__(path)
+                    end
+                end
+                private :require
+            end
+        """.trimIndent())
+    }
 }
 
 object PythonSupport : LanguageSupport {

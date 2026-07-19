@@ -1,6 +1,8 @@
 package org.mycelium.library
 
+import com.oracle.truffle.api.Truffle
 import java.io.File
+import java.nio.charset.StandardCharsets
 import org.graalvm.polyglot.Context
 import org.graalvm.polyglot.Engine
 import org.graalvm.polyglot.Source
@@ -18,6 +20,8 @@ import org.mycelium.library.registry.NpmRegistryClient
 import org.mycelium.library.registry.PackageInstaller
 import org.mycelium.library.registry.PyPIClient
 import org.mycelium.library.registry.RubyGemsClient
+import kotlin.io.path.extension
+import kotlin.io.path.readText
 
 class Mycelium(
     requestedLanguages: List<LanguageSupport> = listOf(
@@ -274,6 +278,81 @@ class Mycelium(
         evalModule(lang, code)
     }
 
+    // Requiring the same URL twice must only execute it once (Kernel#require's own
+    // contract — the second call returns false and does nothing) — separate from
+    // HttpImportCache's own disk cache, which only avoids re-fetching, not re-evaluating.
+    private val httpRequiredUrls = mutableSetOf<String>()
+
+    // Generates the ESM-style shim InterceptingFileSystem.newByteChannel hands back to
+    // GraalJS for a cross-language import — reused here for the same purpose, except
+    // httpRequireFn needs the shim actually *evaluated* into the host language's top-level
+    // scope (Kernel#require has no return-a-module-object protocol to hand it back through),
+    // rather than returned as file bytes for the engine's own import machinery to consume.
+    private val shimGenerator = ShimGenerator { context }
+
+    private fun evalCrossLanguageShim(hostLang: LanguageSupport, value: Value, path: String) {
+        val channel = shimGenerator.generateCrossLanguageShim(hostLang, value, path) as ReadOnlyBufferChannel
+        val shimSource = StandardCharsets.UTF_8.decode(channel.buffer.duplicate()).toString()
+        context.eval(Source.newBuilder(hostLang.languageId, shimSource, path).build())
+    }
+
+    // Backs RubySupport.injectHttpRequire's `Kernel#require` monkeypatch — see that
+    // method's own doc comment for why Ruby needs this rather than routing http(s)
+    // `require` targets through FileSystem.parsePath the way JS's `import` does.
+    //
+    // Mirrors the cross-language logic InterceptingFileSystem.newByteChannel applies to
+    // ordinary (filesystem) cross-language imports: detect the target language from the
+    // URL's extension, and if it differs from the requiring (host) language, eval it in its
+    // own language and splice the result into the host language via evalCrossLanguageShim
+    // instead of naively eval'ing foreign-language source as the host language.
+    private val httpRequireFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
+        val url = args[0].asString()
+        if (!httpRequiredUrls.add(url)) {
+            false
+        } else {
+            val cachedPath = try {
+                HttpImportCache.fetch(java.net.URI(url))
+            } catch (e: java.io.IOException) {
+                throw MyceliumException("mycelium: failed to fetch '$url' — ${e.message}", e)
+            }
+            // Only Ruby wires injectHttpRequire up today (see its own doc comment above), so
+            // this should always resolve via detectFrame's "Kernel#require" match — the
+            // RubySupport fallback below is a defensive default for any future language that
+            // adopts the same hook without a distinctive require-frame of its own.
+            val frames = mutableListOf<String>()
+            Truffle.getRuntime().iterateFrames { frame ->
+                frames.add("${frame.callTarget}")
+                null
+            }
+            val hostLang = detectHostLanguage(frames) ?: RubySupport
+            val targetLang = supportForExtension(cachedPath.extension)
+            when {
+                targetLang != null && targetLang.needsCompilation -> {
+                    val compiled = Compiler.compile(cachedPath, targetLang)
+                    val value = if (targetLang.outputExtension == "wasm") {
+                        Compiler.loadWasmExports(context, compiled)
+                    } else {
+                        context.eval(Source.newBuilder("llvm", compiled.toFile()).build())
+                    }
+                    evalCrossLanguageShim(hostLang, value, url)
+                }
+                targetLang != null && targetLang.jsCompilerId != null -> {
+                    val js = compileToJsDispatcher.compile(targetLang.jsCompilerId!!, cachedPath, context)
+                    val value = context.eval(Source.newBuilder("js", js, url).build())
+                    evalCrossLanguageShim(hostLang, value, url)
+                }
+                targetLang == null || targetLang.languageId == hostLang.languageId -> {
+                    context.eval(Source.newBuilder(hostLang.languageId, cachedPath.readText(), url).build())
+                }
+                else -> {
+                    val source = Source.newBuilder(targetLang.languageId, cachedPath.readText(), url).build()
+                    evalCrossLanguageShim(hostLang, context.eval(source), url)
+                }
+            }
+            true
+        }
+    }
+
     // Backs the `require` shim InterceptingFileSystem prepends to every transpiled CJS
     // module — see InterceptingFileSystem.requireModule / newByteChannel's CJS branch.
     private val requireFn = org.graalvm.polyglot.proxy.ProxyExecutable { args ->
@@ -354,6 +433,7 @@ class Mycelium(
         )
         for (lang in languages) {
             lang.injectEvalModule(context, evalModuleFn)
+            lang.injectHttpRequire(context, httpRequireFn)
         }
         // Everything below is JS-specific: the `__mycelium_require__` bindings live on
         // `context.getBindings("js")`, and the init scripts are all evaluated as JS. When

@@ -26,4 +26,16 @@ interface LanguageSupport {
     fun isValidExportName(name: String): Boolean
     fun generateShim(exports: Map<String, String>): String
     fun injectEvalModule(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {}
+
+    // Optional hook for languages whose native `require`-equivalent never hands a
+    // URL-shaped specifier to Mycelium's FileSystem at all — Ruby's Kernel#require checks
+    // whether its argument looks like an absolute filesystem path or a $LOAD_PATH-relative
+    // feature name and raises LoadError itself otherwise, without ever calling
+    // FileSystem.parsePath. GraalJS's own ESM `import` needs no such hook: it hands any
+    // colon-containing specifier straight to FileSystem.parsePath(URI) itself (see
+    // InterceptingFileSystem.parsePath), which already routes http(s) URLs through the
+    // ordinary newByteChannel path. `fn` fetches+caches a URL (via HttpImportCache) and
+    // evaluates it in this language, returning whether it actually ran (vs.
+    // already-required) — the same true/false contract as Kernel#require's own return value.
+    fun injectHttpRequire(context: Context, fn: org.graalvm.polyglot.proxy.ProxyExecutable) {}
 }

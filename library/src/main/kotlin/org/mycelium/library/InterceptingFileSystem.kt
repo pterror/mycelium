@@ -6,6 +6,8 @@ import org.mycelium.library.vfs.VfsPathResolver
 import org.mycelium.library.vfs.VfsProviderRegistry
 import org.mycelium.library.vfs.VfsResolution
 import org.mycelium.library.vfs.PathStat
+import org.mycelium.library.remote.RemoteFileSystem
+import org.mycelium.library.remote.RemoteFileSystemRegistry
 import org.mycelium.library.compiler.CompileToJsDispatcher
 import org.mycelium.library.registry.PackageInstallerRegistry
 import java.io.File
@@ -48,6 +50,14 @@ class InterceptingFileSystem : FileSystem {
     // bundle.zip.
     private val vfsProviderRegistry = VfsProviderRegistry()
     private val vfsPathResolver = VfsPathResolver(vfsProviderRegistry)
+
+    // Extension point for protocol-based remote access (S3, GCS, WebDAV, ...) — see
+    // remote/RemoteFileSystem's own doc comment for why this is separate from
+    // vfsProviderRegistry above. Empty by default; a consumer registers providers onto
+    // this instance (e.g. via Mycelium's composition root) the same way
+    // vfsProviderRegistry's own extras would be. http(s) imports are handled by the
+    // pre-existing HttpImportCache special case below rather than through this registry.
+    val remoteFileSystemRegistry = RemoteFileSystemRegistry()
 
     // Set by init() — provided by Mycelium (the composition root) rather than reached for
     // as a global singleton, so this class depends only on the CompileToJsDispatcher/
@@ -213,6 +223,9 @@ class InterceptingFileSystem : FileSystem {
         if (path.startsWith("http://") || path.startsWith("https://")) {
             return Path.of("/.mycelium/$path")
         }
+        if (remoteScheme(path) != null) {
+            return Path.of("/.mycelium/$path")
+        }
         if (isBareSpecifier(path)) {
             CoreModuleRegistry.coreModules[path]?.let { return CoreModuleRegistry.syntheticCoreModulePath(it) }
             val fromDir = currentResolutionDir()
@@ -307,6 +320,14 @@ class InterceptingFileSystem : FileSystem {
     // itself already knows how to handle (e.g. by falling back to its embedded frozen code).
     private fun isSyntheticIdentifier(path: String): Boolean =
         path.startsWith("<") && path.endsWith(">")
+
+    // Matches `path` against every scheme currently registered with
+    // remoteFileSystemRegistry (e.g. "s3://bucket/key" against a registered "s3" provider)
+    // — mirrors the hardcoded "http://"/"https://" prefix check just above, generalized to
+    // whatever schemes a consumer has registered.
+    private fun remoteScheme(path: String): String? =
+        path.substringBefore("://", missingDelimiterValue = "")
+            .takeIf { it.isNotEmpty() && remoteFileSystemRegistry.forScheme(it) != null }
 
     private fun isBareSpecifier(path: String): Boolean =
         path.isNotEmpty() &&
@@ -464,12 +485,30 @@ class InterceptingFileSystem : FileSystem {
         return vfsPathResolver.resolve(path.toString(), probeDelegate)
     }
 
+    // If `path` is a synthetic "/.mycelium/<uri>" path (see parsePath's own comment) whose
+    // scheme is a registered RemoteFileSystem's, returns that provider and the decoded URI
+    // — used by checkAccess/newDirectoryStream/readAttributes to route directory-listing/
+    // attribute lookups to the provider, the same way newByteChannel already routes reads.
+    // http(s) paths are excluded here since those keep going through HttpImportCache/
+    // delegate instead (see newByteChannel's own "http", "https" branches).
+    private fun resolveRemoteBoundary(path: Path): Pair<RemoteFileSystem, URI>? {
+        if (!path.startsWith("/.mycelium/")) return null
+        val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
+        if (uri.scheme == "http" || uri.scheme == "https") return null
+        val provider = remoteFileSystemRegistry.forScheme(uri.scheme) ?: return null
+        return provider to uri
+    }
+
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) {
         val absolute = toAbsolutePath(path)
         val probed = if (!absolute.startsWith("/.mycelium/") && !absolute.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) {
             nodeModuleResolver.resolveExtensionlessPath(absolute)
         } else {
             absolute
+        }
+        resolveRemoteBoundary(probed)?.let { (provider, uri) ->
+            provider.attributes(uri) ?: throw NoSuchFileException(probed.toString())
+            return
         }
         resolveVfsBoundary(probed)?.let { resolution ->
             resolution.provider.attributes(resolution.channel, resolution.internalPath)
@@ -621,7 +660,15 @@ class InterceptingFileSystem : FileSystem {
                         } catch (e: java.io.IOException) {
                             throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
                         }
-                        else -> throw MyceliumException("mycelium: unknown URL scheme '${uri.scheme}' in '$uri'")
+                        else -> remoteFileSystemRegistry.forScheme(uri.scheme)?.let { provider ->
+                            try {
+                                delegate.newByteChannel(
+                                    RemoteImportCache.fetch(uri, provider::read), setOf(StandardOpenOption.READ)
+                                )
+                            } catch (e: Exception) {
+                                throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
+                            }
+                        } ?: throw MyceliumException("mycelium: unknown URL scheme '${uri.scheme}' in '$uri'")
                     }
                 } else {
                     try {
@@ -675,7 +722,13 @@ class InterceptingFileSystem : FileSystem {
                         } catch (e: java.io.IOException) {
                             throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
                         }
-                        else -> throw MyceliumException("mycelium: unknown URL scheme '${uri.scheme}' in '$uri'")
+                        else -> remoteFileSystemRegistry.forScheme(uri.scheme)?.let { provider ->
+                            try {
+                                RemoteImportCache.fetch(uri, provider::read).readText()
+                            } catch (e: Exception) {
+                                throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
+                            }
+                        } ?: throw MyceliumException("mycelium: unknown URL scheme '${uri.scheme}' in '$uri'")
                     }
                 } else {
                     path.readText()
@@ -691,6 +744,15 @@ class InterceptingFileSystem : FileSystem {
     }
 
     override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> {
+        resolveRemoteBoundary(dir)?.let { (provider, uri) ->
+            val entries = provider.list(uri)
+                .map { entry -> dir.resolve(entry.name) }
+                .filter { filter.accept(it) }
+            return object : DirectoryStream<Path> {
+                override fun iterator(): MutableIterator<Path> = entries.toMutableList().iterator()
+                override fun close() {}
+            }
+        }
         resolveVfsBoundary(dir)?.let { resolution ->
             val entries = resolution.provider.list(resolution.channel, resolution.internalPath)
                 .map { entry -> dir.resolve(entry.name) }
@@ -737,6 +799,20 @@ class InterceptingFileSystem : FileSystem {
     }
 
     override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> {
+        resolveRemoteBoundary(path)?.let { (provider, uri) ->
+            val attrs = provider.attributes(uri) ?: throw NoSuchFileException(path.toString())
+            val modified = FileTime.fromMillis(attrs.lastModified)
+            return mutableMapOf(
+                "isDirectory" to attrs.isDirectory,
+                "isRegularFile" to !attrs.isDirectory,
+                "isSymbolicLink" to false,
+                "isOther" to false,
+                "size" to attrs.size,
+                "lastModifiedTime" to modified,
+                "creationTime" to modified,
+                "lastAccessTime" to modified,
+            )
+        }
         resolveVfsBoundary(path)?.let { resolution ->
             val attrs = resolution.provider.attributes(resolution.channel, resolution.internalPath)
                 ?: throw NoSuchFileException(path.toString())

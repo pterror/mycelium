@@ -127,8 +127,10 @@ class PythonInteropExperimentTest {
             org.mycelium.library.compiler.CompilerCache,
             org.mycelium.library.compiler.EsbuildBackend(),
         )
-        val installer = org.mycelium.library.registry.PackageInstaller(registryClient)
-        fs.init(ctx, mc, dispatcher, installer)
+        val installerRegistry = org.mycelium.library.registry.PackageInstallerRegistry().apply {
+            register(PackageEcosystem.NPM, org.mycelium.library.registry.PackageInstaller(registryClient))
+        }
+        fs.init(ctx, mc, dispatcher, installerRegistry)
         val code = """Polyglot.eval("python", "print('hi')")"""
         val source = Source.newBuilder("js", code, "test.mjs").build()
         ctx.eval(source)

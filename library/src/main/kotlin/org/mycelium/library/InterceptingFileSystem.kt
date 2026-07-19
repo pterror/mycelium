@@ -7,7 +7,7 @@ import org.mycelium.library.vfs.VfsProviderRegistry
 import org.mycelium.library.vfs.VfsResolution
 import org.mycelium.library.vfs.PathStat
 import org.mycelium.library.compiler.CompileToJsDispatcher
-import org.mycelium.library.registry.PackageInstaller
+import org.mycelium.library.registry.PackageInstallerRegistry
 import java.io.File
 import java.net.URI
 import java.nio.channels.SeekableByteChannel
@@ -53,18 +53,13 @@ class InterceptingFileSystem : FileSystem {
     // as a global singleton, so this class depends only on the CompileToJsDispatcher/
     // PackageInstaller abstractions and can be constructed/tested with fakes of either.
     private var compileToJsDispatcher: CompileToJsDispatcher? = null
-    private var packageInstaller: PackageInstaller? = null
-    // Ecosystem-specific counterparts to `packageInstaller` (which is always npm-backed) —
-    // see Mycelium.kt's composition root, which constructs one PackageInstaller per
-    // PackageIndex implementation (RubyGemsClient/PyPIClient/CratesIoClient/GoProxyClient)
-    // and threads each through here. Ruby/Python auto-install (yoloInstallRubyGem/
-    // yoloInstallPyPIPackage below) uses these the same way npm's own yoloInstall uses
-    // `packageInstaller`. Defaulted (rather than required) so existing callers/tests that
-    // construct an InterceptingFileSystem without needing cross-ecosystem auto-install
-    // (e.g. PythonInteropExperimentTest, which only exercises the npm/JS path) don't need
-    // to be updated to pass them.
-    private var rubyGemsInstaller: PackageInstaller? = null
-    private var pyPIInstaller: PackageInstaller? = null
+    // One PackageInstaller per PackageEcosystem — see Mycelium.kt's composition root,
+    // which constructs one per ecosystem's PackageIndex (NpmRegistryClient/
+    // RubyGemsClient/PyPIClient) and registers it here. Nullable (rather than required)
+    // so existing callers/tests that construct an InterceptingFileSystem without needing
+    // cross-ecosystem auto-install (e.g. PythonInteropExperimentTest, which only
+    // exercises the npm/JS path) don't need to be updated to pass one.
+    private var packageInstallerRegistry: PackageInstallerRegistry? = null
 
     // The directory relative paths fall back to resolving against when nothing more
     // specific applies (see currentResolutionDir/toAbsolutePath/yoloInstall*'s own uses
@@ -126,19 +121,15 @@ class InterceptingFileSystem : FileSystem {
         context: Context,
         mycelium: Mycelium,
         compileToJsDispatcher: CompileToJsDispatcher,
-        packageInstaller: PackageInstaller,
+        packageInstallerRegistry: PackageInstallerRegistry,
         yolo: Boolean = false,
-        rubyGemsInstaller: PackageInstaller? = null,
-        pyPIInstaller: PackageInstaller? = null,
         cwd: Path? = null,
     ) {
         this.context = context
         this.mycelium = mycelium
         this.compileToJsDispatcher = compileToJsDispatcher
-        this.packageInstaller = packageInstaller
+        this.packageInstallerRegistry = packageInstallerRegistry
         this.yolo = yolo
-        this.rubyGemsInstaller = rubyGemsInstaller
-        this.pyPIInstaller = pyPIInstaller
         if (cwd != null) this.cwd = cwd
     }
 
@@ -271,7 +262,8 @@ class InterceptingFileSystem : FileSystem {
             // missing specifier while the stack is inside Ruby should try installing a gem,
             // not guess it might be a PyPI package instead.
             if (yolo && (hostLang?.languageId == "ruby" || hostLang?.languageId == "python") &&
-                rubyGemsInstaller != null && pyPIInstaller != null
+                packageInstallerRegistry?.get(PackageEcosystem.RUBYGEMS) != null &&
+                packageInstallerRegistry?.get(PackageEcosystem.PYPI) != null
             ) {
                 val (packageName, _) = nodeModuleResolver.splitSpecifier(path)
                 if (hostLang.languageId == "ruby") {
@@ -369,7 +361,7 @@ class InterceptingFileSystem : FileSystem {
         val installDir = (sourceDirectoryStack.get().lastOrNull() ?: cwd).toFile()
         System.err.println("mycelium: installing $packageName...")
         try {
-            packageInstaller!!.installPackageTree(
+            packageInstallerRegistry!![PackageEcosystem.NPM]!!.installPackageTree(
                 packageName, null, installDir.toPath().resolve("node_modules")
             )
             return
@@ -390,7 +382,8 @@ class InterceptingFileSystem : FileSystem {
     }
 
     // `--yolo` support for Ruby: fetches `gemName` from rubygems.org (via the
-    // RubyGemsClient-backed `rubyGemsInstaller`) and PackageCache's on-disk archive cache —
+    // RubyGemsClient-backed installer registered under PackageEcosystem.RUBYGEMS) and
+    // PackageCache's on-disk archive cache —
     // no `gem`/`bundle` subprocess involved, mirroring yoloInstall's own pure-Kotlin-first
     // approach for npm — into a project-local vendor directory
     // (".mycelium-vendor/gems/<name>", picked to avoid colliding with any real
@@ -406,7 +399,7 @@ class InterceptingFileSystem : FileSystem {
         val vendorDir = installDir.resolve(".mycelium-vendor").resolve("gems")
         System.err.println("mycelium: installing gem '$gemName'...")
         try {
-            rubyGemsInstaller!!.installPackageTree(gemName, null, vendorDir)
+            packageInstallerRegistry!![PackageEcosystem.RUBYGEMS]!!.installPackageTree(gemName, null, vendorDir)
             rubyModuleResolver.registerInstalledGem(vendorDir.resolve(gemName))
         } catch (e: Exception) {
             System.err.println("mycelium: installing gem '$gemName' failed (${e.message ?: e})")
@@ -422,7 +415,7 @@ class InterceptingFileSystem : FileSystem {
         val vendorDir = installDir.resolve(".mycelium-vendor").resolve("pypi")
         System.err.println("mycelium: installing PyPI package '$packageName'...")
         try {
-            pyPIInstaller!!.installPackageTree(packageName, null, vendorDir)
+            packageInstallerRegistry!![PackageEcosystem.PYPI]!!.installPackageTree(packageName, null, vendorDir)
             pythonModuleResolver.registerInstalledPackage(vendorDir.resolve(packageName), packageName)
         } catch (e: Exception) {
             System.err.println("mycelium: installing PyPI package '$packageName' failed (${e.message ?: e})")

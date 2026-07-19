@@ -18,6 +18,7 @@ import org.mycelium.library.registry.CratesIoClient
 import org.mycelium.library.registry.GoProxyClient
 import org.mycelium.library.registry.NpmRegistryClient
 import org.mycelium.library.registry.PackageInstaller
+import org.mycelium.library.registry.PackageInstallerRegistry
 import org.mycelium.library.registry.PyPIClient
 import org.mycelium.library.registry.RubyGemsClient
 import kotlin.io.path.extension
@@ -152,10 +153,16 @@ class Mycelium(
     private val compileToJsDispatcher =
         CompileToJsDispatcher(compilerRegistry, compilerDownloader, CompilerCache, EsbuildBackend())
     private val packageInstaller = PackageInstaller(registryClient)
-    private val rubyGemsInstaller = PackageInstaller(rubyGemsClient)
-    private val pyPIInstaller = PackageInstaller(pyPIClient)
+    // Not registered in packageInstallerRegistry: crates.io/the Go module proxy aren't
+    // PackageEcosystem entries (see that enum's own doc comment) and aren't consulted by
+    // any automatic bare-specifier resolution yet — see the class comment above.
     private val cratesIoInstaller = PackageInstaller(cratesIoClient)
     private val goProxyInstaller = PackageInstaller(goProxyClient)
+    private val packageInstallerRegistry = PackageInstallerRegistry().apply {
+        register(PackageEcosystem.NPM, packageInstaller)
+        register(PackageEcosystem.RUBYGEMS, PackageInstaller(rubyGemsClient))
+        register(PackageEcosystem.PYPI, PackageInstaller(pyPIClient))
+    }
 
     // js.commonjs-require was prototyped here and reverted — see TODO.md. Enabling it
     // swaps GraalJS's ES module loader for NpmCompatibleESModuleLoader, which rejects any
@@ -428,7 +435,7 @@ class Mycelium(
 
     init {
         filesystem.init(
-            context, this, compileToJsDispatcher, packageInstaller, yolo, rubyGemsInstaller, pyPIInstaller,
+            context, this, compileToJsDispatcher, packageInstallerRegistry, yolo,
             cwd = cwd?.let { File(it).toPath() },
         )
         for (lang in languages) {

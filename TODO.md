@@ -344,15 +344,26 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 *Open threads from a previous session. Treat as starting context, not instructions — verify
 relevance before acting.*
 
-### Truffle Lua implementation — high-priority upcoming work
-Full from-scratch Lua interpreter on GraalVM Truffle with polyglot interop. Not blocked by
-upstream (unlike Python). Complements existing language support (JS/Ruby native, compile-to-JS
-languages, LLVM/WASM compiled languages). Covers parser, AST with Truffle specializations,
-tables with metatables, standard libraries (string/math/table/io/os), coroutines via Truffle
-continuations, and polyglot interop annotations. Code should reference specific Lua spec
-sections. Value: Lua is widely used for config/scripting (embedded contexts, game engines);
-native Truffle implementation brings that entire ecosystem into Mycelium's shared polyglot
-Context alongside npm/PyPI/RubyGems.
+### Truffle Lua implementation — next focus
+Full from-scratch Lua 5.1 interpreter on GraalVM Truffle with polyglot interop. **Target Lua
+5.1 first** (smaller spec, widely embedded in C codebases, industrial baseline). Not blocked by
+upstream (unlike Python). Code comments must reference specific Lua 5.1 spec sections for
+clarity. Complements existing language support (JS/Ruby native, compile-to-JS languages,
+LLVM/WASM compiled languages). Covers: parser, AST nodes with Truffle specializations, table
+implementation (with metatables/metamethods), standard libraries (string/math/table/io/os),
+coroutines (via Truffle continuations), and polyglot interop annotations. Open questions:
+coroutine strategy on Truffle (continuations vs threads?), Lua's 1-based indexing in polyglot
+interop, LuaJIT extensions later. Value: Lua is widely used for config/scripting (embedded
+contexts, game engines); native Truffle implementation brings that entire ecosystem into
+Mycelium's shared polyglot Context alongside npm/PyPI/RubyGems.
+
+### HTTP imports could become first RemoteFileSystem provider
+Currently HTTP and RemoteFileSystem are separate paths in InterceptingFileSystem. Might be worth
+unifying (HTTP as a RemoteFileSystem provider) once there's a second consumer. Not urgent.
+
+### S3/GCS RemoteFileSystem providers
+The extension point exists but has no consumers yet. S3 would be useful in corporate
+environments. Needs AWS SDK dependency decision.
 
 ### GraalVM Insight — integrated, untested in production
 `--insight=<script>` flag lands GraalVM's dynamic-instrumentation API (Instrument API) in

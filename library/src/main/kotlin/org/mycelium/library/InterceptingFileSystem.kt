@@ -1,6 +1,11 @@
 package org.mycelium.library
 
 import com.oracle.truffle.api.Truffle
+import org.mycelium.library.vfs.VfsDelegate
+import org.mycelium.library.vfs.VfsPathResolver
+import org.mycelium.library.vfs.VfsProviderRegistry
+import org.mycelium.library.vfs.VfsResolution
+import org.mycelium.library.vfs.PathStat
 import org.mycelium.library.compiler.CompileToJsDispatcher
 import org.mycelium.library.registry.PackageInstaller
 import java.io.File
@@ -8,6 +13,7 @@ import java.net.URI
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.DirectoryStream.Filter
 import java.nio.file.attribute.FileAttribute
+import java.nio.file.attribute.FileTime
 import org.graalvm.polyglot.Context
 import org.graalvm.polyglot.Source
 import org.graalvm.polyglot.io.FileSystem
@@ -35,6 +41,13 @@ class InterceptingFileSystem : FileSystem {
     private var mycelium: Mycelium? = null
     private var yolo: Boolean = false
     private val delegate = FileSystem.newDefaultFileSystem()
+
+    // Extension point for presenting a file as a traversable filesystem tree (zip today; see
+    // vfs/) as if it were an ordinary directory — e.g. reading
+    // "/proj/assets/bundle.zip/icons/logo.png" transparently extracts icons/logo.png from
+    // bundle.zip.
+    private val vfsProviderRegistry = VfsProviderRegistry()
+    private val vfsPathResolver = VfsPathResolver(vfsProviderRegistry)
 
     // Set by init() — provided by Mycelium (the composition root) rather than reached for
     // as a global singleton, so this class depends only on the CompileToJsDispatcher/
@@ -199,6 +212,15 @@ class InterceptingFileSystem : FileSystem {
                 "mycelium: cannot find module '$path' — no matching \"imports\" entry found in any " +
                     "ancestor package.json from '$fromDir'"
             )
+        }
+        // GraalJS's own ESM loader routes any colon-containing specifier through
+        // parsePath(URI) instead (see that overload's own "node"/else branches) — but other
+        // guest languages' own `require`-equivalents (Ruby's `require`, in particular) hand
+        // a URL specifier to this String overload directly. Wrapping it in the same
+        // synthetic "/.mycelium/<uri>" convention here keeps both routes converging on the
+        // same newByteChannel handling below.
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            return Path.of("/.mycelium/$path")
         }
         if (isBareSpecifier(path)) {
             CoreModuleRegistry.coreModules[path]?.let { return CoreModuleRegistry.syntheticCoreModulePath(it) }
@@ -436,12 +458,35 @@ class InterceptingFileSystem : FileSystem {
     fun resolveRequireSpecifierPaths(specifier: String, fromDirStr: String): Array<String> =
         cjsRuntime.resolveRequireSpecifierPaths(specifier, fromDirStr)
 
+    // Finds the vfs boundary in `path`, if any — see VfsPathResolver's own doc comment for
+    // the algorithm. Never called for synthetic ".mycelium"/core-module paths, which never
+    // touch the real filesystem at all.
+    private fun resolveVfsBoundary(path: Path): VfsResolution? {
+        if (path.startsWith("/.mycelium/") || path.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) return null
+        val probeDelegate = object : VfsDelegate {
+            override fun stat(p: String): PathStat {
+                val np = Path.of(p)
+                return if (Files.exists(np)) PathStat(exists = true, isDirectory = Files.isDirectory(np))
+                else PathStat(exists = false, isDirectory = false)
+            }
+
+            override fun openChannel(p: String): SeekableByteChannel =
+                delegate.newByteChannel(Path.of(p), setOf(StandardOpenOption.READ))
+        }
+        return vfsPathResolver.resolve(path.toString(), probeDelegate)
+    }
+
     override fun checkAccess(path: Path, modes: Set<AccessMode>, vararg linkOptions: LinkOption) {
         val absolute = toAbsolutePath(path)
         val probed = if (!absolute.startsWith("/.mycelium/") && !absolute.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)) {
             nodeModuleResolver.resolveExtensionlessPath(absolute)
         } else {
             absolute
+        }
+        resolveVfsBoundary(probed)?.let { resolution ->
+            resolution.provider.attributes(resolution.channel, resolution.internalPath)
+                ?: throw NoSuchFileException(probed.toString())
+            return
         }
         delegate.checkAccess(probed, modes, *linkOptions)
     }
@@ -476,6 +521,13 @@ class InterceptingFileSystem : FileSystem {
             nodeModuleResolver.resolveExtensionlessPath(resolvedPath)
         } else {
             resolvedPath
+        }
+        if (!options.contains(StandardOpenOption.WRITE) && !options.contains(StandardOpenOption.CREATE)) {
+            resolveVfsBoundary(path)?.let { resolution ->
+                return ReadOnlyBufferChannel(
+                    java.nio.ByteBuffer.wrap(resolution.provider.read(resolution.channel, resolution.internalPath))
+                )
+            }
         }
         val pushed = path.isAbsolute && !path.startsWith("/.mycelium/") && !path.startsWith(CoreModuleRegistry.CORE_MODULE_PREFIX)
         if (pushed) {
@@ -577,7 +629,7 @@ class InterceptingFileSystem : FileSystem {
                     val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
                     when (uri.scheme) {
                         "http", "https" -> try {
-                            HttpChannel(uri)
+                            delegate.newByteChannel(HttpImportCache.fetch(uri), setOf(StandardOpenOption.READ))
                         } catch (e: java.io.IOException) {
                             throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
                         }
@@ -631,7 +683,7 @@ class InterceptingFileSystem : FileSystem {
                     val uri = URI(path.toString().substring("/.mycelium/".length).replace(":/", "://"))
                     when (uri.scheme) {
                         "http", "https" -> try {
-                            uri.toURL().readText()
+                            HttpImportCache.fetch(uri).readText()
                         } catch (e: java.io.IOException) {
                             throw MyceliumException("mycelium: failed to fetch '$uri' — ${e.message}", e)
                         }
@@ -650,8 +702,18 @@ class InterceptingFileSystem : FileSystem {
         }
     }
 
-    override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> =
-        delegate.newDirectoryStream(dir, filter)
+    override fun newDirectoryStream(dir: Path, filter: Filter<in Path>): DirectoryStream<Path> {
+        resolveVfsBoundary(dir)?.let { resolution ->
+            val entries = resolution.provider.list(resolution.channel, resolution.internalPath)
+                .map { entry -> dir.resolve(entry.name) }
+                .filter { filter.accept(it) }
+            return object : DirectoryStream<Path> {
+                override fun iterator(): MutableIterator<Path> = entries.toMutableList().iterator()
+                override fun close() {}
+            }
+        }
+        return delegate.newDirectoryStream(dir, filter)
+    }
 
     override fun toAbsolutePath(path: Path): Path {
         if (!path.isAbsolute) {
@@ -686,6 +748,22 @@ class InterceptingFileSystem : FileSystem {
         cwd = currentWorkingDirectory
     }
 
-    override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> =
-        delegate.readAttributes(path, attributes, *options)
+    override fun readAttributes(path: Path, attributes: String, vararg options: LinkOption): MutableMap<String, Any> {
+        resolveVfsBoundary(path)?.let { resolution ->
+            val attrs = resolution.provider.attributes(resolution.channel, resolution.internalPath)
+                ?: throw NoSuchFileException(path.toString())
+            val modified = FileTime.fromMillis(attrs.lastModified)
+            return mutableMapOf(
+                "isDirectory" to attrs.isDirectory,
+                "isRegularFile" to !attrs.isDirectory,
+                "isSymbolicLink" to false,
+                "isOther" to false,
+                "size" to attrs.size,
+                "lastModifiedTime" to modified,
+                "creationTime" to modified,
+                "lastAccessTime" to modified,
+            )
+        }
+        return delegate.readAttributes(path, attributes, *options)
+    }
 }

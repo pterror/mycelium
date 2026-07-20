@@ -61,6 +61,18 @@ final class LuaPackageLib {
         loaders.rawset(2.0, makeLuaSearcher(language, pkg));
         pkg.rawset("loaders", loaders);
 
+        // Lua 5.1 §5.3: PUC-Rio pre-registers every standard library in package.loaded so that
+        // require("math"), require("string"), etc. return the existing library table instead of
+        // falling through to the file searcher. This must run after all other standard libraries
+        // have been installed as globals (see LuaStdLib.installAll(), which installs package last).
+        String[] builtinLibs = {"math", "string", "table", "io", "os", "coroutine", "debug", "package"};
+        for (String lib : builtinLibs) {
+            Object libTable = globals.rawget(lib);
+            if (libTable != null && libTable != LuaNil.INSTANCE) {
+                loaded.rawset(lib, libTable);
+            }
+        }
+
         globals.rawset("require", wrap(language, "require", (frame, callNode) ->
                 require(language, checkString("require", 1, arg(frame, 1)), pkg, loaded, callNode)));
 

@@ -40,12 +40,16 @@ final class LuaStringFormat {
                 continue;
             }
             int specStart = i;
+            int flagsStart = i;
             while (i < len && "-+ #0".indexOf(fmt.charAt(i)) >= 0) {
                 i++;
             }
+            String flags = fmt.substring(flagsStart, i);
+            int widthStart = i;
             while (i < len && Character.isDigit(fmt.charAt(i))) {
                 i++;
             }
+            boolean hasWidth = i > widthStart;
             if (i < len && fmt.charAt(i) == '.') {
                 i++;
                 while (i < len && Character.isDigit(fmt.charAt(i))) {
@@ -57,6 +61,12 @@ final class LuaStringFormat {
             }
             char conv = fmt.charAt(i);
             String spec = fmt.substring(specStart, i);
+            // Java's String.format rejects a bare '0' flag with no explicit width. In C (and Lua)
+            // this is a harmless no-op — "pad with zeros" is meaningless without a width — so strip
+            // it rather than passing it through.
+            if (!hasWidth && flags.indexOf('0') >= 0) {
+                spec = flags.replace("0", "") + spec.substring(flags.length());
+            }
             i++;
             Object argVal = argIndex < args.length ? args[argIndex++] : null;
             switch (conv) {

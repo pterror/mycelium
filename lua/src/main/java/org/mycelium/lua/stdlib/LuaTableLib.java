@@ -99,7 +99,11 @@ final class LuaTableLib {
             Comparator<Object> comparator = isNil(compArg)
                     ? LuaTableLib::defaultLess0
                     : (a, b) -> compareWith(callNode, compArg, a, b);
-            Arrays.sort(arr, comparator);
+            try {
+                Arrays.sort(arr, comparator);
+            } catch (IllegalArgumentException e) {
+                throw LuaException.runtimeError(null, "invalid order function for sorting");
+            }
             for (int i = 0; i < n; i++) {
                 t.rawset((long) (i + 1), arr[i]);
             }

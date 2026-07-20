@@ -115,7 +115,14 @@ final class LuaStringLib {
             String fmt = checkString("format", 1, arg(frame, 1));
             Object[] all = allArgs(frame);
             Object[] rest = Arrays.copyOfRange(all, Math.min(1, all.length), all.length);
-            return LuaStringFormat.format(fmt, rest);
+            return LuaStringFormat.format(fmt, rest, cn);
+        }));
+
+        string.rawset("dump", wrap(language, "dump", (frame, cn) -> {
+            // Lua 5.1 §5.4: string.dump produces a binary chunk from a Lua function's bytecode.
+            // This is a tree-walking interpreter with no bytecode representation to dump, so this
+            // exists only so `string.dump ~= nil` holds and callers get a clean pcall-able error.
+            throw LuaException.runtimeError(null, "unable to dump given function");
         }));
 
         string.rawset("find", wrap(language, "find", (frame, cn) -> findImpl(frame)));

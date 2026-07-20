@@ -47,6 +47,21 @@ final class LuaMathLib {
                 Math.pow(checkNumber("pow", 1, arg(frame, 1)), checkNumber("pow", 2, arg(frame, 2)))));
         math.rawset("deg", wrap(language, "deg", (frame, cn) -> Math.toDegrees(checkNumber("deg", 1, arg(frame, 1)))));
         math.rawset("rad", wrap(language, "rad", (frame, cn) -> Math.toRadians(checkNumber("rad", 1, arg(frame, 1)))));
+        math.rawset("cosh", wrap(language, "cosh", (frame, cn) -> Math.cosh(checkNumber("cosh", 1, arg(frame, 1)))));
+        math.rawset("sinh", wrap(language, "sinh", (frame, cn) -> Math.sinh(checkNumber("sinh", 1, arg(frame, 1)))));
+        math.rawset("tanh", wrap(language, "tanh", (frame, cn) -> Math.tanh(checkNumber("tanh", 1, arg(frame, 1)))));
+        math.rawset("ldexp", wrap(language, "ldexp", (frame, cn) ->
+                Math.scalb(checkNumber("ldexp", 1, arg(frame, 1)), (int) checkNumber("ldexp", 2, arg(frame, 2)))));
+
+        math.rawset("frexp", wrap(language, "frexp", (frame, cn) -> {
+            double x = checkNumber("frexp", 1, arg(frame, 1));
+            if (x == 0) {
+                throw new LuaReturnException(new Object[] {0.0, 0.0});
+            }
+            int exp = Math.getExponent(x) + 1;
+            double mantissa = x / Math.pow(2, exp);
+            throw new LuaReturnException(new Object[] {mantissa, (double) exp});
+        }));
 
         math.rawset("max", wrap(language, "max", (frame, cn) -> {
             Object[] args = allArgs(frame);

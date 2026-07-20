@@ -1,5 +1,6 @@
 package org.mycelium.lua.stdlib;
 
+import com.oracle.truffle.api.nodes.IndirectCallNode;
 import org.mycelium.lua.LuaException;
 import org.mycelium.lua.runtime.LuaTypeUtils;
 
@@ -18,7 +19,7 @@ final class LuaStringFormat {
 
     private LuaStringFormat() {}
 
-    static String format(String fmt, Object[] args) {
+    static String format(String fmt, Object[] args, IndirectCallNode callNode) {
         StringBuilder out = new StringBuilder();
         int argIndex = 0;
         int i = 0;
@@ -116,7 +117,7 @@ final class LuaStringFormat {
                     break;
                 }
                 case 's': {
-                    String s = argVal == null ? "nil" : LuaTypeUtils.tostring(argVal);
+                    String s = argVal == null ? "nil" : LuaBaseLib.tostring(argVal, callNode);
                     out.append(String.format("%" + spec + "s", s));
                     break;
                 }

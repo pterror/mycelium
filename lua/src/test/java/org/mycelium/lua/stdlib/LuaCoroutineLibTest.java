@@ -86,7 +86,7 @@ class LuaCoroutineLibTest {
                 return {ok, err}
                 """);
         assertFalse(result.getArrayElement(0).asBoolean());
-        assertEquals("boom", result.getArrayElement(1).asString());
+        assertTrue(result.getArrayElement(1).asString().matches(".*:\\d+: boom"));
     }
 
     @Test

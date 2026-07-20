@@ -97,9 +97,13 @@ final class LuaBaseLib {
 
         globals.rawset("error", wrap(language, "error", (frame, callNode) -> {
             Object message = arg(frame, 1);
-            // Level (arg 2) governs where a string message's position prefix points; ignored here
-            // since this tree-walk interpreter has no separate "caller" source position to splice
-            // in without deeper plumbing.
+            int level = (int) optNumber(arg(frame, 2), 1);
+            if (message instanceof String s && level > 0) {
+                String prefix = locationPrefixAtLevel(level);
+                if (prefix != null) {
+                    message = prefix + s;
+                }
+            }
             throw new LuaException(message, null);
         }));
 
@@ -280,6 +284,24 @@ final class LuaBaseLib {
             Object[] results = LuaCallSupport.call(null, callNode, chunkOrError, new Object[0]);
             throw new LuaReturnException(results);
         }));
+        globals.rawset("loadfile", wrap(language, "loadfile", (frame, callNode) -> {
+            Object filenameArg = arg(frame, 1);
+            if (isNil(filenameArg)) {
+                // Lua 5.1 §5.1: with no argument, loadfile reads stdin. Not implemented — no
+                // existing caller in this codebase feeds an interactive/stdin chunk this way yet.
+                throw LuaException.runtimeError(null, "loadfile from stdin not yet implemented");
+            }
+            String filename = checkString("loadfile", 1, filenameArg);
+            String code;
+            try {
+                code = java.nio.file.Files.readString(
+                        java.nio.file.Path.of(filename), java.nio.charset.StandardCharsets.ISO_8859_1);
+            } catch (java.io.IOException e) {
+                throw new LuaReturnException(
+                        new Object[] {LuaNil.INSTANCE, "cannot open " + filename + ": " + e.getMessage()});
+            }
+            throw new LuaReturnException(loadChunk(language, callNode, code, "@" + filename));
+        }));
         globals.rawset("load", wrap(language, "load", (frame, callNode) -> {
             Object func = arg(frame, 1);
             String chunkname = optString(arg(frame, 2), "=(load)");
@@ -343,6 +365,44 @@ final class LuaBaseLib {
             LuaTable env = fn.getEnvironment();
             return env != null ? env : LuaLanguage.getContext(callNode).getGlobals();
         }));
+    }
+
+    /**
+     * Lua 5.1 &sect;5.1 {@code error}'s {@code level} argument: {@code "chunkname:currentline: "}
+     * for the stack frame {@code level} steps above {@code error} itself (level 1 = the function
+     * that called {@code error}, level 2 = that function's caller, ...), or {@code null} if no
+     * source position is available (e.g. the level is out of range, or that frame is a builtin
+     * with no Lua source). Mirrors {@link #functionAtLevel}'s frame-walking approach, but collects
+     * {@link RootNode}s (for their {@link SourceSection}) rather than {@link LuaFunction}s, and
+     * &mdash; like {@code debug.getinfo}'s {@code currentline} (see {@link LuaDebugLib}) &mdash;
+     * approximates the current line with the frame's root {@code SourceSection} start line, since
+     * this tree-walk interpreter doesn't track a separate per-statement "current line" once a call
+     * is in progress.
+     */
+    private static String locationPrefixAtLevel(int level) {
+        if (level < 1) {
+            return null;
+        }
+        java.util.List<com.oracle.truffle.api.nodes.RootNode> frames = new java.util.ArrayList<>();
+        Truffle.getRuntime().iterateFrames(frameInstance -> {
+            com.oracle.truffle.api.CallTarget ct = frameInstance.getCallTarget();
+            if (ct instanceof com.oracle.truffle.api.RootCallTarget rct
+                    && !rct.getRootNode().isInternal()) {
+                frames.add(rct.getRootNode());
+            }
+            return null;
+        });
+        // frames.get(0) is error()'s own builtin frame, so level 1 (the caller of error) is at
+        // index 1, level 2 at index 2, and so on.
+        if (level >= frames.size()) {
+            return null;
+        }
+        com.oracle.truffle.api.nodes.RootNode root = frames.get(level);
+        com.oracle.truffle.api.source.SourceSection section = root.getSourceSection();
+        if (section == null || !section.isAvailable()) {
+            return null;
+        }
+        return section.getSource().getName() + ":" + section.getStartLine() + ": ";
     }
 
     /**

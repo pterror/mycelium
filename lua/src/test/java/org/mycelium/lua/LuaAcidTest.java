@@ -892,6 +892,15 @@ class LuaAcidTest {
     }
 
     @Test
+    void stringFormatHonorsToStringMetamethod() {
+        eval("""
+                local t = setmetatable({}, {__tostring = function() return "custom" end})
+                assert(string.format("%s", t) == "custom")
+                assert(tostring(t) == "custom")
+                """);
+    }
+
+    @Test
     void stringFormatQAndE() {
         eval("""
                 local q = string.format("%q", 'he said "hi"\\n')
@@ -974,6 +983,38 @@ class LuaAcidTest {
                 """);
     }
 
+    @Test
+    void mathHyperbolicFunctions() {
+        eval("""
+                assert(math.cosh(0) == 1)
+                assert(math.sinh(0) == 0)
+                assert(math.tanh(0) == 0)
+                """);
+    }
+
+    @Test
+    void mathFrexpAndLdexp() {
+        eval("""
+                local m, e = math.frexp(8)
+                assert(m == 0.5)
+                assert(e == 4)
+                assert(math.ldexp(0.5, 4) == 8)
+                local m0, e0 = math.frexp(0)
+                assert(m0 == 0)
+                assert(e0 == 0)
+                """);
+    }
+
+    @Test
+    void stringDumpAlwaysErrors() {
+        eval("""
+                assert(string.dump ~= nil)
+                local ok, err = pcall(string.dump, print)
+                assert(not ok)
+                assert(type(err) == "string")
+                """);
+    }
+
     // ---------------------------------------------------------------------
     // 13. Table library (§5.5)
     // ---------------------------------------------------------------------
@@ -1019,6 +1060,34 @@ class LuaAcidTest {
                 local t2 = {3, 1, 4, 1, 5}
                 table.sort(t2, function(a, b) return a > b end)
                 for i = 1, #t2 - 1 do assert(t2[i] >= t2[i+1]) end
+                """);
+    }
+
+    @Test
+    void tableSortInvalidComparatorFailsGracefullyUnderPcall() {
+        // A "rock-paper-scissors" comparator (x beats y iff (x - y) mod 3 == 1, cyclically over
+        // {0, 1, 2}) is non-transitive and so violates the strict weak ordering that Java's
+        // Arrays.sort (TimSort) requires of its comparator. TimSort only actually detects and
+        // rejects such a violation once it exercises its merge phase on a sufficiently scrambled
+        // run of elements, so this shuffles a sizeable table (rather than relying on a tiny,
+        // already-orderly one) to reliably provoke the underlying IllegalArgumentException that
+        // table.sort must convert into a catchable Lua error instead of letting it escape pcall.
+        eval("""
+                local function beats(x, y) return (x - y) % 3 == 1 end
+                local t = {}
+                for i = 1, 300 do t[i] = i % 3 end
+                local seed = 12345
+                local function rand()
+                    seed = (seed * 1103515245 + 12345) % 2147483648
+                    return seed
+                end
+                for i = 300, 2, -1 do
+                    local j = (rand() % i) + 1
+                    t[i], t[j] = t[j], t[i]
+                end
+                local ok, err = pcall(table.sort, t, beats)
+                assert(not ok, "expected the non-transitive comparator to be rejected")
+                assert(type(err) == "string")
                 """);
     }
 
@@ -1071,7 +1140,7 @@ class LuaAcidTest {
                 local co = coroutine.create(function() error("kaboom") end)
                 local ok, err = coroutine.resume(co)
                 assert(not ok)
-                assert(err == "kaboom")
+                assert(err:match(".*:%d+: kaboom$"), "expected location-prefixed message, got: " .. tostring(err))
                 assert(coroutine.status(co) == "dead")
                 """);
     }
@@ -1139,7 +1208,26 @@ class LuaAcidTest {
         eval("""
                 local ok, err = pcall(function() error("boom") end)
                 assert(not ok)
+                assert(err:match(".*:%d+: boom$"), "expected location-prefixed message, got: " .. tostring(err))
+                """);
+    }
+
+    @Test
+    void errorWithLevelZeroHasNoPrefix() {
+        eval("""
+                local ok, err = pcall(function() error("boom", 0) end)
+                assert(not ok)
                 assert(err == "boom")
+                """);
+    }
+
+    @Test
+    void errorWithNonStringMessageThrowsRawObject() {
+        eval("""
+                local errObj = {}
+                local ok, err = pcall(function() error(errObj) end)
+                assert(not ok)
+                assert(err == errObj)
                 """);
     }
 
@@ -1161,7 +1249,7 @@ class LuaAcidTest {
                 assert(ok and result == 2)
 
                 local ok2, err = pcall(function() error("fail") end)
-                assert(not ok2 and err == "fail")
+                assert(not ok2 and err:match(".*:%d+: fail$"))
 
                 local ok3, a, b = pcall(function() return 1, 2 end)
                 assert(ok3 and a == 1 and b == 2)
@@ -1178,7 +1266,7 @@ class LuaAcidTest {
                 end)
                 assert(not ok)
                 assert(handlerCalled)
-                assert(result == "handled:oops")
+                assert(result:match("^handled:.*:%d+: oops$"), "got: " .. tostring(result))
                 """);
     }
 
@@ -1224,6 +1312,31 @@ class LuaAcidTest {
                 local ok, result = pcall(f2)
                 assert(ok)
                 assert(result == nil)
+                """);
+    }
+
+    @Test
+    void loadfileExecutesFile() throws Exception {
+        Path tmp = Files.createTempFile("lua-loadfile", ".lua");
+        try {
+            Files.writeString(tmp, "return 99");
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    local f = loadfile("%s")
+                    assert(type(f) == "function")
+                    assert(f() == 99)
+                    """, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void loadfileNonexistentReturnsNilAndError() {
+        eval("""
+                local f, err = loadfile("/nonexistent/path/does/not/exist.lua")
+                assert(f == nil)
+                assert(type(err) == "string")
                 """);
     }
 

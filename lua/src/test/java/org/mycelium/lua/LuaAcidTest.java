@@ -5,11 +5,15 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -1361,6 +1365,479 @@ class LuaAcidTest {
                 local a, b = 1, 2
                 a, b = b, a
                 assert(a == 2 and b == 1)
+                """);
+    }
+
+    // ---------------------------------------------------------------------
+    // 19. io library (§5.7)
+    // ---------------------------------------------------------------------
+
+    @Test
+    void ioWriteAndReadFile() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-test", ".txt");
+        try {
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    local f = assert(io.open("%s", "w"))
+                    f:write("hello world")
+                    f:close()
+                    local f2 = assert(io.open("%s", "r"))
+                    local content = f2:read("*a")
+                    f2:close()
+                    assert(content == "hello world", "got: " .. tostring(content))
+                    """, path, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void ioReadFormats() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-formats", ".txt");
+        Path tmp2 = Files.createTempFile("lua-io-formats2", ".txt");
+        try {
+            Files.writeString(tmp, "first line\n123 45\nrest of the file content");
+            Files.writeString(tmp2, "99 rest\nignored\n");
+            String path = tmp.toAbsolutePath().toString();
+            String path2 = tmp2.toAbsolutePath().toString();
+            eval(String.format("""
+                    local f = assert(io.open("%s", "r"))
+                    assert(f:read("*l") == "first line")
+                    assert(f:read("*n") == 123)
+                    assert(f:read("*n") == 45)
+                    assert(f:read(4) == "\\nres")
+                    assert(f:read("*a") == "t of the file content")
+                    f:close()
+
+                    local f2 = assert(io.open("%s", "r"))
+                    local n, l = f2:read("*n", "*l")
+                    assert(n == 99, "got n=" .. tostring(n))
+                    assert(l == " rest", "got l=" .. tostring(l))
+                    f2:close()
+                    """, path, path2));
+        } finally {
+            Files.deleteIfExists(tmp);
+            Files.deleteIfExists(tmp2);
+        }
+    }
+
+    @Test
+    void ioLines() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-lines", ".txt");
+        try {
+            Files.writeString(tmp, "alpha\nbeta\ngamma\n");
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    local lines = {}
+                    for line in io.lines("%s") do
+                        lines[#lines+1] = line
+                    end
+                    assert(#lines == 3)
+                    assert(lines[1] == "alpha")
+                    assert(lines[2] == "beta")
+                    assert(lines[3] == "gamma")
+                    """, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void ioSeek() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-seek", ".txt");
+        try {
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    local f = assert(io.open("%s", "w"))
+                    f:write("0123456789")
+                    f:close()
+
+                    local f2 = assert(io.open("%s", "r"))
+                    assert(f2:seek("set", 5) == 5)
+                    assert(f2:read(2) == "56")
+                    assert(f2:seek("cur") == 7)
+                    assert(f2:seek("end") == 10)
+                    assert(f2:seek("set", 0) == 0)
+                    assert(f2:read("*a") == "0123456789")
+                    f2:close()
+                    """, path, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void ioType() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-type", ".txt");
+        try {
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    assert(io.type(io.stdout) == "file")
+                    local f = assert(io.open("%s", "w"))
+                    f:close()
+                    assert(io.type(f) == "closed file")
+                    assert(io.type("string") == nil)
+                    assert(io.type(42) == nil)
+                    """, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void ioStdStreams() {
+        eval("""
+                assert(io.stdin ~= nil)
+                assert(io.stdout ~= nil)
+                assert(io.stderr ~= nil)
+                assert(io.type(io.stdin) == "file")
+                assert(io.type(io.stdout) == "file")
+                assert(io.type(io.stderr) == "file")
+                """);
+    }
+
+    @Test
+    void ioDefaultInputOutput() throws Exception {
+        Path tmp = Files.createTempFile("lua-io-default", ".txt");
+        try {
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    io.output("%s")
+                    io.write("hello default")
+                    io.close()
+
+                    local f2 = assert(io.open("%s", "r"))
+                    local content = f2:read("*a")
+                    f2:close()
+                    assert(content == "hello default", "got: " .. tostring(content))
+                    """, path, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void typeOfFileHandle() {
+        eval("""
+                assert(type(io.stdout) == "userdata")
+                """);
+    }
+
+    // ---------------------------------------------------------------------
+    // 20. os library (§5.8)
+    // ---------------------------------------------------------------------
+
+    @Test
+    void osClock() {
+        eval("""
+                local c = os.clock()
+                assert(type(c) == "number")
+                assert(c >= 0)
+                """);
+    }
+
+    @Test
+    void osTime() {
+        eval("""
+                local t = os.time()
+                assert(type(t) == "number")
+                assert(t > 1000000000)
+                """);
+    }
+
+    @Test
+    void osDate() {
+        eval("""
+                local t = os.date("*t")
+                assert(type(t) == "table")
+                assert(type(t.year) == "number")
+                assert(type(t.month) == "number")
+                assert(type(t.day) == "number")
+                assert(type(t.hour) == "number")
+                assert(type(t.min) == "number")
+                assert(type(t.sec) == "number")
+                assert(type(t.wday) == "number")
+                assert(type(t.yday) == "number")
+
+                local y = os.date("%Y")
+                assert(type(y) == "string")
+                assert(#y == 4)
+
+                local h = os.date("!%H", 0)
+                assert(h == "00", "got: " .. tostring(h))
+                """);
+    }
+
+    @Test
+    void osDifftime() {
+        eval("""
+                assert(os.difftime(100, 40) == 60)
+                local t1 = os.time()
+                local t2 = t1 + 10
+                assert(os.difftime(t2, t1) == 10)
+                """);
+    }
+
+    @Test
+    void osGetenv() {
+        // os.getenv reaches out through TruffleLanguage.Env#getEnvironment(), which honors the
+        // polyglot Context's environment-access policy; the shared `context` from setUp() doesn't
+        // opt into that (matching every other test's minimal-permissions default), so this test
+        // builds its own context with environment access enabled rather than widening the default
+        // for every other test in the file.
+        try (Context envContext = Context.newBuilder("lua")
+                .allowEnvironmentAccess(org.graalvm.polyglot.EnvironmentAccess.INHERIT)
+                .build()) {
+            envContext.eval("lua", """
+                    local p = os.getenv("PATH")
+                    assert(type(p) == "string")
+                    assert(os.getenv("NONEXISTENT_VAR_12345") == nil)
+                    """);
+        }
+    }
+
+    @Test
+    void osTmpname() {
+        eval("""
+                local n = os.tmpname()
+                assert(type(n) == "string")
+                assert(#n > 0)
+                """);
+    }
+
+    @Test
+    void osRemoveAndRename() throws Exception {
+        Path tmp = Files.createTempFile("lua-os-remove", ".txt");
+        Path renameTarget = tmp.resolveSibling(tmp.getFileName() + ".renamed");
+        Files.deleteIfExists(renameTarget);
+        try {
+            String path = tmp.toAbsolutePath().toString();
+            String missingPath = path + ".does-not-exist";
+            String renamedPath = renameTarget.toAbsolutePath().toString();
+            eval(String.format("""
+                    assert(os.remove("%s") == true)
+
+                    local ok, err = os.remove("%s")
+                    assert(ok == nil)
+                    assert(type(err) == "string")
+
+                    local f = assert(io.open("%s", "w"))
+                    f:write("data")
+                    f:close()
+                    assert(os.rename("%s", "%s") == true)
+                    local f2 = assert(io.open("%s", "r"))
+                    assert(f2:read("*a") == "data")
+                    f2:close()
+
+                    local ok2, err2 = os.rename("%s", "%s")
+                    assert(ok2 == nil)
+                    assert(type(err2) == "string")
+                    """,
+                    path, missingPath, path, path, renamedPath, renamedPath, missingPath, missingPath + ".x"));
+        } finally {
+            Files.deleteIfExists(tmp);
+            Files.deleteIfExists(renameTarget);
+        }
+    }
+
+    @Test
+    void osSetlocale() {
+        eval("""
+                local loc = os.setlocale(nil)
+                assert(type(loc) == "string")
+                assert(#loc > 0)
+                """);
+    }
+
+    // ---------------------------------------------------------------------
+    // 21. require / package (§5.3)
+    // ---------------------------------------------------------------------
+
+    @Test
+    void requireLoadsFile() throws Exception {
+        Path dir = Files.createTempDirectory("lua-require");
+        try {
+            Files.writeString(dir.resolve("mod.lua"), "return {value = 42}");
+            String dirPath = dir.toAbsolutePath().toString();
+            eval(String.format("""
+                    package.path = "%s/?.lua;" .. package.path
+                    local m = require("mod")
+                    assert(type(m) == "table")
+                    assert(m.value == 42)
+                    """, dirPath));
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void requireCachesModules() throws Exception {
+        Path dir = Files.createTempDirectory("lua-require-cache");
+        try {
+            Files.writeString(dir.resolve("mod.lua"), "return {}");
+            String dirPath = dir.toAbsolutePath().toString();
+            eval(String.format("""
+                    package.path = "%s/?.lua;" .. package.path
+                    local m1 = require("mod")
+                    local m2 = require("mod")
+                    assert(m1 == m2)
+                    """, dirPath));
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void requirePreload() {
+        eval("""
+                package.preload["mymod"] = function() return {x = 42} end
+                local m = require("mymod")
+                assert(m.x == 42)
+                """);
+    }
+
+    @Test
+    void requireNotFoundError() {
+        eval("""
+                local ok, err = pcall(require, "nonexistent_module_xyz")
+                assert(not ok)
+                assert(type(err) == "string")
+                assert(string.find(err, "nonexistent_module_xyz") ~= nil)
+                """);
+    }
+
+    @Test
+    void packageLoadedManual() {
+        eval("""
+                package.loaded["foo"] = {bar = 1}
+                assert(require("foo").bar == 1)
+                """);
+    }
+
+    @Test
+    void dofileExecutesFile() throws Exception {
+        Path tmp = Files.createTempFile("lua-dofile", ".lua");
+        try {
+            Files.writeString(tmp, "return 99");
+            String path = tmp.toAbsolutePath().toString();
+            eval(String.format("""
+                    local v = dofile("%s")
+                    assert(v == 99)
+                    """, path));
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void requireDottedNames() throws Exception {
+        Path dir = Files.createTempDirectory("lua-require-dotted");
+        try {
+            Path sub = dir.resolve("foo");
+            Files.createDirectory(sub);
+            Files.writeString(sub.resolve("bar.lua"), "return {y = 7}");
+            String dirPath = dir.toAbsolutePath().toString();
+            eval(String.format("""
+                    package.path = "%s/?.lua;" .. package.path
+                    local m = require("foo.bar")
+                    assert(m.y == 7)
+                    """, dirPath));
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    private static void deleteRecursively(Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.delete(p);
+                } catch (IOException ignored) {
+                    // Best-effort cleanup.
+                }
+            });
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 22. debug library (§5.9)
+    // ---------------------------------------------------------------------
+
+    @Test
+    void debugTraceback() {
+        eval("""
+                local s = debug.traceback()
+                assert(type(s) == "string")
+                assert(string.find(s, "stack traceback") ~= nil)
+                """);
+    }
+
+    @Test
+    void debugTracebackWithMessage() {
+        eval("""
+                local s = debug.traceback("custom msg")
+                assert(s:sub(1, 10) == "custom msg", "got: " .. s)
+                """);
+    }
+
+    @Test
+    void debugGetinfoBuiltin() {
+        eval("""
+                local info = debug.getinfo(print)
+                assert(type(info) == "table")
+                assert(info.what == "C")
+                """);
+    }
+
+    @Test
+    void debugGetinfoFunction() {
+        eval("""
+                local info = debug.getinfo(function() end)
+                assert(type(info) == "table")
+                assert(info.what == "Lua")
+                """);
+    }
+
+    @Test
+    void debugGetmetatable() {
+        eval("""
+                local t = setmetatable({}, {__metatable = "protected"})
+                assert(getmetatable(t) == "protected")
+                assert(type(debug.getmetatable(t)) == "table")
+                """);
+    }
+
+    @Test
+    void debugSetmetatable() {
+        eval("""
+                local t = setmetatable({}, {__metatable = "protected"})
+                local newmt = {marker = true}
+                debug.setmetatable(t, newmt)
+                assert(debug.getmetatable(t) == newmt)
+                assert(getmetatable(t).marker == true)
+                """);
+    }
+
+    @Test
+    void debugGetregistry() {
+        eval("""
+                local r1 = debug.getregistry()
+                local r2 = debug.getregistry()
+                assert(type(r1) == "table")
+                assert(r1 == r2)
+                """);
+    }
+
+    @Test
+    void debugStubsDontError() {
+        eval("""
+                assert(debug.getlocal(1, 1) == nil)
+                assert(debug.setlocal(1, 1, "x") == nil)
+                assert(debug.sethook() == nil)
+                assert(debug.gethook() == nil)
                 """);
     }
 }

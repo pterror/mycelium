@@ -46,7 +46,7 @@ public final class LuaContext {
         globals.rawset("_VERSION", "Lua 5.1");
         globals.rawset("_G", globals);
         try {
-            org.mycelium.lua.stdlib.LuaStdLib.installAll(language, globals);
+            org.mycelium.lua.stdlib.LuaStdLib.installAll(language, this);
         } catch (LinkageError e) {
             // Standard library not available yet — base runtime (parsing/execution) still works.
         }

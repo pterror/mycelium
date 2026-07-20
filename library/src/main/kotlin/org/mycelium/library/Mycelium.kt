@@ -29,7 +29,7 @@ class Mycelium(
         JsSupport, CoffeeSupport, CivetSupport, LiveScriptSupport, ElmSupport, PureScriptSupport, ReScriptSupport,
         GleamSupport, ImbaSupport,
         DartSupport, KotlinJsSupport, ScalaJsSupport,
-        RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport
+        RubySupport, PythonSupport, CSupport, RustSupport, TinyGoSupport, LuaSupport
     ),
     // When true, a bare specifier that can't be resolved against any existing
     // node_modules tree triggers an automatic `npm install`/`pnpm install` of the

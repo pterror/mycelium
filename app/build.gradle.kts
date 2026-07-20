@@ -42,6 +42,7 @@ val languagePackConfigNames = mapOf(
     "java" to "javaLang",
     "llvm" to "llvmLang",
     "wasm" to "wasmLang",
+    "lua" to "luaLang",
 )
 
 // `./gradlew :app:jvmRun --args="run path/to/file.mjs"`
@@ -49,14 +50,14 @@ val languagePackConfigNames = mapOf(
 //
 // Runs Mycelium in JVM mode with the core runtime plus whichever Truffle language packs
 // are named in the `-Planguages` property (comma-separated: `js`, `ruby`, `python`,
-// `java`, `llvm`, `wasm`). **Defaults to `js` when no `-Planguages` is specified**, so
+// `java`, `llvm`, `wasm`, `lua`). **Defaults to `js` when no `-Planguages` is specified**, so
 // existing usage (`./gradlew :app:jvmRun --args="run file.mjs"`) keeps working without
 // having to spell out `-Planguages=js` every time. Pass `-Planguages=` (empty) to run
 // with NO languages at all (useful only for probing — Mycelium will report an error
 // since it has no supported extensions).
 val jvmRun by tasks.registering(JavaExec::class) {
     group = "application"
-    description = "Run Mycelium in JVM mode. Pass -Planguages=js,ruby,python,java,llvm,wasm to select language packs (default: js)."
+    description = "Run Mycelium in JVM mode. Pass -Planguages=js,ruby,python,java,llvm,wasm,lua to select language packs (default: js)."
     mainClass.set("org.mycelium.app.AppKt")
     workingDir = rootDir
     // insightTool is added unconditionally (not gated behind -Planguages, since it's an

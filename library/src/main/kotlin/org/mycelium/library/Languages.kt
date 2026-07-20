@@ -309,6 +309,73 @@ object RustSupport : LanguageSupport {
 // "js.webassembly" context option set in Mycelium.kt) — see
 // InterceptingFileSystem.loadWasmExports, which returns `instance.exports`, an ordinary JS
 // object generateShim can enumerate exactly like an LLVM Value's members.
+// Lua 5.1, via Mycelium's own from-scratch Truffle language implementation
+// (project(":lua"), package org.mycelium.lua — see lua/build.gradle.kts and
+// LuaLanguage.java's own Truffle registration, language ID "lua"). Unlike every other
+// LanguageSupport here, this isn't a GraalVM-shipped or npm-installed runtime: Mycelium
+// owns the lexer/parser/AST/stdlib itself. `packageEcosystemOrder` falls back to NPM
+// (rather than defining a new PackageEcosystem.LUAROCKS entry) since LuaRocks isn't wired
+// into PackageEcosystem/PackageInstallerRegistry yet — a bare specifier encountered while
+// the guest stack is inside Lua is simply resolved the same way any other unrecognized
+// host language's would be (npm-first, the interface default), rather than against any
+// Lua-specific package index.
+//
+// KNOWN LIMITATION (discovered integrating this LanguageSupport, 2026-07-20): the Lua
+// runtime's own value types (LuaTable, LuaFunction — see
+// lua/src/main/java/org/mycelium/lua/runtime/) carry no
+// `@ExportLibrary(InteropLibrary.class)` annotations at all, so a polyglot Value wrapping
+// either one exposes no members/executability to another guest language — `Value.memberKeys`
+// is always empty and `Value.canExecute()` is always false for a Lua table/function. That
+// blocks the two things Mycelium's own cross-language import machinery
+// (ShimGenerator/InterceptingFileSystem) needs from a *target* language's return value:
+// enumerating a returned table's fields to generate a shim (so a `.lua` module written as
+// `return { add = function(a, b) ... end }` can't have `add` extracted the way a Ruby/JS
+// module's own exports already are — see ShimGenerator.generateCrossLanguageShim, which
+// walks `value.memberKeys`) and directly invoking a Lua closure from another guest language.
+// A plain `context.eval("lua", ...)` that returns a primitive (number/string/boolean/nil)
+// still crosses the polyglot boundary fine — Lua numbers/strings are ordinary boxed
+// Long/Double/String values, which every guest language's interop already understands — and
+// running a standalone `.lua` *file* via `Mycelium.runFile` works too, since neither of
+// those depends on interop on the returned value. Only cross-language *member*-based
+// import of/into Lua is affected; fixing it would require adding InteropLibrary exports to
+// LuaTable/LuaFunction in the lua/ subproject itself, which is out of scope here (this
+// LanguageSupport only wires up what the existing Lua runtime already exposes).
+object LuaSupport : LanguageSupport {
+    override val languageId = "lua"
+    override val extensions = listOf("lua")
+    override val compilerCommand = null
+    override val packageEcosystemOrder = listOf(PackageEcosystem.NPM)
+
+    // Placeholder, mirroring PythonSupport's own detectFrame doc comment — this Lua
+    // implementation has no `require`-equivalent wired up yet (LuaContext installs the
+    // stdlib but no module-loading builtin), so there's no real cross-language-import call
+    // stack shape to validate this against yet. LuaRootNode (see
+    // lua/src/main/java/org/mycelium/lua/nodes/LuaRootNode.java) doesn't override
+    // toString()/getName(), so a Truffle call target's default frame representation while
+    // executing Lua code includes that class's simple name.
+    override fun detectFrame(frame: String) = frame.contains("LuaRootNode")
+
+    private val identifierRegex = Regex("^[a-zA-Z_][a-zA-Z0-9_]*$")
+    private val reservedWords = setOf(
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+        "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"
+    )
+
+    override fun isValidExportName(name: String) =
+        identifierRegex.matches(name) && name !in reservedWords
+
+    // Unverified against a real cross-language import — see this object's own KNOWN
+    // LIMITATION doc comment above: Value.memberKeys is always empty for a Lua table/
+    // function today, so ShimGenerator never actually has any exports to hand this
+    // method in practice. Modeled on RubySupport's own generateShim (a plain top-level
+    // assignment per export) for whenever Lua gains a "Polyglot" global of its own to
+    // resolve `Polyglot.import` against.
+    override fun generateShim(exports: Map<String, String>): String =
+        exports.entries.joinToString("\n") { (name, key) ->
+            "$name = Polyglot.import(\"$key\")"
+        }
+}
+
 object TinyGoSupport : LanguageSupport {
     override val languageId = "wasm"
     override val extensions = listOf("go")

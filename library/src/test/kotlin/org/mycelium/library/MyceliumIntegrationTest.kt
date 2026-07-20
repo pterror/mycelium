@@ -2664,4 +2664,102 @@ class MyceliumIntegrationTest {
         assertEquals("function", mc.eval("js", "globalThis.__modModuleType").asString())
         assertEquals("function", mc.eval("js", "globalThis.__modRequireEventsType").asString())
     }
+
+    // --- Lua 5.1 (org.mycelium.lua — Mycelium's own from-scratch Truffle language) ---
+    //
+    // See LuaSupport's own KNOWN LIMITATION doc comment (Languages.kt): LuaTable/LuaFunction
+    // carry no InteropLibrary exports yet, so a Value wrapping either one has no usable
+    // members/executability from another guest language — only plain-primitive (number/
+    // string/boolean/nil) results cross the polyglot boundary today. Every test below is
+    // scoped to what that actually supports: evaluating Lua directly (mc.eval("lua", ...)),
+    // running a standalone .lua file (mc.runFile), and JS/Ruby reaching into Lua (never the
+    // other direction, and never by reading a returned table's fields from outside Lua)
+    // via the target language's own built-in Polyglot.eval, exactly like the existing
+    // Ruby-only chain tests above (chainJsToRubyToJs, etc.) already do for Ruby.
+
+    @Test fun polyglotEvalLua() {
+        val mc = vm
+        val result = mc.eval("lua", "return 1 + 2")
+        assertEquals(3, result.asInt())
+    }
+
+    @Test fun luaTableFieldAccess() {
+        val mc = vm
+        val result = mc.eval("lua", "local t = {a = 1, b = 2}\nreturn t.a + t.b")
+        assertEquals(3, result.asInt())
+    }
+
+    @Test fun luaStringLibraryUpper() {
+        val mc = vm
+        val result = mc.eval("lua", "return string.upper(\"hello\")")
+        assertEquals("HELLO", result.asString())
+    }
+
+    @Test fun luaMathLibraryFloor() {
+        val mc = vm
+        val result = mc.eval("lua", "return math.floor(3.7)")
+        assertEquals(3, result.asInt())
+    }
+
+    @Test fun luaFunctionDefinitionAndCall() {
+        val mc = vm
+        val result = mc.eval(
+            "lua",
+            """
+            local function add(a, b)
+                return a + b
+            end
+            return add(4, 5)
+            """.trimIndent()
+        )
+        assertEquals(9, result.asInt())
+    }
+
+    // --- Lua file import (mc.runFile) ---
+    //
+    // Lua's shared globals table (LuaContext) persists for the lifetime of a single
+    // Mycelium/Context instance, the same way JS's globalThis does — so a standalone .lua
+    // *file* run via runFile can leave a value behind for a later mc.eval("lua", ...) call
+    // to read back, without needing any cross-language interop at all.
+    @Test fun runLuaFile() {
+        val mc = Mycelium()
+        mc.runFile(testResourcePath("constant.lua"))
+        val result = mc.eval("lua", "return myLuaGlobal")
+        assertEquals(42, result.asInt())
+    }
+
+    // --- Cross-language: JS/Ruby reaching into Lua via Polyglot.eval ---
+
+    // Lua's own grammar (Lua 5.1 &sect;8: `exprstat -> functioncall`) only permits a bare
+    // function call as a top-level expression statement — a plain arithmetic expression
+    // like `7 * 6` needs an explicit `return` to be a valid chunk, unlike JS/Ruby where the
+    // last expression's value is implicitly the eval result. Every `Polyglot.eval("lua",
+    // ...)` snippet below spells that out rather than relying on JS/Ruby's own
+    // implicit-last-expression convention.
+
+    @Test fun jsEvalsLua() {
+        val mc = vm
+        mc.eval("js", """
+            globalThis.__jsLuaResult = Polyglot.eval("lua", "return 7 * 6");
+        """)
+        val result = mc.eval("js", "globalThis.__jsLuaResult")
+        assertEquals(42, result.asInt())
+    }
+
+    @Test fun rubyEvalsLua() {
+        val mc = vm
+        mc.eval("ruby", """
+            ${'$'}__rb_lua_result = Polyglot.eval("lua", "return 5 + 5")
+        """.trimIndent())
+        val result = mc.eval("ruby", "${'$'}__rb_lua_result")
+        assertEquals(10, result.asInt())
+    }
+
+    @Test fun chainJsToRubyToLua() {
+        val mc = vm
+        val result = mc.eval("js", """
+            Polyglot.eval("ruby", 'Polyglot.eval("lua", "return 6 * 7")')
+        """)
+        assertEquals(42, result.asInt())
+    }
 }

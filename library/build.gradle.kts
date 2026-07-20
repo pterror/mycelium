@@ -34,6 +34,7 @@ val pythonLang: Configuration by configurations.creating { isCanBeConsumed = fal
 val javaLang: Configuration by configurations.creating { isCanBeConsumed = false }
 val llvmLang: Configuration by configurations.creating { isCanBeConsumed = false }
 val wasmLang: Configuration by configurations.creating { isCanBeConsumed = false }
+val luaLang: Configuration by configurations.creating { isCanBeConsumed = false }
 val insightTool: Configuration by configurations.creating { isCanBeConsumed = false }
 
 dependencies {
@@ -58,6 +59,10 @@ dependencies {
   llvmLang("org.graalvm.polyglot:llvm:$graalVersion")
   llvmLang("org.graalvm.polyglot:llvm-native:$graalVersion")
   wasmLang("org.graalvm.polyglot:wasm:$graalVersion")
+  // Lua is Mycelium's own from-scratch Truffle language implementation (not a GraalVM-shipped
+  // artifact like the packs above), so it's pulled in as a project dependency instead of a
+  // Maven coordinate.
+  luaLang(project(":lua"))
   insightTool("org.graalvm.tools:insight-tool:$graalVersion")
 
   implementation("io.mvnpm:esbuild-java:1.5.1")
@@ -77,4 +82,4 @@ dependencies {
 // (Configuration instances can no longer be passed directly to `dependencies { }` as of
 // Gradle 8 — `extendsFrom` is the supported way to fold one Configuration's dependencies
 // into another).
-configurations.testImplementation.get().extendsFrom(jsLang, rubyLang, pythonLang, javaLang, llvmLang, wasmLang, insightTool)
+configurations.testImplementation.get().extendsFrom(jsLang, rubyLang, pythonLang, javaLang, llvmLang, wasmLang, luaLang, insightTool)

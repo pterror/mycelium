@@ -93,6 +93,15 @@ public final class LuaLanguage extends TruffleLanguage<LuaContext> {
             this.callNode = DirectCallNode.create(chunkCallTarget);
         }
 
+        /** This wrapper has no Lua source position of its own (see class doc) &mdash; the real
+         * chunk {@link LuaRootNode} it immediately delegates to does. Marking it internal keeps it
+         * out of {@code debug.traceback}/{@code debug.getinfo}'s frame walks, which would otherwise
+         * report a spurious extra {@code "?: in function <?>"} frame beneath the actual chunk. */
+        @Override
+        public boolean isInternal() {
+            return true;
+        }
+
         @Override
         public Object execute(VirtualFrame frame) {
             LuaContext context = LuaLanguage.getContext(this);

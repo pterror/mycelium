@@ -6,6 +6,7 @@ import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.Node.Child;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.SourceSection;
 import org.mycelium.lua.nodes.controlflow.LuaReturnException;
 import org.mycelium.lua.runtime.LuaFunction;
 
@@ -29,6 +30,11 @@ import org.mycelium.lua.runtime.LuaFunction;
  * <p><b>Return values:</b> {@link #execute} always returns an {@code Object[]} (possibly empty),
  * extracted from a thrown {@link LuaReturnException}, or empty if the body falls off the end
  * without an explicit {@code return}.
+ *
+ * <p><b>Debug info:</b> {@link #name} (surfaced via {@link #getName()}) and {@link #sourceSection}
+ * (via {@link #getSourceSection()}) are set by the parser so that {@code debug.traceback}/
+ * {@code debug.getinfo} and Truffle's own stack-trace machinery can report a meaningful
+ * {@code file:line: in function 'name'}.
  */
 public final class LuaRootNode extends RootNode {
 
@@ -39,9 +45,34 @@ public final class LuaRootNode extends RootNode {
 
     @Child private LuaStatementNode body;
 
+    private final String name;
+    private SourceSection sourceSection;
+
     public LuaRootNode(TruffleLanguage<?> language, FrameDescriptor frameDescriptor, LuaStatementNode body) {
+        this(language, frameDescriptor, body, null);
+    }
+
+    public LuaRootNode(
+            TruffleLanguage<?> language, FrameDescriptor frameDescriptor, LuaStatementNode body, String name) {
         super(language, frameDescriptor);
         this.body = body;
+        this.name = name;
+    }
+
+    /** Attaches the source range spanning this function's definition (from {@code function}/its
+     * name through the matching {@code end}, or the whole chunk for a top-level compile). */
+    public void setSourceSection(SourceSection sourceSection) {
+        this.sourceSection = sourceSection;
+    }
+
+    @Override
+    public SourceSection getSourceSection() {
+        return sourceSection;
+    }
+
+    @Override
+    public String getName() {
+        return name;
     }
 
     @Override

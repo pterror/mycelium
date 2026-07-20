@@ -65,6 +65,11 @@ public final class LuaLexer {
     private int column = 1;
     private LuaToken peeked;
 
+    /** Character offset of the token currently being scanned, captured at the top of
+     * {@link #scanToken()} (before whitespace/comments were skipped, this is the *first*
+     * character of the token itself since it's set right after {@link #skipWhitespaceAndComments()}). */
+    private int tokenStartOffset;
+
     public LuaLexer(String source, String sourceName) {
         this.source = source;
         this.sourceName = sourceName;
@@ -102,6 +107,7 @@ public final class LuaLexer {
 
         int startLine = line;
         int startCol = column;
+        tokenStartOffset = pos;
         char c = peekChar();
 
         if (c == EOF_CHAR) {
@@ -452,7 +458,7 @@ public final class LuaLexer {
     }
 
     private LuaToken tok(TokenType type, String value, int line, int col) {
-        return new LuaToken(type, value, line, col);
+        return new LuaToken(type, value, line, col, tokenStartOffset, pos - tokenStartOffset);
     }
 
     private LuaLexerException error(String message) {

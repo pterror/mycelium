@@ -1,10 +1,13 @@
 package org.mycelium.lua.stdlib;
 
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.source.Source;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.mycelium.lua.LuaContext;
 import org.mycelium.lua.LuaException;
 import org.mycelium.lua.LuaLanguage;
@@ -304,6 +307,73 @@ final class LuaBaseLib {
             String chunkname = optString(arg(frame, 2), code);
             throw new LuaReturnException(loadChunk(language, callNode, code, chunkname));
         }));
+
+        // setfenv/getfenv (Lua 5.1 §5.1): get/set a function's environment table (the table its
+        // global reads/writes resolve against &mdash; see LuaReadGlobalNode/LuaWriteGlobalNode).
+        // `f` may be a function directly, or a stack level (1 = the function calling
+        // setfenv/getfenv, 2 = that function's caller, ...). Level 0 ("the running thread's
+        // globals") isn't meaningfully distinct from _G in this implementation and isn't supported.
+        globals.rawset("setfenv", wrap(language, "setfenv", (frame, callNode) -> {
+            Object target = arg(frame, 1);
+            LuaTable env = checkTable("setfenv", 2, arg(frame, 2));
+            if (target instanceof LuaFunction fn) {
+                fn.setEnvironment(env);
+                return fn;
+            }
+            int level = (int) checkNumber("setfenv", 1, target);
+            LuaFunction fn = functionAtLevel(level);
+            if (fn == null) {
+                throw LuaException.runtimeError(null, "bad argument #1 to 'setfenv' (invalid level)");
+            }
+            fn.setEnvironment(env);
+            return fn;
+        }));
+
+        globals.rawset("getfenv", wrap(language, "getfenv", (frame, callNode) -> {
+            Object target = arg(frame, 1);
+            if (target instanceof LuaFunction fn) {
+                LuaTable env = fn.getEnvironment();
+                return env != null ? env : LuaLanguage.getContext(callNode).getGlobals();
+            }
+            int level = isNil(target) ? 1 : (int) checkNumber("getfenv", 1, target);
+            LuaFunction fn = functionAtLevel(level);
+            if (fn == null) {
+                throw LuaException.runtimeError(null, "bad argument #1 to 'getfenv' (invalid level)");
+            }
+            LuaTable env = fn.getEnvironment();
+            return env != null ? env : LuaLanguage.getContext(callNode).getGlobals();
+        }));
+    }
+
+    /**
+     * Finds the {@link LuaFunction} closure executing at the given stack {@code level}, where
+     * level 1 is the function that called the setfenv/getfenv builtin itself, level 2 its caller,
+     * and so on &mdash; matching {@code debug.getinfo}'s level numbering (Lua 5.1 &sect;5.9). On
+     * this runtime configuration {@link Truffle#iterateFrames} reports the currently-executing
+     * frame first (i.e. the setfenv/getfenv builtin's own frame), so that first frame is skipped
+     * before counting down to {@code level}.
+     */
+    private static LuaFunction functionAtLevel(int level) {
+        if (level < 1) {
+            return null;
+        }
+        AtomicInteger remaining = new AtomicInteger(level);
+        boolean[] skippedSelf = {false};
+        Object found = Truffle.getRuntime().iterateFrames(frameInstance -> {
+            Object[] args = frameInstance.getFrame(FrameInstance.FrameAccess.READ_ONLY).getArguments();
+            if (args.length == 0 || !(args[0] instanceof LuaFunction fn)) {
+                return null;
+            }
+            if (!skippedSelf[0]) {
+                skippedSelf[0] = true;
+                return null;
+            }
+            if (remaining.decrementAndGet() == 0) {
+                return fn;
+            }
+            return null;
+        });
+        return found instanceof LuaFunction fn ? fn : null;
     }
 
     /**

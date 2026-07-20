@@ -59,11 +59,19 @@ public final class LuaToken {
     public final int line;
     public final int column;
 
-    public LuaToken(TokenType type, String value, int line, int column) {
+    /** 0-based character offset, into the source, of this token's first character. */
+    public final int startOffset;
+
+    /** Number of characters this token spans in the source (0 for the synthetic {@code EOF} token). */
+    public final int length;
+
+    public LuaToken(TokenType type, String value, int line, int column, int startOffset, int length) {
         this.type = type;
         this.value = value;
         this.line = line;
         this.column = column;
+        this.startOffset = startOffset;
+        this.length = length;
     }
 
     @Override

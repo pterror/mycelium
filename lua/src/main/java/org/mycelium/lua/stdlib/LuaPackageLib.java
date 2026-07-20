@@ -1,7 +1,9 @@
 package org.mycelium.lua.stdlib;
 
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.source.Source;
 import java.io.IOException;
@@ -20,6 +22,7 @@ import org.mycelium.lua.runtime.LuaFunction;
 import org.mycelium.lua.runtime.LuaNil;
 import org.mycelium.lua.runtime.LuaTable;
 
+import static org.mycelium.lua.stdlib.LuaBuiltinRootNode.allArgs;
 import static org.mycelium.lua.stdlib.LuaBuiltinRootNode.arg;
 import static org.mycelium.lua.stdlib.LuaBuiltinRootNode.wrap;
 import static org.mycelium.lua.stdlib.LuaLibUtil.*;
@@ -61,12 +64,31 @@ final class LuaPackageLib {
         globals.rawset("require", wrap(language, "require", (frame, callNode) ->
                 require(language, checkString("require", 1, arg(frame, 1)), pkg, loaded, callNode)));
 
-        // `module` is deprecated even in Lua 5.1 and rarely used by modern code; a full
-        // implementation (rewriting the caller's _ENV-equivalent global-lookup path, §5.3's
-        // package.seeall handling, etc.) doesn't fit this tree-walk interpreter's calling
-        // convention without much deeper plumbing. This stub creates the module table, registers
-        // it in package.loaded, and returns it, which covers simple non-searching uses; it does
-        // NOT rebind the caller's subsequent global writes into the module table.
+        // package.seeall (Lua 5.1 §5.3): passed as an extra argument to module(), e.g.
+        // `module("mymod", package.seeall)`. Its job is to give the about-to-be-rebound module
+        // table an __index fallback to the real globals, so code inside the module can still read
+        // (though not implicitly write) globals like `print` after its environment becomes the
+        // module table.
+        LuaFunction seeall = wrap(language, "seeall", (frame, callNode) -> {
+            Object moduleArg = arg(frame, 1);
+            if (moduleArg instanceof LuaTable module) {
+                LuaTable mt = module.getMetatable();
+                if (mt == null) {
+                    mt = new LuaTable();
+                    module.setMetatable(mt);
+                }
+                mt.rawset("__index", globals);
+            }
+            return LuaNil.INSTANCE;
+        });
+        pkg.rawset("seeall", seeall);
+
+        // `module(name, ...)` (Lua 5.1 §5.3): creates (or reuses package.loaded[name] as) the
+        // module table, stamps _M/_NAME/_PACKAGE onto it, registers it as both package.loaded[name]
+        // and a global, then rebinds the *calling* function's environment to the module table so
+        // subsequent unqualified global writes in that chunk land in the module table instead of
+        // _G. Extra arguments are "option" functions (e.g. package.seeall) invoked with the module
+        // table as their sole argument.
         globals.rawset("module", wrap(language, "module", (frame, callNode) -> {
             String name = checkString("module", 1, arg(frame, 1));
             Object existing = loaded.rawget(name);
@@ -77,8 +99,41 @@ final class LuaPackageLib {
             module.rawset("_PACKAGE", lastDot >= 0 ? name.substring(0, lastDot + 1) : "");
             loaded.rawset(name, module);
             globals.rawset(name, module);
+
+            rebindCallerEnvironment(module);
+
+            Object[] extraArgs = allArgs(frame);
+            for (int i = 1; i < extraArgs.length; i++) {
+                LuaCallSupport.call(null, callNode, extraArgs[i], new Object[] {module});
+            }
             return LuaNil.INSTANCE;
         }));
+    }
+
+    /**
+     * Walks the Truffle call stack outward from {@code module()}'s own frame to find the nearest
+     * enclosing {@link LuaFunction} (the chunk or function that called {@code module(...)}) and
+     * rebinds its environment table to {@code newEnv}. Per the calling convention shared by every
+     * Lua call target ({@code frame.getArguments()[0]} is always the {@link LuaFunction} closure
+     * currently executing &mdash; see {@code LuaRootNode}), {@link Truffle#iterateFrames} on this
+     * runtime configuration includes the currently-executing frame first (i.e. {@code module()}'s
+     * own builtin frame), so the caller we want is the *second* frame carrying a {@link
+     * LuaFunction} at argument 0 &mdash; the first one visited is skipped.
+     */
+    private static void rebindCallerEnvironment(LuaTable newEnv) {
+        boolean[] skippedSelf = {false};
+        Truffle.getRuntime().iterateFrames(frameInstance -> {
+            Object[] args = frameInstance.getFrame(FrameInstance.FrameAccess.READ_ONLY).getArguments();
+            if (args.length == 0 || !(args[0] instanceof LuaFunction callerFn)) {
+                return null;
+            }
+            if (!skippedSelf[0]) {
+                skippedSelf[0] = true;
+                return null;
+            }
+            callerFn.setEnvironment(newEnv);
+            return callerFn;
+        });
     }
 
     /**

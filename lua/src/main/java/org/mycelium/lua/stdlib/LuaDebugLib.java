@@ -7,6 +7,7 @@ import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.SourceSection;
 import java.util.ArrayList;
 import java.util.List;
 import org.mycelium.lua.LuaContext;
@@ -26,11 +27,12 @@ import static org.mycelium.lua.stdlib.LuaLibUtil.optNumber;
 /**
  * Lua 5.1 &sect;5.9: the {@code debug} library.
  *
- * <p>This tree-walk interpreter does not track Lua source positions on individual {@link
- * RootNode}s (no {@code SourceSection}s are attached during parsing), so several of the
- * introspection facilities this library is nominally supposed to expose &mdash; current line
- * numbers, precise upvalue/local names, per-function source ranges &mdash; are not available. The
- * functions below are implemented on a best-effort basis: they never throw for missing
+ * <p>The parser attaches a {@link SourceSection} to every compiled function's {@link RootNode}
+ * (spanning its {@code function}/name through the matching {@code end}, or the whole chunk for a
+ * top-level compile), which is what {@code source}/{@code short_src}/{@code linedefined} below are
+ * read from. Some introspection facilities are still not available in this tree-walk interpreter
+ * &mdash; per-statement {@code currentline} while a call is in progress, precise upvalue/local
+ * names &mdash; and those are implemented on a best-effort basis: they never throw for missing
  * information, returning {@code nil} (or a placeholder) instead, exactly as real Lua programs
  * expect when probing optional debug info.
  */
@@ -113,21 +115,31 @@ final class LuaDebugLib {
             boolean isBuiltin = root instanceof LuaBuiltinRootNode;
             LuaTable info = new LuaTable();
 
+            SourceSection rootSection = root != null ? root.getSourceSection() : null;
             if (what.indexOf('S') >= 0) {
                 if (isBuiltin) {
                     info.rawset("source", "=[C]");
                     info.rawset("short_src", "[C]");
                     info.rawset("what", "C");
+                    info.rawset("linedefined", -1.0);
+                    info.rawset("lastlinedefined", -1.0);
+                } else if (rootSection != null) {
+                    String srcName = rootSection.getSource().getName();
+                    info.rawset("source", "@" + srcName);
+                    info.rawset("short_src", srcName);
+                    info.rawset("what", "Lua");
+                    info.rawset("linedefined", (double) rootSection.getStartLine());
+                    info.rawset("lastlinedefined", (double) rootSection.getEndLine());
                 } else {
                     info.rawset("source", "=?");
                     info.rawset("short_src", "?");
                     info.rawset("what", "Lua");
+                    info.rawset("linedefined", -1.0);
+                    info.rawset("lastlinedefined", -1.0);
                 }
-                info.rawset("linedefined", -1.0);
-                info.rawset("lastlinedefined", -1.0);
             }
             if (what.indexOf('l') >= 0) {
-                info.rawset("currentline", -1.0);
+                info.rawset("currentline", rootSection != null ? (double) rootSection.getStartLine() : -1.0);
             }
             if (what.indexOf('n') >= 0) {
                 String name = root != null ? root.getName() : null;
@@ -219,7 +231,7 @@ final class LuaDebugLib {
         List<RootNode> frames = new ArrayList<>();
         Truffle.getRuntime().iterateFrames(frameInstance -> {
             CallTarget ct = frameInstance.getCallTarget();
-            if (ct instanceof RootCallTarget rct) {
+            if (ct instanceof RootCallTarget rct && !rct.getRootNode().isInternal()) {
                 frames.add(rct.getRootNode());
             }
             return null;
@@ -232,7 +244,10 @@ final class LuaDebugLib {
     private static List<FrameInstance> collectFrameInstances() {
         List<FrameInstance> frames = new ArrayList<>();
         Truffle.getRuntime().iterateFrames(frameInstance -> {
-            frames.add(frameInstance);
+            CallTarget ct = frameInstance.getCallTarget();
+            if (!(ct instanceof RootCallTarget rct) || !rct.getRootNode().isInternal()) {
+                frames.add(frameInstance);
+            }
             return null;
         });
         return frames;
@@ -243,10 +258,12 @@ final class LuaDebugLib {
             String name = root.getName();
             return "[C]: in function '" + (name == null ? "?" : name) + "'";
         }
+        SourceSection section = root.getSourceSection();
+        String location = section != null ? section.getSource().getName() + ":" + section.getStartLine() : "?";
         String name = root.getName();
         if (name == null || name.isEmpty()) {
-            return "?: in function <?>";
+            return location + ": in function <" + location + ">";
         }
-        return "?: in function '" + name + "'";
+        return location + ": in function '" + name + "'";
     }
 }

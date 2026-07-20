@@ -1747,6 +1747,62 @@ class LuaAcidTest {
         }
     }
 
+    @Test
+    void moduleCreatesModuleTable() throws Exception {
+        Path dir = Files.createTempDirectory("lua-module");
+        try {
+            Files.writeString(dir.resolve("mymod.lua"), """
+                    module("mymod")
+                    function greet() return "hello" end
+                    """);
+            String dirPath = dir.toAbsolutePath().toString();
+            eval(String.format("""
+                    package.path = "%s/?.lua;" .. package.path
+                    local m = require("mymod")
+                    assert(type(m) == "table")
+                    assert(m.greet() == "hello")
+                    assert(m._NAME == "mymod")
+                    assert(m._M == m)
+                    assert(mymod == m)
+                    assert(rawget(_G, "greet") == nil)
+                    """, dirPath));
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void moduleSeeall() throws Exception {
+        Path dir = Files.createTempDirectory("lua-module-seeall");
+        try {
+            Files.writeString(dir.resolve("mymod.lua"), """
+                    module("mymod", package.seeall)
+                    function foo() return type(print) end
+                    """);
+            String dirPath = dir.toAbsolutePath().toString();
+            eval(String.format("""
+                    package.path = "%s/?.lua;" .. package.path
+                    local m = require("mymod")
+                    assert(m.foo() == "function")
+                    """, dirPath));
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void setfenvGetfenv() {
+        eval("""
+                local env = {}
+                setmetatable(env, {__index = _G})
+                local f = function() x = 42 end
+                setfenv(f, env)
+                f()
+                assert(env.x == 42)
+                assert(getfenv(f) == env)
+                """);
+    }
+
     private static void deleteRecursively(Path dir) throws IOException {
         if (!Files.exists(dir)) {
             return;
@@ -1838,6 +1894,46 @@ class LuaAcidTest {
                 assert(debug.setlocal(1, 1, "x") == nil)
                 assert(debug.sethook() == nil)
                 assert(debug.gethook() == nil)
+                """);
+    }
+
+    @Test
+    void debugTracebackShowsLineNumbers() {
+        Value result = eval("""
+                local function inner()
+                    return debug.traceback()
+                end
+                local function outer()
+                    return inner()
+                end
+                return outer()
+                """);
+        String tb = result.asString();
+        // Should contain file:line info for each Lua frame, not just "?".
+        assertTrue(tb.contains(":"), "traceback should contain file:line info, got: " + tb);
+        assertFalse(tb.contains("?:"), "traceback should not fall back to '?:', got: " + tb);
+    }
+
+    @Test
+    void debugGetinfoHasSourceInfo() {
+        eval("""
+                local function foo() end
+                local info = debug.getinfo(foo, "S")
+                assert(info.source ~= nil and info.source ~= "=?", "source should be set")
+                assert(info.what == "Lua")
+                assert(info.linedefined ~= nil and info.linedefined >= 1, "linedefined should be set")
+                """);
+    }
+
+    @Test
+    void errorMessagesIncludeLocation() {
+        eval("""
+                local ok, err = pcall(function()
+                    local x = nil
+                    x()  -- attempt to call a nil value
+                end)
+                assert(not ok)
+                assert(err:find(":"), "error should include source location: " .. tostring(err))
                 """);
     }
 }

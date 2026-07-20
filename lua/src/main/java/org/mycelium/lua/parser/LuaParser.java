@@ -6,6 +6,7 @@ import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameSlotKind;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.api.source.SourceSection;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -13,6 +14,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.mycelium.lua.parser.LuaToken.TokenType;
 import org.mycelium.lua.nodes.LuaAddNode;
@@ -91,9 +93,15 @@ public final class LuaParser {
     private static final Object[] NO_VALUES = new Object[0];
 
     private final TruffleLanguage<?> language;
+    private final Source source;
     private final String sourceName;
     private final LuaLexer lexer;
     private final List<LuaToken> lookahead = new ArrayList<>();
+
+    /** The most recently consumed token (see {@link #advance()}); together with a construct's
+     * starting token, delimits the character range used to build that construct's
+     * {@link SourceSection} (see {@link #sectionFrom(LuaToken)}). */
+    private LuaToken lastConsumed;
 
     private FunctionScope currentFunction;
 
@@ -103,12 +111,14 @@ public final class LuaParser {
 
     public LuaParser(TruffleLanguage<?> language, Source source) {
         this.language = language;
+        this.source = source;
         this.sourceName = source.getName();
         this.lexer = new LuaLexer(source.getCharacters().toString(), sourceName);
     }
 
     /** Parses the whole source as a Lua "chunk" (Lua 5.1 &sect;8), returning the compiled main-chunk root node. */
     public LuaRootNode parse() {
+        LuaToken startTok = peek();
         currentFunction = new FunctionScope(null);
         currentFunction.vararg = true;
         currentFunction.pushBlock();
@@ -121,7 +131,32 @@ public final class LuaParser {
         LuaStatementNode prologue = new ArgumentPrologueNode(new int[0], true);
         LuaStatementNode fullBody = new LuaBlockNode(new LuaStatementNode[] {prologue, block});
         FrameDescriptor frameDescriptor = currentFunction.frameBuilder.build();
-        return new LuaRootNode(language, frameDescriptor, fullBody);
+        LuaRootNode root = new LuaRootNode(language, frameDescriptor, fullBody, sourceName);
+        root.setSourceSection(sectionFrom(startTok));
+        return root;
+    }
+
+    // ------------------------------------------------------------------
+    // Source position tracking
+    // ------------------------------------------------------------------
+
+    /** Builds a {@link SourceSection} spanning from {@code start} (inclusive) through the most
+     * recently consumed token (inclusive), i.e. everything the parser looked at while producing
+     * whatever construct {@code start} was the first token of. */
+    private SourceSection sectionFrom(LuaToken start) {
+        int startOffset = start.startOffset;
+        LuaToken end = lastConsumed != null ? lastConsumed : start;
+        int endOffset = Math.max(end.startOffset + end.length, startOffset);
+        return source.createSection(startOffset, endOffset - startOffset);
+    }
+
+    /** Parses one statement via {@code parser} and attaches a {@link SourceSection} spanning the
+     * tokens consumed while parsing it. */
+    private LuaStatementNode withSection(Supplier<LuaStatementNode> parser) {
+        LuaToken startTok = peek();
+        LuaStatementNode node = parser.get();
+        node.setSourceSection(sectionFrom(startTok));
+        return node;
     }
 
     // ------------------------------------------------------------------
@@ -236,6 +271,7 @@ public final class LuaParser {
     private LuaToken advance() {
         LuaToken t = peek(0);
         lookahead.remove(0);
+        lastConsumed = t;
         return t;
     }
 
@@ -302,11 +338,11 @@ public final class LuaParser {
                 continue;
             }
             if (check(TokenType.RETURN) || check(TokenType.BREAK)) {
-                statements.add(parseLastStat());
+                statements.add(withSection(this::parseLastStat));
                 match(TokenType.SEMICOLON);
                 break;
             }
-            statements.add(parseStatement());
+            statements.add(withSection(this::parseStatement));
         }
         return new LuaBlockNode(statements.toArray(new LuaStatementNode[0]));
     }
@@ -487,7 +523,7 @@ public final class LuaParser {
      * to an assignment: {@code function t.a.b:m() end} becomes {@code t.a.b.m = function(self) end}.
      */
     private LuaStatementNode parseFunctionStat() {
-        expect(TokenType.FUNCTION);
+        LuaToken funcTok = expect(TokenType.FUNCTION);
         LuaToken nameTok = expect(TokenType.NAME, "<name>");
         List<String> path = new ArrayList<>();
         boolean isMethod = false;
@@ -500,7 +536,8 @@ public final class LuaParser {
             isMethod = true;
         }
 
-        LuaExpressionNode funcExpr = parseFuncBody(isMethod);
+        String funcName = functionName(nameTok.value, path, isMethod);
+        LuaExpressionNode funcExpr = parseFuncBody(isMethod, funcName, funcTok);
 
         LuaAssignmentTarget target;
         if (path.isEmpty()) {
@@ -516,12 +553,27 @@ public final class LuaParser {
         return new LuaAssignmentNode(new LuaAssignmentTarget[] {target}, new LuaExpressionNode[] {funcExpr});
     }
 
+    /** Builds the display name used for {@code debug.traceback}/{@code debug.getinfo} from a
+     * {@code funcname}'s parts (Lua 5.1 &sect;8: {@code funcname ::= Name {'.' Name} [':' Name]}). */
+    private static String functionName(String base, List<String> path, boolean isMethod) {
+        if (path.isEmpty()) {
+            return base;
+        }
+        StringBuilder sb = new StringBuilder(base);
+        for (int i = 0; i < path.size(); i++) {
+            boolean last = i == path.size() - 1;
+            sb.append(last && isMethod ? ':' : '.').append(path.get(i));
+        }
+        return sb.toString();
+    }
+
     /** {@code local function Name funcbody}. The name is declared as a local *before* the body is
      * parsed so the function can call itself recursively via an upvalue/local reference. */
     private LuaStatementNode parseLocalFunction() {
+        LuaToken startTok = lastConsumed; // the already-consumed 'function' keyword
         LuaToken nameTok = expect(TokenType.NAME, "<name>");
         int slot = currentFunction.declareLocal(nameTok.value);
-        LuaExpressionNode funcExpr = parseFuncBody(false);
+        LuaExpressionNode funcExpr = parseFuncBody(false, nameTok.value, startTok);
         LuaAssignmentTarget target = new LuaLocalTarget(slot);
         return new LuaAssignmentNode(new LuaAssignmentTarget[] {target}, new LuaExpressionNode[] {funcExpr});
     }
@@ -741,9 +793,10 @@ public final class LuaParser {
                 }
                 return new LuaVarargNode();
             }
-            case FUNCTION:
-                advance();
-                return parseFuncBody(false);
+            case FUNCTION: {
+                LuaToken funcTok = advance();
+                return parseFuncBody(false, null, funcTok);
+            }
             case LBRACE:
                 return parseTableConstructor();
             case NAME:
@@ -851,8 +904,11 @@ public final class LuaParser {
      * {@code parlist ::= namelist [',' '...'] | '...'}. Compiles the body into its own
      * {@link LuaRootNode}/{@link CallTarget}, wrapped in a {@link LuaFunctionDefNode} that captures
      * the defining frame at runtime. When {@code isMethod} is set (i.e. this is a {@code function
-     * t:m() ... end} declaration), an implicit leading {@code self} parameter is added. */
-    private LuaExpressionNode parseFuncBody(boolean isMethod) {
+     * t:m() ... end} declaration), an implicit leading {@code self} parameter is added.
+     * {@code name} (nullable, for anonymous functions) and {@code startTok} (the earliest token of
+     * this function's definition) are used only for the compiled body's {@link LuaRootNode} debug
+     * info ({@link LuaRootNode#getName()}/{@link LuaRootNode#getSourceSection()}). */
+    private LuaExpressionNode parseFuncBody(boolean isMethod, String name, LuaToken startTok) {
         expect(TokenType.LPAREN);
 
         FunctionScope parentFn = currentFunction;
@@ -897,7 +953,8 @@ public final class LuaParser {
         LuaStatementNode prologue = new ArgumentPrologueNode(slots, isVararg);
         LuaStatementNode fullBody = new LuaBlockNode(new LuaStatementNode[] {prologue, block});
         FrameDescriptor frameDescriptor = fn.frameBuilder.build();
-        LuaRootNode rootNode = new LuaRootNode(language, frameDescriptor, fullBody);
+        LuaRootNode rootNode = new LuaRootNode(language, frameDescriptor, fullBody, name);
+        rootNode.setSourceSection(sectionFrom(startTok));
         CallTarget callTarget = rootNode.getCallTarget();
         int numUpvalues = fn.numUpvalues;
 

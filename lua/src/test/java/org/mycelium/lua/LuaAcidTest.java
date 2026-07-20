@@ -842,6 +842,21 @@ class LuaAcidTest {
     }
 
     @Test
+    void stringPatternClassesAreAsciiOnly() {
+        // PUC-Rio Lua 5.1's %a/%l/%u/%d/%w/%s/%p/%c character classes use C-locale ctype.h
+        // functions, which only ever consider bytes 0-127 — a non-ASCII letter like "é" must not
+        // match %a, unlike Java's Unicode-aware Character.isLetter.
+        eval("""
+                assert(string.match("A", "%a") == "A")
+                assert(string.match("é", "%a") == nil)
+                assert(string.match("5", "%d") == "5")
+                assert(string.match("é", "%d") == nil)
+                assert(string.match("a", "%w") == "a")
+                assert(string.match("é", "%w") == nil)
+                """);
+    }
+
+    @Test
     void stringGmatchIteration() {
         eval("""
                 local words = {}
@@ -1762,6 +1777,19 @@ class LuaAcidTest {
                 """);
     }
 
+    @Test
+    void osSetlocaleCOrPosixSucceedsOthersFail() {
+        // Java/Truffle can't actually switch the C locale, so only "C"/"POSIX" (and "", which
+        // means "system default" and is always "C" here) are ever accepted — see Lua 5.1 §5.8.
+        eval("""
+                assert(os.setlocale(nil) == "C")
+                assert(os.setlocale("C") == "C")
+                assert(os.setlocale("POSIX") == "C")
+                assert(os.setlocale("") == "C")
+                assert(os.setlocale("fr_FR") == nil)
+                """);
+    }
+
     // ---------------------------------------------------------------------
     // 21. require / package (§5.3)
     // ---------------------------------------------------------------------
@@ -1839,6 +1867,18 @@ class LuaAcidTest {
                     """, path));
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void dofileWithNoArgumentReadsStdin() {
+        // Lua 5.1 §5.1: dofile() with no argument executes the contents of standard input.
+        try (Context stdinContext = Context.newBuilder("lua")
+                .allowCreateThread(true)
+                .in(new java.io.ByteArrayInputStream("return 7 + 8".getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                .build()) {
+            Value result = stdinContext.eval("lua", "return dofile()");
+            assertEquals(15, result.asInt());
         }
     }
 

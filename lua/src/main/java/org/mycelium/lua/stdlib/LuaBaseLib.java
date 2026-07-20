@@ -293,20 +293,39 @@ final class LuaBaseLib {
 
         globals.rawset("dofile", wrap(language, "dofile", (frame, callNode) -> {
             Object filenameArg = arg(frame, 1);
-            if (isNil(filenameArg)) {
-                // Lua 5.1 §5.1: with no argument, dofile executes stdin. Not implemented — no
-                // existing caller in this codebase feeds an interactive/stdin chunk this way yet.
-                throw LuaException.runtimeError(null, "dofile from stdin not yet implemented");
-            }
-            String filename = checkString("dofile", 1, filenameArg);
             String code;
-            try {
-                code = java.nio.file.Files.readString(
-                        java.nio.file.Path.of(filename), java.nio.charset.StandardCharsets.ISO_8859_1);
-            } catch (java.io.IOException e) {
-                throw LuaException.runtimeError(null, "cannot open " + filename + ": " + e.getMessage());
+            String chunkname;
+            if (isNil(filenameArg)) {
+                // Lua 5.1 §5.1: with no argument, dofile executes the contents of stdin.
+                LuaContext context = LuaLanguage.getContext(callNode);
+                java.io.InputStream in = context.getEnv().in();
+                if (in == null) {
+                    throw LuaException.runtimeError(null, "cannot open stdin");
+                }
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.ISO_8859_1))) {
+                    StringBuilder sb = new StringBuilder();
+                    char[] buf = new char[4096];
+                    int n;
+                    while ((n = reader.read(buf)) != -1) {
+                        sb.append(buf, 0, n);
+                    }
+                    code = sb.toString();
+                } catch (java.io.IOException e) {
+                    throw LuaException.runtimeError(null, "cannot read stdin: " + e.getMessage());
+                }
+                chunkname = "=stdin";
+            } else {
+                String filename = checkString("dofile", 1, filenameArg);
+                try {
+                    code = java.nio.file.Files.readString(
+                            java.nio.file.Path.of(filename), java.nio.charset.StandardCharsets.ISO_8859_1);
+                } catch (java.io.IOException e) {
+                    throw LuaException.runtimeError(null, "cannot open " + filename + ": " + e.getMessage());
+                }
+                chunkname = filename;
             }
-            Object[] chunkResult = loadChunk(language, callNode, code, filename);
+            Object[] chunkResult = loadChunk(language, callNode, code, chunkname);
             Object chunkOrError = chunkResult[0];
             if (isNil(chunkOrError)) {
                 throw LuaException.runtimeError(null, String.valueOf(chunkResult[1]));

@@ -97,16 +97,40 @@ final class LuaPattern {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
     }
 
+    private static boolean isAsciiUpper(char c) {
+        return c >= 'A' && c <= 'Z';
+    }
+
+    private static boolean isAsciiLower(char c) {
+        return c >= 'a' && c <= 'z';
+    }
+
+    private static boolean isAsciiAlpha(char c) {
+        return isAsciiUpper(c) || isAsciiLower(c);
+    }
+
+    private static boolean isAsciiDigit(char c) {
+        return c >= '0' && c <= '9';
+    }
+
+    private static boolean isAsciiSpace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '';
+    }
+
+    private static boolean isAsciiControl(char c) {
+        return (c >= 0 && c <= 0x1F) || c == 0x7F;
+    }
+
     private static boolean matchClass(char c, char cl) {
         boolean res;
         switch (Character.toLowerCase(cl)) {
-            case 'a': res = Character.isLetter(c); break;
-            case 'd': res = Character.isDigit(c); break;
-            case 'l': res = Character.isLowerCase(c); break;
-            case 's': res = Character.isWhitespace(c); break;
-            case 'u': res = Character.isUpperCase(c); break;
-            case 'w': res = Character.isLetterOrDigit(c); break;
-            case 'c': res = Character.isISOControl(c); break;
+            case 'a': res = isAsciiAlpha(c); break;
+            case 'd': res = isAsciiDigit(c); break;
+            case 'l': res = isAsciiLower(c); break;
+            case 's': res = isAsciiSpace(c); break;
+            case 'u': res = isAsciiUpper(c); break;
+            case 'w': res = isAsciiAlpha(c) || isAsciiDigit(c); break;
+            case 'c': res = isAsciiControl(c); break;
             case 'p': res = isPunct(c); break;
             case 'x': res = isHexDigit(c); break;
             default: return cl == c;
@@ -350,7 +374,7 @@ final class LuaPattern {
                                 }
                                 return -1;
                             }
-                            if (Character.isDigit(nx)) {
+                            if (isAsciiDigit(nx)) {
                                 int s2 = matchCapture(ms, s, nx - '0');
                                 if (s2 == -1) {
                                     return -1;

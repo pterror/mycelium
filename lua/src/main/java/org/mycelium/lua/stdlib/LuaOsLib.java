@@ -189,10 +189,19 @@ final class LuaOsLib {
             }
         }));
 
-        os.rawset("setlocale", wrap(language, "setlocale", (frame, cn) ->
-                // Full C-locale support (numeric formatting, collation, etc.) is out of scope;
-                // this always reports (and only ever knows) the "C" locale.
-                "C"));
+        os.rawset("setlocale", wrap(language, "setlocale", (frame, cn) -> {
+            // Full C-locale support (numeric formatting, collation, etc.) is out of scope; the
+            // only locale we ever recognize is "C" (and "POSIX", its synonym) — see Lua 5.1 §5.8.
+            Object localeArg = arg(frame, 1);
+            if (isNil(localeArg)) {
+                return "C";
+            }
+            String locale = checkString("setlocale", 1, localeArg);
+            if (locale.isEmpty() || locale.equals("C") || locale.equals("POSIX")) {
+                return "C";
+            }
+            return LuaNil.INSTANCE;
+        }));
     }
 
     // -------------------------------------------------------------------

@@ -13,7 +13,6 @@ import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -84,23 +83,6 @@ class LuaLibraryAcidTest {
     // ---------------------------------------------------------------------
 
     @Test
-    @Disabled(
-            "BUG: comparing two Lua numbers with `<`/`<=` throws \"attempt to compare two number"
-                    + " values\" instead of comparing them whenever one operand is a table key/index"
-                    + " produced internally as a boxed java.lang.Long (e.g. from pairs()/ipairs()"
-                    + " iteration or rawlen()) and the other is a java.lang.Double (e.g. a numeric"
-                    + " source literal like `1`). Minimal repro: `local t = {1,2,3}; for k in pairs(t)"
-                    + " do local ok = pcall(function() return k < 2 end); assert(ok) end` fails today."
-                    + " Root cause: LuaNodeUtil.lessThan/lessEqual (org.mycelium.lua.nodes.LuaNodeUtil,"
-                    + " ~line 286/304) only special-case `a instanceof Double && b instanceof Double`;"
-                    + " when one side is a Long they fall through past that check and the string check,"
-                    + " find no __lt/__le metamethod, and throw compareError — even though both operands"
-                    + " are ordinary Lua numbers. inspect.lua trips this inside its own getKeys()/"
-                    + " isSequenceKey() (inspect.lua lines 138-143: `1 <= (k) and k <= sequenceLength`,"
-                    + " where `k` comes from `for k in rawpairs(t)`), so inspecting even a plain"
-                    + " sequence table like {1,2,3} fails. Needs lessThan/lessEqual (and likely"
-                    + " LuaTableLib.defaultLess, which has the exact same Double-only special case) to"
-                    + " widen to any two boxed-numeric operands (Long or Double), not just Double/Double.")
     void inspectPrettyPrintsTablesAndPrimitives() {
         runLibraryTest("inspect.lua", """
                 assert(type(_lib) == "table" or type(_lib) == "function")
@@ -177,19 +159,6 @@ class LuaLibraryAcidTest {
     // ---------------------------------------------------------------------
 
     @Test
-    @Disabled(
-            "BUG: string.format('%g'/'%G', n) (and by extension '%.14g', which json.lua's"
-                    + " encode_number uses for every numeric value) never strips trailing zeros, unlike"
-                    + " C's printf (which real Lua's string.format wraps) — so"
-                    + " string.format('%.14g', 1.0) yields \"1.0000000000000\" instead of \"1\", and"
-                    + " json.encode({1,2,3}) yields \"[1.0000000000000,2.0000000000000,3.0000000000000]\""
-                    + " instead of \"[1,2,3]\". Root cause: LuaStringFormat's 'g'/'G' cases"
-                    + " (org.mycelium.lua.stdlib.LuaStringFormat, ~line 92-97) delegate straight to"
-                    + " Java's String.format(\"%g\", ...), and Java's %g conversion — unlike C's — has"
-                    + " no \"remove insignificant trailing zeros\" behavior at all (a long-documented"
-                    + " Java quirk). Needs a real C-style %g implementation (format as %e or %f"
-                    + " depending on the exponent per C99 rules, then strip trailing zeros/the decimal"
-                    + " point when there's no '#' flag) rather than delegating to Java's %g.")
     void jsonEncodesAndDecodesRoundTrip() {
         runLibraryTest("json.lua", """
                 local json = _lib

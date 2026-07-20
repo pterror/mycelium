@@ -114,17 +114,32 @@ public final class LuaTypeUtils {
         return value.toString();
     }
 
-    // Lua 5.1's default number formatting uses "%.14g".
+    // Lua 5.1's default number formatting uses "%.14g", which (like C's printf) strips trailing
+    // zeros after the decimal point -- and the point itself if no digits remain -- unlike Java's
+    // String.format, which always pads the mantissa to the requested precision.
     private static String formatFloat(double d) {
         String s = String.format("%.14g", d);
-        // Trim trailing zeros in the fractional part (but keep at least one digit after '.').
-        if (s.contains(".") && !s.contains("e") && !s.contains("E")) {
-            s = s.replaceAll("0+$", "");
-            if (s.endsWith(".")) {
-                s = s + "0";
+        int ePos = -1;
+        for (int idx = 0; idx < s.length(); idx++) {
+            char ch = s.charAt(idx);
+            if (ch == 'e' || ch == 'E') {
+                ePos = idx;
+                break;
             }
         }
-        return s;
+        String mantissa = ePos >= 0 ? s.substring(0, ePos) : s;
+        String exponent = ePos >= 0 ? s.substring(ePos) : "";
+        if (mantissa.indexOf('.') >= 0) {
+            int end = mantissa.length();
+            while (end > 0 && mantissa.charAt(end - 1) == '0') {
+                end--;
+            }
+            if (end > 0 && mantissa.charAt(end - 1) == '.') {
+                end--;
+            }
+            mantissa = mantissa.substring(0, end);
+        }
+        return mantissa + exponent;
     }
 
     /** Lua 5.1 &sect;2.2: only {@code nil} and {@code false} are falsy; everything else, including {@code 0} and {@code ""}, is truthy. */

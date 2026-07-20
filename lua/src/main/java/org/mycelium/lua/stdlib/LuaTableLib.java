@@ -137,9 +137,20 @@ final class LuaTableLib {
         return 0;
     }
 
+    /** Widens a {@link Double} or {@link Long} to {@code double}; {@link LuaTable} normalizes
+     * whole-number keys to {@code Long} internally, so table-sourced values can arrive here as
+     * either type even though Lua 5.1 itself only knows doubles. */
+    private static double toDouble(Object value) {
+        return value instanceof Long l ? l.doubleValue() : (Double) value;
+    }
+
+    private static boolean isNumber(Object value) {
+        return value instanceof Double || value instanceof Long;
+    }
+
     private static boolean defaultLess(Object a, Object b) {
-        if (a instanceof Double da && b instanceof Double db) {
-            return da < db;
+        if (isNumber(a) && isNumber(b)) {
+            return toDouble(a) < toDouble(b);
         }
         if (a instanceof String sa && b instanceof String sb) {
             return sa.compareTo(sb) < 0;

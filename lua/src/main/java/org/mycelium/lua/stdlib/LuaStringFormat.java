@@ -89,12 +89,22 @@ final class LuaStringFormat {
                 case 'E':
                     out.append(String.format("%" + spec + "E", toDouble(argVal)));
                     break;
-                case 'g':
-                    out.append(String.format("%" + spec + "g", toDouble(argVal)));
+                case 'g': {
+                    String r = String.format("%" + spec + "g", toDouble(argVal));
+                    if (spec.indexOf('#') < 0) {
+                        r = trimGTrailingZeros(r);
+                    }
+                    out.append(r);
                     break;
-                case 'G':
-                    out.append(String.format("%" + spec + "G", toDouble(argVal)));
+                }
+                case 'G': {
+                    String r = String.format("%" + spec + "G", toDouble(argVal));
+                    if (spec.indexOf('#') < 0) {
+                        r = trimGTrailingZeros(r);
+                    }
+                    out.append(r);
                     break;
+                }
                 case 's': {
                     String s = argVal == null ? "nil" : LuaTypeUtils.tostring(argVal);
                     out.append(String.format("%" + spec + "s", s));
@@ -160,6 +170,36 @@ final class LuaStringFormat {
         }
         sb.append('"');
         return sb.toString();
+    }
+
+    /**
+     * {@code %g}/{@code %G}: C's printf strips trailing zeros after the decimal point (and the
+     * decimal point itself, if no digits remain), unlike Java's {@link String#format} which
+     * always pads the mantissa to the requested precision. Applied to the mantissa only, so an
+     * exponent suffix ({@code e+02}, {@code E-05}, ...) is left untouched.
+     */
+    private static String trimGTrailingZeros(String s) {
+        int ePos = -1;
+        for (int idx = 0; idx < s.length(); idx++) {
+            char ch = s.charAt(idx);
+            if (ch == 'e' || ch == 'E') {
+                ePos = idx;
+                break;
+            }
+        }
+        String mantissa = ePos >= 0 ? s.substring(0, ePos) : s;
+        String exponent = ePos >= 0 ? s.substring(ePos) : "";
+        if (mantissa.indexOf('.') >= 0) {
+            int end = mantissa.length();
+            while (end > 0 && mantissa.charAt(end - 1) == '0') {
+                end--;
+            }
+            if (end > 0 && mantissa.charAt(end - 1) == '.') {
+                end--;
+            }
+            mantissa = mantissa.substring(0, end);
+        }
+        return mantissa + exponent;
     }
 
     private static LuaException error(String message) {

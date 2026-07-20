@@ -117,7 +117,7 @@ public class LuaTable implements TruffleObject {
     public Object[] next(Object key) {
         if (key == null || key == LuaNil.INSTANCE) {
             if (!arrayPart.isEmpty()) {
-                return new Object[] {1L, arrayPart.get(0)};
+                return new Object[] {1.0, arrayPart.get(0)};
             }
             return firstHashEntry();
         }
@@ -127,7 +127,7 @@ public class LuaTable implements TruffleObject {
             long idx = (Long) normalized;
             if (idx >= 1 && idx <= arrayPart.size()) {
                 if (idx < arrayPart.size()) {
-                    return new Object[] {idx + 1, arrayPart.get((int) idx)};
+                    return new Object[] {(double) (idx + 1), arrayPart.get((int) idx)};
                 }
                 // Last array element: continue into the hash part.
                 return firstHashEntry();
@@ -141,7 +141,7 @@ public class LuaTable implements TruffleObject {
             if (entry.getKey().equals(normalized)) {
                 if (it.hasNext()) {
                     Map.Entry<Object, Object> next = it.next();
-                    return new Object[] {next.getKey(), next.getValue()};
+                    return new Object[] {denormalizeKey(next.getKey()), next.getValue()};
                 }
                 return null;
             }
@@ -153,9 +153,20 @@ public class LuaTable implements TruffleObject {
         Iterator<Map.Entry<Object, Object>> it = hashPart.entrySet().iterator();
         if (it.hasNext()) {
             Map.Entry<Object, Object> entry = it.next();
-            return new Object[] {entry.getKey(), entry.getValue()};
+            return new Object[] {denormalizeKey(entry.getKey()), entry.getValue()};
         }
         return null;
+    }
+
+    /**
+     * Converts an internally-normalized key back to the form user code expects: Lua 5.1 has no
+     * integer subtype, so a hash-part key stored as {@link Long} (see {@link #normalizeForStore})
+     * must be surfaced as a {@link Double} to callers such as {@code next}/{@code pairs}, keeping
+     * every other consumer of table keys (comparisons, arithmetic, string formatting) unaware
+     * that {@code Long} is used at all internally.
+     */
+    private static Object denormalizeKey(Object key) {
+        return key instanceof Long l ? (double) l : key;
     }
 
     // ---------------------------------------------------------------------

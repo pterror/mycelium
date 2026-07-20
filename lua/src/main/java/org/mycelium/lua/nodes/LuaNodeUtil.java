@@ -252,8 +252,8 @@ final class LuaNodeUtil {
         if (isNil(av) != isNil(bv)) {
             return false;
         }
-        if (av instanceof Double da && bv instanceof Double db) {
-            return da.doubleValue() == db.doubleValue();
+        if (isNumber(av) && isNumber(bv)) {
+            return toDouble(av) == toDouble(bv);
         }
         if (av instanceof String sa && bv instanceof String sb) {
             return sa.equals(sb);
@@ -281,10 +281,25 @@ final class LuaNodeUtil {
         return av.equals(bv);
     }
 
+    /** Whether {@code value} is one of the numeric representations that can appear in this
+     * implementation: Lua source and arithmetic always produce {@link Double} (Lua 5.1 has no
+     * integer subtype), but {@link LuaTable} normalizes whole-number keys to {@link Long}
+     * internally for array-part indexing (see {@link LuaTable}'s class doc). {@link LuaTable#next}
+     * converts those back to {@code Double} before they reach user code, but comparisons stay
+     * defensive here in case a {@code Long} reaches this code by some other path. */
+    private static boolean isNumber(Object value) {
+        return value instanceof Double || value instanceof Long;
+    }
+
+    /** Widens a {@link Double} or {@link Long} to {@code double}; only call after {@link #isNumber}. */
+    private static double toDouble(Object value) {
+        return value instanceof Long l ? l.doubleValue() : (Double) value;
+    }
+
     /** Lua 5.1 &sect;2.5.2 {@code <}: numeric or lexicographic comparison, else {@code __lt}. */
     static boolean lessThan(Node location, Object a, Object b, IndirectCallNode callNode) {
-        if (a instanceof Double da && b instanceof Double db) {
-            return da < db;
+        if (isNumber(a) && isNumber(b)) {
+            return toDouble(a) < toDouble(b);
         }
         if (a instanceof String sa && b instanceof String sb) {
             return sa.compareTo(sb) < 0;
@@ -301,8 +316,8 @@ final class LuaNodeUtil {
 
     /** Lua 5.1 &sect;2.5.2 {@code <=}: numeric/lexicographic, else {@code __le}, else {@code not (b < a)}. */
     static boolean lessEqual(Node location, Object a, Object b, IndirectCallNode callNode) {
-        if (a instanceof Double da && b instanceof Double db) {
-            return da <= db;
+        if (isNumber(a) && isNumber(b)) {
+            return toDouble(a) <= toDouble(b);
         }
         if (a instanceof String sa && b instanceof String sb) {
             return sa.compareTo(sb) <= 0;

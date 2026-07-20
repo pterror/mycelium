@@ -1926,6 +1926,87 @@ class LuaAcidTest {
     }
 
     @Test
+    void debugSethookCallReturn() {
+        eval("""
+                local events = {}
+                debug.sethook(function(event)
+                    events[#events + 1] = event
+                end, "cr")
+
+                local function foo() end
+                foo()
+
+                debug.sethook()  -- remove hook
+
+                -- Should have recorded call and return events
+                local found_call, found_return = false, false
+                for _, e in ipairs(events) do
+                    if e == "call" then found_call = true end
+                    if e == "return" then found_return = true end
+                end
+                assert(found_call, "should have call events")
+                assert(found_return, "should have return events")
+                """);
+    }
+
+    @Test
+    void debugSethookLine() {
+        eval("""
+                local lines = {}
+                debug.sethook(function(event, line)
+                    if event == "line" then
+                        lines[#lines + 1] = line
+                    end
+                end, "l")
+
+                local x = 1
+                local y = 2
+                local z = 3
+
+                debug.sethook()
+
+                assert(#lines > 0, "should have recorded line events")
+                """);
+    }
+
+    @Test
+    void debugSethookCount() {
+        eval("""
+                local count = 0
+                debug.sethook(function()
+                    count = count + 1
+                end, "", 3)  -- fire every 3 instructions
+
+                local a = 1
+                local b = 2
+                local c = 3
+                local d = 4
+                local e = 5
+                local f = 6
+
+                debug.sethook()
+
+                assert(count >= 1, "should have fired at least once, got " .. count)
+                """);
+    }
+
+    @Test
+    void debugGethook() {
+        eval("""
+                local function myhook() end
+                debug.sethook(myhook, "cl", 5)
+                local hook, mask, count = debug.gethook()
+                assert(hook == myhook)
+                assert(mask == "cl")
+                assert(count == 5)
+
+                debug.sethook()
+                hook, mask, count = debug.gethook()
+                assert(hook == nil)
+                """);
+    }
+
+    @Test
     void errorMessagesIncludeLocation() {
         eval("""
                 local ok, err = pcall(function()

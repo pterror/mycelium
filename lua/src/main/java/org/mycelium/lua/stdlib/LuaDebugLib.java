@@ -195,11 +195,32 @@ final class LuaDebugLib {
         debug.rawset("setlocal", wrap(language, "setlocal", (frame, callNode) ->
                 LuaNil.INSTANCE));
 
-        debug.rawset("sethook", wrap(language, "sethook", (frame, callNode) ->
-                LuaNil.INSTANCE));
+        debug.rawset("sethook", wrap(language, "sethook", (frame, callNode) -> {
+            LuaContext context = LuaLanguage.getContext(callNode);
+            Object hookArg = arg(frame, 1);
+            if (isNil(hookArg)) {
+                // debug.sethook() with no arguments removes the current hook (Lua 5.1 §5.9).
+                context.clearHook();
+                return LuaNil.INSTANCE;
+            }
+            if (!(hookArg instanceof LuaFunction fn)) {
+                return LuaNil.INSTANCE;
+            }
+            Object maskArg = arg(frame, 2);
+            String mask = maskArg instanceof String s ? s : "";
+            int count = (int) optNumber(arg(frame, 3), 0);
+            context.setHook(fn, mask, count);
+            return LuaNil.INSTANCE;
+        }));
 
-        debug.rawset("gethook", wrap(language, "gethook", (frame, callNode) ->
-                LuaNil.INSTANCE));
+        debug.rawset("gethook", wrap(language, "gethook", (frame, callNode) -> {
+            LuaContext context = LuaLanguage.getContext(callNode);
+            LuaFunction hook = context.getHookFunction();
+            if (hook == null) {
+                return new Object[] {LuaNil.INSTANCE};
+            }
+            return new Object[] {hook, context.getHookMask(), (double) context.getHookCount()};
+        }));
 
         debug.rawset("getfenv", wrap(language, "getfenv", (frame, callNode) -> {
             Object o = arg(frame, 1);

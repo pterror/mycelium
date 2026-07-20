@@ -7,6 +7,7 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.Node.Child;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.SourceSection;
+import org.mycelium.lua.LuaContext;
 import org.mycelium.lua.nodes.controlflow.LuaReturnException;
 import org.mycelium.lua.runtime.LuaFunction;
 
@@ -77,12 +78,38 @@ public final class LuaRootNode extends RootNode {
 
     @Override
     public Object execute(VirtualFrame frame) {
+        LuaContext context = LuaContext.get(this);
+        // debug.sethook's "c"/"r" masks (Lua 5.1 §5.9): fired around every Lua function call,
+        // never re-entrantly from inside the hook function itself (see LuaContext#isInHook).
+        boolean fireHooks = context.isHookActive() && !context.isInHook();
+        if (fireHooks && context.getHookMask().indexOf('c') >= 0) {
+            callHook(context, "call");
+        }
         try {
             body.executeVoid(frame);
+            return NO_VALUES;
         } catch (LuaReturnException e) {
             return e.getValues();
+        } finally {
+            if (fireHooks && context.getHookMask().indexOf('r') >= 0) {
+                callHook(context, "return");
+            }
         }
-        return NO_VALUES;
+    }
+
+    /** Invokes the current thread's debug hook function with {@code event}, guarding against
+     * hook re-entrancy (a hook's own execution must not trigger further hook calls). */
+    private static void callHook(LuaContext context, String event) {
+        LuaFunction hook = context.getHookFunction();
+        if (hook == null) {
+            return;
+        }
+        context.setInHook(true);
+        try {
+            hook.getCallTarget().call(hook, event);
+        } finally {
+            context.setInHook(false);
+        }
     }
 
     /** Recovers the {@link LuaFunction} closure currently executing in {@code frame} (see class doc). */

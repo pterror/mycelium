@@ -31,6 +31,15 @@ import java.nio.charset.StandardCharsets;
  */
 public final class LuaIOFile {
 
+    /**
+     * Private sentinel key under which a file handle table (see {@code
+     * org.mycelium.lua.stdlib.LuaIoLib}) stores its {@link LuaIOFile}. Lives here (rather than in
+     * {@code LuaIoLib}) so that {@link LuaTypeUtils#typeName} &mdash; in this same package &mdash;
+     * can recognize a file-handle table and report it as {@code "userdata"} rather than {@code
+     * "table"}, matching real Lua 5.1 (&sect;5.7: file handles are userdata).
+     */
+    public static final Object FILE_KEY = new Object();
+
     private final RandomAccessFile raf;
     private final InputStream inputStream;
     private final OutputStream outputStream;

@@ -115,6 +115,8 @@ final class LuaBaseLib {
                 throw new LuaReturnException(out);
             } catch (LuaException e) {
                 throw new LuaReturnException(new Object[] {Boolean.FALSE, e.getErrorObject()});
+            } catch (StackOverflowError e) {
+                throw new LuaReturnException(new Object[] {Boolean.FALSE, "stack overflow"});
             }
         }));
 
@@ -129,6 +131,9 @@ final class LuaBaseLib {
                 throw new LuaReturnException(out);
             } catch (LuaException e) {
                 Object[] handlerResult = LuaCallSupport.call(null, callNode, handler, new Object[] {e.getErrorObject()});
+                throw new LuaReturnException(new Object[] {Boolean.FALSE, LuaCallSupport.first(handlerResult)});
+            } catch (StackOverflowError e) {
+                Object[] handlerResult = LuaCallSupport.call(null, callNode, handler, new Object[] {"stack overflow"});
                 throw new LuaReturnException(new Object[] {Boolean.FALSE, LuaCallSupport.first(handlerResult)});
             }
         }));
@@ -245,11 +250,32 @@ final class LuaBaseLib {
 
         globals.rawset("collectgarbage", wrap(language, "collectgarbage", (frame, callNode) -> 0.0));
 
-        globals.rawset("require", wrap(language, "require", (frame, callNode) -> {
-            throw LuaException.runtimeError(null, "require not yet implemented");
-        }));
+        // `require` and the `package` table (Lua 5.1 §5.3) are installed separately by
+        // LuaPackageLib.install, which needs the full LuaContext (not just globals) to resolve
+        // package.path relative to the working directory — see LuaStdLib#installPackage.
+
         globals.rawset("dofile", wrap(language, "dofile", (frame, callNode) -> {
-            throw LuaException.runtimeError(null, "dofile not yet implemented");
+            Object filenameArg = arg(frame, 1);
+            if (isNil(filenameArg)) {
+                // Lua 5.1 §5.1: with no argument, dofile executes stdin. Not implemented — no
+                // existing caller in this codebase feeds an interactive/stdin chunk this way yet.
+                throw LuaException.runtimeError(null, "dofile from stdin not yet implemented");
+            }
+            String filename = checkString("dofile", 1, filenameArg);
+            String code;
+            try {
+                code = java.nio.file.Files.readString(
+                        java.nio.file.Path.of(filename), java.nio.charset.StandardCharsets.ISO_8859_1);
+            } catch (java.io.IOException e) {
+                throw LuaException.runtimeError(null, "cannot open " + filename + ": " + e.getMessage());
+            }
+            Object[] chunkResult = loadChunk(language, callNode, code, filename);
+            Object chunkOrError = chunkResult[0];
+            if (isNil(chunkOrError)) {
+                throw LuaException.runtimeError(null, String.valueOf(chunkResult[1]));
+            }
+            Object[] results = LuaCallSupport.call(null, callNode, chunkOrError, new Object[0]);
+            throw new LuaReturnException(results);
         }));
         globals.rawset("load", wrap(language, "load", (frame, callNode) -> {
             Object func = arg(frame, 1);

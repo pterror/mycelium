@@ -27,7 +27,13 @@ public final class LuaTypeUtils {
         if (value instanceof String) {
             return "string";
         }
-        if (value instanceof LuaTable) {
+        if (value instanceof LuaTable table) {
+            // A file handle (io.open/io.stdout/...) is, under the hood, a LuaTable carrying its
+            // LuaIOFile state under a private sentinel key (see LuaIOFile#FILE_KEY) -- but Lua 5.1
+            // (sect.5.7) treats file handles as userdata, not table, so `type()` must agree.
+            if (table.rawget(LuaIOFile.FILE_KEY) instanceof LuaIOFile) {
+                return "userdata";
+            }
             return "table";
         }
         if (value instanceof LuaFunction) {

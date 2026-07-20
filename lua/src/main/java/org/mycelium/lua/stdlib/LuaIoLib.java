@@ -37,8 +37,9 @@ import static org.mycelium.lua.stdlib.LuaLibUtil.*;
  */
 final class LuaIoLib {
 
-    /** Private sentinel key under which a file handle table stores its {@link LuaIOFile}. */
-    private static final Object FILE_KEY = new Object();
+    /** Private sentinel key under which a file handle table stores its {@link LuaIOFile}; see
+     * {@link LuaIOFile#FILE_KEY} for why it lives on that class rather than here. */
+    private static final Object FILE_KEY = LuaIOFile.FILE_KEY;
 
     private LuaIoLib() {}
 

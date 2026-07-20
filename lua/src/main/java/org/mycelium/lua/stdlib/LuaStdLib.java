@@ -43,6 +43,11 @@ public final class LuaStdLib {
         LuaOsLib.install(language, globals);
     }
 
+    /** Lua 5.1 &sect;5.9: the {@code debug} table. */
+    public static void installDebug(TruffleLanguage<?> language, LuaTable globals) {
+        LuaDebugLib.install(language, globals);
+    }
+
     /** Lua 5.1 &sect;5.7: the {@code io} table (file handles, {@code io.open}/{@code io.read}/
      * {@code io.write}/..., and the predefined {@code io.stdin}/{@code io.stdout}/{@code
      * io.stderr} handles). Unlike the other {@code install*} methods, this one needs the owning
@@ -51,6 +56,13 @@ public final class LuaStdLib {
      * standard streams. */
     public static void installIo(TruffleLanguage<?> language, LuaContext context) {
         LuaIoLib.install(language, context);
+    }
+
+    /** Lua 5.1 &sect;5.3: {@code require}, the {@code package} table, and {@code module}. Like
+     * {@link #installIo}, this needs the full {@link LuaContext} (not just its globals table) so
+     * loaded chunks can be attributed to the right context. */
+    public static void installPackage(TruffleLanguage<?> language, LuaContext context) {
+        LuaPackageLib.install(language, context);
     }
 
     /** Installs every implemented library ({@code base}, {@code math}, {@code string}, {@code
@@ -62,6 +74,7 @@ public final class LuaStdLib {
         installTable(language, globals);
         installCoroutine(language, globals);
         installOs(language, globals);
+        installDebug(language, globals);
     }
 
     /** Installs every implemented library, including {@code io} (which needs the full {@link
@@ -71,5 +84,6 @@ public final class LuaStdLib {
     public static void installAll(TruffleLanguage<?> language, LuaContext context) {
         installAll(language, context.getGlobals());
         installIo(language, context);
+        installPackage(language, context);
     }
 }

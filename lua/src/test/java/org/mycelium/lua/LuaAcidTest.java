@@ -10,7 +10,6 @@ import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -1180,12 +1179,6 @@ class LuaAcidTest {
     }
 
     @Test
-    @Disabled(
-            "BUG: unbounded Lua recursion blows the host Java stack, which Truffle reports as a"
-                    + " resource-exhaustion PolyglotException that propagates straight past pcall's"
-                    + " try/catch (which only catches org.mycelium.lua.LuaException) instead of being"
-                    + " caught as an ordinary Lua error (real Lua 5.1 pcall(recurse) returns `false,"
-                    + " \"stack overflow\"`). See LuaBaseLib's pcall/xpcall implementations.")
     void deepRecursionErrorsRatherThanCrashing() {
         eval("""
                 local function recurse(n) return recurse(n + 1) end

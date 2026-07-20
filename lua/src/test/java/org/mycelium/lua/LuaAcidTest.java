@@ -2028,6 +2028,46 @@ class LuaAcidTest {
     }
 
     @Test
+    void debugGetinfoNamewhatEmptyForAnonymousFunction() {
+        eval("""
+                local info = debug.getinfo(function() end, "n")
+                assert(info.namewhat == "", "expected empty namewhat, got: " .. info.namewhat)
+                """);
+    }
+
+    @Test
+    void debugDebugExistsAndIsNoOp() {
+        eval("""
+                assert(type(debug.debug) == "function")
+                debug.debug()
+                """);
+    }
+
+    @Test
+    void collectgarbageCountReturnsPositiveNumber() {
+        eval("""
+                local kb = collectgarbage("count")
+                assert(type(kb) == "number")
+                assert(kb > 0, "expected count > 0, got: " .. tostring(kb))
+                """);
+    }
+
+    @Test
+    void collectgarbageCollectDoesNotError() {
+        eval("""
+                collectgarbage("collect")
+                collectgarbage()
+                """);
+    }
+
+    @Test
+    void collectgarbageIsrunningReturnsTrue() {
+        eval("""
+                assert(collectgarbage("isrunning") == true)
+                """);
+    }
+
+    @Test
     void debugGetinfoHasSourceInfo() {
         eval("""
                 local function foo() end
@@ -2116,6 +2156,77 @@ class LuaAcidTest {
                 debug.sethook()
                 hook, mask, count = debug.gethook()
                 assert(hook == nil)
+                """);
+    }
+
+    @Test
+    void debugGetlocal() {
+        eval("""
+                local function f()
+                    local x = 10
+                    local y = 20
+                    local name, val = debug.getlocal(1, 1)
+                    return name, val
+                end
+                local name, val = f()
+                assert(name == "x", "expected name 'x', got " .. tostring(name))
+                assert(val == 10, "expected value 10, got " .. tostring(val))
+                """);
+    }
+
+    @Test
+    void debugGetlocalOutOfRange() {
+        eval("""
+                local function f()
+                    local x = 10
+                    return debug.getlocal(1, 99)
+                end
+                assert(f() == nil)
+                """);
+    }
+
+    @Test
+    void debugSetlocal() {
+        eval("""
+                local function g()
+                    local x = 10
+                    debug.setlocal(1, 1, 42)
+                    return x
+                end
+                assert(g() == 42, "expected 42, got " .. tostring(g()))
+                """);
+    }
+
+    @Test
+    void debugGetupvalue() {
+        eval("""
+                local outer = 100
+                local function h() return outer end
+                local name, val = debug.getupvalue(h, 1)
+                assert(name ~= nil, "expected a non-nil upvalue name")
+                assert(val == 100, "expected value 100, got " .. tostring(val))
+                """);
+    }
+
+    @Test
+    void debugSetupvalue() {
+        eval("""
+                local outer = 100
+                local function h() return outer end
+                debug.setupvalue(h, 1, 200)
+                assert(h() == 200, "expected h() to return 200 after setupvalue")
+                """);
+    }
+
+    @Test
+    void debugGetinfoNups() {
+        eval("""
+                local outer = 100
+                local function closure()
+                    return outer
+                end
+                local info = debug.getinfo(closure, "u")
+                assert(info.nups > 0, "expected nups > 0, got " .. tostring(info.nups))
                 """);
     }
 

@@ -255,7 +255,37 @@ final class LuaBaseLib {
             return protectedMeta != null ? protectedMeta : mt;
         }));
 
-        globals.rawset("collectgarbage", wrap(language, "collectgarbage", (frame, callNode) -> 0.0));
+        // collectgarbage (Lua 5.1 §5.1): this runtime has no control over Java's garbage collector
+        // beyond a best-effort System.gc() hint, so most options are no-ops that return a plausible
+        // placeholder rather than throwing. "count" is the one option scripts commonly rely on for
+        // an actual value, so it reports real JVM heap usage (in KB, per the Lua spec) instead of 0.
+        globals.rawset("collectgarbage", wrap(language, "collectgarbage", (frame, callNode) -> {
+            String opt = optString(arg(frame, 1), "collect");
+            switch (opt) {
+                case "count" -> {
+                    double totalBytes = Runtime.getRuntime().totalMemory();
+                    double kb = totalBytes / 1024.0;
+                    double remainderBytes = totalBytes - (Math.floor(kb) * 1024.0);
+                    throw new LuaReturnException(new Object[] {kb, remainderBytes});
+                }
+                case "collect" -> {
+                    System.gc();
+                    return 0.0;
+                }
+                case "stop", "restart", "step" -> {
+                    return 0.0;
+                }
+                case "setpause", "setstepmul" -> {
+                    return 0.0;
+                }
+                case "isrunning" -> {
+                    return Boolean.TRUE;
+                }
+                default -> {
+                    return 0.0;
+                }
+            }
+        }));
 
         // `require` and the `package` table (Lua 5.1 §5.3) are installed separately by
         // LuaPackageLib.install, which needs the full LuaContext (not just globals) to resolve

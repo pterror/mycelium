@@ -5,13 +5,16 @@ import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameInstance;
+import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.SourceSection;
 import java.util.ArrayList;
 import java.util.List;
 import org.mycelium.lua.LuaContext;
 import org.mycelium.lua.LuaLanguage;
+import org.mycelium.lua.nodes.LuaRootNode;
 import org.mycelium.lua.nodes.controlflow.LuaReturnException;
 import org.mycelium.lua.runtime.LuaFunction;
 import org.mycelium.lua.runtime.LuaNil;
@@ -144,10 +147,19 @@ final class LuaDebugLib {
             if (what.indexOf('n') >= 0) {
                 String name = root != null ? root.getName() : null;
                 info.rawset("name", name == null ? LuaNil.INSTANCE : name);
-                info.rawset("namewhat", name == null ? "" : "global");
+                String namewhat = "";
+                if (name != null && fn != null) {
+                    LuaContext context = LuaLanguage.getContext(callNode);
+                    Object globalValue = context.getGlobals().rawget(name);
+                    if (globalValue == fn) {
+                        namewhat = "global";
+                    }
+                }
+                info.rawset("namewhat", namewhat);
             }
             if (what.indexOf('u') >= 0) {
-                info.rawset("nups", 0.0);
+                MaterializedFrame enclosing = fn == null ? null : fn.getEnclosingFrame();
+                info.rawset("nups", (double) countNamedSlots(enclosing));
             }
             if (what.indexOf('f') >= 0) {
                 info.rawset("func", fn == null ? LuaNil.INSTANCE : fn);
@@ -181,19 +193,104 @@ final class LuaDebugLib {
         }));
 
         debug.rawset("getupvalue", wrap(language, "getupvalue", (frame, callNode) -> {
-            // Upvalue names/slots aren't tracked separately from the enclosing frame in this
-            // interpreter; report "no such upvalue" uniformly.
-            throw new LuaReturnException(new Object[] {LuaNil.INSTANCE});
+            // Upvalues aren't tracked separately from the enclosing (closed-over) frame in this
+            // interpreter, so every named slot of that frame is exposed as an upvalue slot; see
+            // countNamedSlots/upvalueSlotName below.
+            Object target = arg(frame, 1);
+            if (!(target instanceof LuaFunction fn)) {
+                return LuaNil.INSTANCE;
+            }
+            MaterializedFrame enclosing = fn.getEnclosingFrame();
+            if (enclosing == null) {
+                return LuaNil.INSTANCE;
+            }
+            Double indexNum = LuaTypeUtils.toNumber(arg(frame, 2));
+            if (indexNum == null) {
+                return LuaNil.INSTANCE;
+            }
+            int slot = upvalueSlot(enclosing.getFrameDescriptor(), indexNum.intValue());
+            if (slot < 0) {
+                return LuaNil.INSTANCE;
+            }
+            String name = (String) enclosing.getFrameDescriptor().getSlotName(slot);
+            Object value = enclosing.getObject(slot);
+            return new Object[] {name, value == null ? LuaNil.INSTANCE : value};
         }));
 
-        debug.rawset("setupvalue", wrap(language, "setupvalue", (frame, callNode) ->
-                LuaNil.INSTANCE));
+        debug.rawset("setupvalue", wrap(language, "setupvalue", (frame, callNode) -> {
+            Object target = arg(frame, 1);
+            if (!(target instanceof LuaFunction fn)) {
+                return LuaNil.INSTANCE;
+            }
+            MaterializedFrame enclosing = fn.getEnclosingFrame();
+            if (enclosing == null) {
+                return LuaNil.INSTANCE;
+            }
+            Double indexNum = LuaTypeUtils.toNumber(arg(frame, 2));
+            if (indexNum == null) {
+                return LuaNil.INSTANCE;
+            }
+            int slot = upvalueSlot(enclosing.getFrameDescriptor(), indexNum.intValue());
+            if (slot < 0) {
+                return LuaNil.INSTANCE;
+            }
+            Object value = arg(frame, 3);
+            enclosing.setObject(slot, value);
+            return enclosing.getFrameDescriptor().getSlotName(slot);
+        }));
 
-        debug.rawset("getlocal", wrap(language, "getlocal", (frame, callNode) ->
-                LuaNil.INSTANCE));
+        debug.rawset("getlocal", wrap(language, "getlocal", (frame, callNode) -> {
+            Double levelNum = LuaTypeUtils.toNumber(arg(frame, 1));
+            Double indexNum = LuaTypeUtils.toNumber(arg(frame, 2));
+            if (levelNum == null || indexNum == null) {
+                return LuaNil.INSTANCE;
+            }
+            Frame target = resolveLevelFrame(levelNum.intValue(), FrameInstance.FrameAccess.READ_ONLY);
+            if (target == null) {
+                return LuaNil.INSTANCE;
+            }
+            int index = indexNum.intValue();
+            if (index < 0) {
+                Object[] varargs = readVarargs(target);
+                int vi = varargs.length + index;
+                if (vi < 0 || vi >= varargs.length) {
+                    return LuaNil.INSTANCE;
+                }
+                Object value = varargs[vi];
+                return new Object[] {"(vararg)", value == null ? LuaNil.INSTANCE : value};
+            }
+            FrameDescriptor descriptor = target.getFrameDescriptor();
+            if (index < 1 || index >= descriptor.getNumberOfSlots()) {
+                return LuaNil.INSTANCE;
+            }
+            String name = (String) descriptor.getSlotName(index);
+            Object value = target.getObject(index);
+            return new Object[] {name, value == null ? LuaNil.INSTANCE : value};
+        }));
 
-        debug.rawset("setlocal", wrap(language, "setlocal", (frame, callNode) ->
-                LuaNil.INSTANCE));
+        debug.rawset("setlocal", wrap(language, "setlocal", (frame, callNode) -> {
+            Double levelNum = LuaTypeUtils.toNumber(arg(frame, 1));
+            Double indexNum = LuaTypeUtils.toNumber(arg(frame, 2));
+            if (levelNum == null || indexNum == null) {
+                return LuaNil.INSTANCE;
+            }
+            Frame target = resolveLevelFrame(levelNum.intValue(), FrameInstance.FrameAccess.READ_WRITE);
+            if (target == null) {
+                return LuaNil.INSTANCE;
+            }
+            int index = indexNum.intValue();
+            if (index < 1) {
+                // Varargs aren't named locals; setting them isn't a meaningful operation here.
+                return LuaNil.INSTANCE;
+            }
+            FrameDescriptor descriptor = target.getFrameDescriptor();
+            if (index >= descriptor.getNumberOfSlots()) {
+                return LuaNil.INSTANCE;
+            }
+            Object value = arg(frame, 3);
+            target.setObject(index, value);
+            return descriptor.getSlotName(index);
+        }));
 
         debug.rawset("sethook", wrap(language, "sethook", (frame, callNode) -> {
             LuaContext context = LuaLanguage.getContext(callNode);
@@ -244,6 +341,14 @@ final class LuaDebugLib {
         }));
 
         debug.rawset("getregistry", wrap(language, "getregistry", (frame, callNode) -> registry));
+
+        // debug.debug() (Lua 5.1 §5.9): in PUC-Rio this enters an interactive prompt for running
+        // arbitrary commands until "cont" is typed. There's no interactive console to drive here,
+        // so this is a no-op that returns immediately; the important part is that the function
+        // exists, so code that probes `debug.debug ~= nil` still works.
+        debug.rawset("debug", wrap(language, "debug", (frame, callNode) -> {
+            throw new LuaReturnException(new Object[0]);
+        }));
     }
 
     /** {@code RootNode}s of every frame currently on the Truffle call stack, from the caller of
@@ -272,6 +377,75 @@ final class LuaDebugLib {
             return null;
         });
         return frames;
+    }
+
+    /** Resolves a {@code debug.getlocal}/{@code setlocal}-style stack {@code level} (same numbering
+     * as {@code debug.getinfo}'s numeric-level form: 0 is the currently running builtin itself, 1
+     * is its caller, and so on) to that frame, accessed the way {@code access} requests. Returns
+     * {@code null} if {@code level} is out of range. */
+    private static Frame resolveLevelFrame(int level, FrameInstance.FrameAccess access) {
+        List<FrameInstance> instances = collectFrameInstances();
+        if (level < 0 || level >= instances.size()) {
+            return null;
+        }
+        return instances.get(level).getFrame(access);
+    }
+
+    /** The vararg values ({@code ...}) captured in {@code frame}'s reserved slot 0, or an empty
+     * array if the frame has no slot 0 or it doesn't (yet) hold an {@code Object[]}. */
+    private static Object[] readVarargs(Frame frame) {
+        FrameDescriptor descriptor = frame.getFrameDescriptor();
+        if (descriptor.getNumberOfSlots() <= LuaRootNode.VARARGS_FRAME_SLOT) {
+            return new Object[0];
+        }
+        Object varargs = frame.getObject(LuaRootNode.VARARGS_FRAME_SLOT);
+        return varargs instanceof Object[] arr ? arr : new Object[0];
+    }
+
+    /** Maps a 1-based {@code debug.getupvalue}/{@code setupvalue} index to a frame slot in {@code
+     * descriptor}, per the simplification noted on the library class doc: every named slot of the
+     * enclosing frame (i.e. every slot except the unnamed/vararg slot 0) is treated as one upvalue,
+     * in slot order. Returns -1 if {@code index} is out of range. */
+    private static int upvalueSlot(FrameDescriptor descriptor, int index) {
+        if (index < 1) {
+            return -1;
+        }
+        int seen = 0;
+        int numSlots = descriptor.getNumberOfSlots();
+        for (int slot = 0; slot < numSlots; slot++) {
+            if (!(descriptor.getSlotName(slot) instanceof String)) {
+                continue;
+            }
+            if (slot == LuaRootNode.VARARGS_FRAME_SLOT) {
+                continue;
+            }
+            seen++;
+            if (seen == index) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    /** Number of upvalue-eligible named slots in {@code enclosing} (see {@link #upvalueSlot}), used
+     * for {@code debug.getinfo}'s {@code nups} field. {@code enclosing} is {@code null} for builtin
+     * functions and closures with no captured enclosing frame, which report zero upvalues. */
+    private static int countNamedSlots(MaterializedFrame enclosing) {
+        if (enclosing == null) {
+            return 0;
+        }
+        FrameDescriptor descriptor = enclosing.getFrameDescriptor();
+        int count = 0;
+        int numSlots = descriptor.getNumberOfSlots();
+        for (int slot = 0; slot < numSlots; slot++) {
+            if (slot == LuaRootNode.VARARGS_FRAME_SLOT) {
+                continue;
+            }
+            if (descriptor.getSlotName(slot) instanceof String) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static String formatFrameLine(RootNode root) {

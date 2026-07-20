@@ -215,7 +215,7 @@ final class LuaBaseLib {
         globals.rawset("setmetatable", wrap(language, "setmetatable", (frame, callNode) -> {
             LuaTable t = checkTable("setmetatable", 1, arg(frame, 1));
             Object metaArg = arg(frame, 2);
-            if (t.getMetatable() != null && t.getMetatable().getMetamethod("__metatable") != null) {
+            if (t.getMetatable() != null && rawMetatableField(t.getMetatable(), "__metatable") != null) {
                 throw LuaException.runtimeError(null, "cannot change a protected metatable");
             }
             if (isNil(metaArg)) {
@@ -239,7 +239,7 @@ final class LuaBaseLib {
             if (mt == null) {
                 return LuaNil.INSTANCE;
             }
-            Object protectedMeta = mt.getMetamethod("__metatable");
+            Object protectedMeta = rawMetatableField(mt, "__metatable");
             return protectedMeta != null ? protectedMeta : mt;
         }));
 
@@ -314,6 +314,19 @@ final class LuaBaseLib {
             }
         }
         return LuaTypeUtils.tostring(v);
+    }
+
+    /**
+     * Reads a field directly off a metatable itself (e.g. {@code mt.__metatable}), as opposed to
+     * {@link LuaTable#getMetamethod}, which reads a field off a value's <em>own</em> metatable.
+     * {@code __metatable} lives as a plain field on the metatable, not behind a further nested
+     * metatable, so {@code mt.getMetamethod(name)} would incorrectly look at {@code mt}'s own
+     * metatable (almost always absent) rather than {@code mt} itself. Returns {@code null} if the
+     * field is absent or nil.
+     */
+    private static Object rawMetatableField(LuaTable mt, String name) {
+        Object value = mt.rawget(name);
+        return (value == null || value == LuaNil.INSTANCE) ? null : value;
     }
 
     private static Object nextImpl(com.oracle.truffle.api.frame.VirtualFrame frame) {

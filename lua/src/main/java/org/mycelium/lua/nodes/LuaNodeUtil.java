@@ -136,9 +136,13 @@ final class LuaNodeUtil {
                 current = handler;
             } else if (current instanceof String) {
                 // Lua 5.1 §5.4: strings share a metatable whose __index is the string library
-                // table, letting `("hi"):upper()` resolve as a method call.
+                // table, letting `("hi"):upper()` resolve as a method call. __index lives as a
+                // plain field directly on stringMetatable (rawget), not behind a further nested
+                // metatable — stringMetatable.getMetamethod("__index") would incorrectly look at
+                // stringMetatable's own (nonexistent) metatable instead.
                 LuaTable stringMetatable = LuaStringMetatable.get();
-                Object handler = stringMetatable != null ? stringMetatable.getMetamethod("__index") : null;
+                Object rawHandler = stringMetatable != null ? stringMetatable.rawget("__index") : null;
+                Object handler = (rawHandler == null || isNil(rawHandler)) ? null : rawHandler;
                 if (handler == null) {
                     throw LuaException.typeError(location, "index", current);
                 }

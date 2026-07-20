@@ -9,10 +9,10 @@ import org.mycelium.lua.runtime.LuaTypeUtils;
  * modifiers, by re-emitting each conversion spec through {@link String#format} after coercing the
  * Lua argument to the Java type that conversion expects.
  *
- * <p><b>Known approximation:</b> {@code %x}/{@code %X}/{@code %o} of a negative number format as
- * 64-bit two's complement (via Java's {@code long} formatting) rather than C's 32-bit unsigned
- * wraparound &mdash; flagging this as a divergence from the reference implementation for values
- * that rely on that specific width.
+ * <p>{@code %x}/{@code %X}/{@code %o}/{@code %u} mask their operand to 32 bits before formatting,
+ * matching C's {@code unsigned int} width used by PUC-Rio Lua 5.1's {@code lstrlib.c} (e.g.
+ * {@code string.format("%x", -1)} yields {@code "ffffffff"}, not 64-bit {@code
+ * "ffffffffffffffff"}). {@code %d}/{@code %i} likewise truncate to a 32-bit signed {@code int}.
  */
 final class LuaStringFormat {
 
@@ -62,17 +62,19 @@ final class LuaStringFormat {
             switch (conv) {
                 case 'd':
                 case 'i':
+                    out.append(String.format("%" + spec + "d", (int) toLong(argVal)));
+                    break;
                 case 'u':
-                    out.append(String.format("%" + spec + "d", toLong(argVal)));
+                    out.append(String.format("%" + spec + "d", toUnsigned32(argVal)));
                     break;
                 case 'o':
-                    out.append(String.format("%" + spec + "o", toLong(argVal)));
+                    out.append(String.format("%" + spec + "o", toUnsigned32(argVal)));
                     break;
                 case 'x':
-                    out.append(String.format("%" + spec + "x", toLong(argVal)));
+                    out.append(String.format("%" + spec + "x", toUnsigned32(argVal)));
                     break;
                 case 'X':
-                    out.append(String.format("%" + spec + "X", toLong(argVal)));
+                    out.append(String.format("%" + spec + "X", toUnsigned32(argVal)));
                     break;
                 case 'c':
                     out.append((char) toLong(argVal));
@@ -106,6 +108,15 @@ final class LuaStringFormat {
             }
         }
         return out.toString();
+    }
+
+    /**
+     * {@code %x}/{@code %X}/{@code %o}/{@code %u}: mask to 32 bits, matching C's {@code unsigned
+     * int} (32-bit) width used by PUC-Rio Lua 5.1's {@code lstrlib.c}, rather than Java's 64-bit
+     * {@code long} formatting.
+     */
+    private static long toUnsigned32(Object v) {
+        return toLong(v) & 0xFFFFFFFFL;
     }
 
     private static long toLong(Object v) {

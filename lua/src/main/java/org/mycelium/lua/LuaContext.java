@@ -2,6 +2,10 @@ package org.mycelium.lua;
 
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.nodes.Node;
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import org.mycelium.lua.runtime.LuaCoroutine;
 import org.mycelium.lua.runtime.LuaTable;
 
 /**
@@ -17,6 +21,12 @@ public final class LuaContext {
     private final LuaLanguage language;
     private final TruffleLanguage.Env env;
     private final LuaTable globals;
+
+    /** Every {@link LuaCoroutine} that has ever been started (i.e. resumed at least once), so
+     * that {@link #shutdownCoroutines()} can interrupt any still-suspended backing threads before
+     * the Truffle context finishes closing &mdash; see {@link LuaCoroutine}'s class doc. */
+    private final Set<LuaCoroutine> startedCoroutines =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     public LuaContext(LuaLanguage language, TruffleLanguage.Env env) {
         this.language = language;
@@ -52,6 +62,29 @@ public final class LuaContext {
 
     public TruffleLanguage.Env getEnv() {
         return env;
+    }
+
+    /** Registers {@code coroutine} as started, so its backing thread gets a shutdown chance. */
+    public void registerCoroutine(LuaCoroutine coroutine) {
+        startedCoroutines.add(coroutine);
+    }
+
+    /** Unregisters {@code coroutine} once it's finished on its own (normal return or error), so
+     * the registry doesn't grow unbounded over a long-running program's lifetime. */
+    public void unregisterCoroutine(LuaCoroutine coroutine) {
+        startedCoroutines.remove(coroutine);
+    }
+
+    /**
+     * Interrupts every still-registered coroutine's backing thread (see {@link
+     * LuaCoroutine#interruptForShutdown()}), called from {@link LuaLanguage#finalizeContext} so
+     * that a Lua program that dropped a suspended coroutine without resuming it to completion
+     * doesn't prevent the enclosing polyglot {@code Context} from closing.
+     */
+    public void shutdownCoroutines() {
+        for (LuaCoroutine coroutine : new java.util.ArrayList<>(startedCoroutines)) {
+            coroutine.interruptForShutdown();
+        }
     }
 
     /** Retrieves the {@link LuaContext} for the language currently executing at {@code node}. */

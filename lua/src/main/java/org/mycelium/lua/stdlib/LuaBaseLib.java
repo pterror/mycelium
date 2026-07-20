@@ -1,10 +1,18 @@
 package org.mycelium.lua.stdlib;
 
+import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
+import com.oracle.truffle.api.source.Source;
 import java.util.Arrays;
+import org.mycelium.lua.LuaContext;
 import org.mycelium.lua.LuaException;
+import org.mycelium.lua.LuaLanguage;
+import org.mycelium.lua.nodes.LuaRootNode;
 import org.mycelium.lua.nodes.controlflow.LuaReturnException;
+import org.mycelium.lua.parser.LuaLexer;
+import org.mycelium.lua.parser.LuaParseError;
+import org.mycelium.lua.parser.LuaParser;
 import org.mycelium.lua.runtime.LuaFunction;
 import org.mycelium.lua.runtime.LuaNil;
 import org.mycelium.lua.runtime.LuaStringMetatable;
@@ -244,11 +252,54 @@ final class LuaBaseLib {
             throw LuaException.runtimeError(null, "dofile not yet implemented");
         }));
         globals.rawset("load", wrap(language, "load", (frame, callNode) -> {
-            throw new LuaReturnException(new Object[] {LuaNil.INSTANCE, "load not yet implemented"});
+            Object func = arg(frame, 1);
+            String chunkname = optString(arg(frame, 2), "=(load)");
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                Object[] result = LuaCallSupport.call(null, callNode, func, new Object[0]);
+                Object piece = LuaCallSupport.first(result);
+                if (isNil(piece)) {
+                    break;
+                }
+                String s = (piece instanceof String str) ? str : null;
+                if (s == null) {
+                    throw new LuaReturnException(
+                            new Object[] {LuaNil.INSTANCE, "reader function must return a string"});
+                }
+                if (s.isEmpty()) {
+                    break;
+                }
+                sb.append(s);
+            }
+            throw new LuaReturnException(loadChunk(language, callNode, sb.toString(), chunkname));
         }));
         globals.rawset("loadstring", wrap(language, "loadstring", (frame, callNode) -> {
-            throw new LuaReturnException(new Object[] {LuaNil.INSTANCE, "loadstring not yet implemented"});
+            String code = checkString("loadstring", 1, arg(frame, 1));
+            String chunkname = optString(arg(frame, 2), code);
+            throw new LuaReturnException(loadChunk(language, callNode, code, chunkname));
         }));
+    }
+
+    /**
+     * Shared {@code load}/{@code loadstring} implementation (Lua 5.1 &sect;5.1): parses {@code code}
+     * as a chunk and, on success, returns a one-element array holding the compiled function (its
+     * environment set to the current context's globals); on a parse error, returns
+     * {@code {nil, errorMessage}} rather than throwing, per Lua semantics.
+     */
+    private static Object[] loadChunk(
+            TruffleLanguage<?> language, IndirectCallNode callNode, String code, String chunkname) {
+        try {
+            Source source = Source.newBuilder(LuaLanguage.ID, code, chunkname).build();
+            LuaParser parser = new LuaParser(language, source);
+            LuaRootNode chunkRootNode = parser.parse();
+            CallTarget chunkCallTarget = chunkRootNode.getCallTarget();
+            LuaFunction chunkFunction = new LuaFunction(chunkCallTarget, null);
+            LuaContext context = LuaLanguage.getContext(callNode);
+            chunkFunction.setEnvironment(context.getGlobals());
+            return new Object[] {chunkFunction};
+        } catch (LuaParseError | LuaLexer.LuaLexerException e) {
+            return new Object[] {LuaNil.INSTANCE, e.getMessage()};
+        }
     }
 
     /** {@code tostring}: honors a table's {@code __tostring} metamethod before falling back to

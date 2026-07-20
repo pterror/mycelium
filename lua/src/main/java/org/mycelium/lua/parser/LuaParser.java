@@ -97,6 +97,10 @@ public final class LuaParser {
 
     private FunctionScope currentFunction;
 
+    /** Depth of enclosing {@code while}/{@code repeat}/{@code for} loops, reset at each function
+     * boundary since {@code break} cannot cross into an enclosing function's loop (Lua 5.1 &sect;2.4.4). */
+    private int loopDepth = 0;
+
     public LuaParser(TruffleLanguage<?> language, Source source) {
         this.language = language;
         this.sourceName = source.getName();
@@ -309,7 +313,13 @@ public final class LuaParser {
 
     /** {@code laststat ::= return [explist] | break}. */
     private LuaStatementNode parseLastStat() {
-        if (match(TokenType.BREAK)) {
+        if (check(TokenType.BREAK)) {
+            LuaToken breakTok = peek();
+            if (loopDepth <= 0) {
+                throw new LuaParseError(sourceName + ":" + breakTok.line
+                        + ": <break> at line " + breakTok.line + " is not inside a loop");
+            }
+            advance();
             return new LuaBreakNode();
         }
         expect(TokenType.RETURN);
@@ -382,7 +392,9 @@ public final class LuaParser {
         LuaExpressionNode condition = parseExpr();
         expect(TokenType.DO);
         pushScope();
+        loopDepth++;
         LuaStatementNode body = parseBlock();
+        loopDepth--;
         popScope();
         expect(TokenType.END);
         return new LuaWhileNode(condition, body);
@@ -403,9 +415,11 @@ public final class LuaParser {
     private LuaStatementNode parseRepeat() {
         expect(TokenType.REPEAT);
         pushScope();
+        loopDepth++;
         LuaStatementNode body = parseBlock();
         expect(TokenType.UNTIL);
         LuaExpressionNode condition = parseExpr();
+        loopDepth--;
         popScope();
         return new LuaRepeatNode(body, condition);
     }
@@ -438,7 +452,9 @@ public final class LuaParser {
         expect(TokenType.DO);
         pushScope();
         int slot = currentFunction.declareLocal(nameTok.value);
+        loopDepth++;
         LuaStatementNode body = parseBlock();
+        loopDepth--;
         popScope();
         expect(TokenType.END);
         return new LuaForNumericNode(start, stop, step, slot, body);
@@ -458,7 +474,9 @@ public final class LuaParser {
         for (int i = 0; i < names.size(); i++) {
             slots[i] = currentFunction.declareLocal(names.get(i));
         }
+        loopDepth++;
         LuaStatementNode body = parseBlock();
+        loopDepth--;
         popScope();
         expect(TokenType.END);
         return new LuaForGenericNode(exprs.toArray(new LuaExpressionNode[0]), slots, body);
@@ -841,6 +859,8 @@ public final class LuaParser {
         FunctionScope fn = new FunctionScope(parentFn);
         currentFunction = fn;
         fn.pushBlock();
+        int parentLoopDepth = loopDepth;
+        loopDepth = 0;
 
         List<Integer> paramSlots = new ArrayList<>();
         if (isMethod) {
@@ -882,6 +902,7 @@ public final class LuaParser {
         int numUpvalues = fn.numUpvalues;
 
         currentFunction = parentFn;
+        loopDepth = parentLoopDepth;
         return new LuaFunctionDefNode(callTarget, numUpvalues);
     }
 

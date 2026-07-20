@@ -32,11 +32,18 @@ public final class LuaStdLib {
         LuaTableLib.install(language, globals);
     }
 
-    /** Installs every implemented library ({@code base}, {@code math}, {@code string}, {@code table}) into {@code globals}. */
+    /** Lua 5.1 &sect;5.2: the {@code coroutine} table. */
+    public static void installCoroutine(TruffleLanguage<?> language, LuaTable globals) {
+        LuaCoroutineLib.install(language, globals);
+    }
+
+    /** Installs every implemented library ({@code base}, {@code math}, {@code string}, {@code
+     * table}, {@code coroutine}) into {@code globals}. */
     public static void installAll(TruffleLanguage<?> language, LuaTable globals) {
         installBase(language, globals);
         installMath(language, globals);
         installString(language, globals);
         installTable(language, globals);
+        installCoroutine(language, globals);
     }
 }

@@ -33,6 +33,9 @@ public final class LuaTypeUtils {
         if (value instanceof LuaFunction) {
             return "function";
         }
+        if (value instanceof LuaCoroutine) {
+            return "thread";
+        }
         // Anything else is treated as opaque host/user data.
         return "userdata";
     }

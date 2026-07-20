@@ -40,6 +40,32 @@ public final class LuaLanguage extends TruffleLanguage<LuaContext> {
         return new LuaContext(this, env);
     }
 
+    /**
+     * Lua 5.1 coroutines (&sect;2.11/&sect;5.2) are implemented as "thread-per-coroutine": each
+     * coroutine that is actually started runs on its own backing Java thread (see {@link
+     * org.mycelium.lua.runtime.LuaCoroutine}), created via {@link Env#newTruffleThreadBuilder}.
+     * That means
+     * more than one thread may be entered in this context at once &mdash; the resumer blocks
+     * (still entered) while the coroutine's thread runs. Truffle's default policy rejects that
+     * ({@code isThreadAccessAllowed} defaults to {@code singleThreaded}), so it's overridden here:
+     * this is still safe because {@code LuaCoroutine}'s resume/yield rendezvous guarantees that
+     * only one of those entered threads is ever actually executing Lua code at a time.
+     */
+    @Override
+    protected boolean isThreadAccessAllowed(Thread thread, boolean singleThreaded) {
+        return true;
+    }
+
+    /**
+     * Gives any coroutine backing threads that are still parked (suspended, never resumed to
+     * completion) a chance to exit before the context finishes closing &mdash; see {@link
+     * org.mycelium.lua.runtime.LuaCoroutine}'s class doc for why this is necessary.
+     */
+    @Override
+    protected void finalizeContext(LuaContext context) {
+        context.shutdownCoroutines();
+    }
+
     @Override
     protected CallTarget parse(ParsingRequest request) throws Exception {
         Source source = request.getSource();

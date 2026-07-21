@@ -12,3 +12,8 @@ build
 
 # Ignore Kotlin IDE files
 .kotlin/
+
+# Normalize
+.normalize/*
+!.normalize/config.toml
+!.normalize/memory/

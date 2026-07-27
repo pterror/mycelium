@@ -22,3 +22,7 @@ build
 docs/node_modules
 docs/.vitepress/dist
 docs/.vitepress/cache
+
+# jqwik's local database of failing-sample seeds (BunFuzzTest.kt) — a per-machine cache
+# for reproducing previous fuzz failures across runs, not something to version.
+.jqwik-database

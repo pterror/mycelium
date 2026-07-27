@@ -285,10 +285,16 @@ class BunCompatTest {
         assumeTrue(bunCommand() != null, "bun not available — skipping live parity check")
         // Extensions BUN_INIT_SCRIPT's MIME_TYPES table covers, plus a no-extension case —
         // every one of these is now diffed against a live `bun` process's own
-        // `Bun.file(name).type`, not a value transcribed by hand.
+        // `Bun.file(name).type`, not a value transcribed by hand. Includes a handful of the
+        // short/obscure source-code extensions ("c"/"h"/"t"/"s"/"java") that MIME_TYPES only
+        // gained once it was regenerated via tooling/generate-bun-mime-table.mjs against a
+        // broad corpus (see that script's own header + BUN_INIT_SCRIPT's MIME_TYPES comment)
+        // — these are exactly the cases BunFuzzTest.kt's bunFileMimeTypeGuessLiveDiffFuzz
+        // used to have to dodge (via a length >= 5 restriction) before the table covered them.
         val extensions = listOf(
             "json", "txt", "html", "js", "mjs", "ts", "css", "md", "xml", "csv",
             "png", "jpg", "jpeg", "gif", "svg", "wasm", "pdf", "zip", "unknownext",
+            "c", "h", "t", "s", "java", "lua", "sql", "toml",
         )
         val mc = Mycelium()
         val dir = createTempDirectory()

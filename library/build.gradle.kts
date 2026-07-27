@@ -75,6 +75,13 @@ dependencies {
   // fragile — it could disappear silently if those artifacts' own dependencies change.
   implementation("org.json:json:20240303")
   implementation("org.apache.commons:commons-compress:1.26.2")
+
+  // Property-based/fuzz testing for the Bun-compat shim surface (BunFuzzTest.kt). jqwik is
+  // JUnit5-native (its own JUnit Platform TestEngine runs alongside Jupiter's under the
+  // same `useJUnitPlatform()` task — see buildlogic.kotlin-common-conventions), so no
+  // separate test task/build wiring is needed beyond this dependency. Scoped to
+  // `library`'s test dependencies only, per the task — no other module needs it.
+  testImplementation("net.jqwik:jqwik:1.9.1")
 }
 
 // Tests exercise Ruby/Python/LLVM/WASM directly against a real Context, so the test

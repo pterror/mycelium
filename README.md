@@ -55,12 +55,11 @@ background daemon that amortizes JVM/GraalVM startup across runs.
   `Error.captureStackTrace` are polyfilled as bare globals the way Node exposes them.
 - **18 importable languages**, spanning three execution strategies:
   - **Native Truffle languages** — JavaScript/TypeScript, Ruby, Python (guest-eval only),
-    and Lua 5.1 (guest-eval and standalone-file execution; implemented from scratch in
-    `lua/` — parser, tables/metatables, coroutines, and the string/math/table/io/os/debug
-    standard libraries. `LuaTable`/`LuaFunction` don't yet export `InteropLibrary`, so
-    cross-language *member* import of a `.lua` module's exports — `import { add } from
-    "./foo.lua"` — isn't wired up yet; running a `.lua` file directly, or a plain
-    `Polyglot.eval("lua", ...)` that returns a primitive, both work today).
+    and Lua 5.1 (guest-eval, standalone-file execution, and cross-language *member* import;
+    implemented from scratch in `lua/` — parser, tables/metatables, coroutines, and the
+    string/math/table/io/os/debug standard libraries. `LuaTable`/`LuaFunction` both export
+    `InteropLibrary`, so `import { add } from "./foo.lua"` works from another guest language
+    like JS, the same way it does for C — verified by the `jsImportsLua` integration test).
   - **Compiled to LLVM bitcode/WASM** and loaded through GraalVM's LLVM/WebAssembly
     runtimes — C (clang), Rust (rustc), Go (via TinyGo → WASM).
   - **Compiled to plain JS** and executed as an ordinary ES module — CoffeeScript, Civet,

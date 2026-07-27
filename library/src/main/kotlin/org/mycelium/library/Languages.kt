@@ -320,26 +320,24 @@ object RustSupport : LanguageSupport {
 // host language's would be (npm-first, the interface default), rather than against any
 // Lua-specific package index.
 //
-// KNOWN LIMITATION (discovered integrating this LanguageSupport, 2026-07-20): the Lua
-// runtime's own value types (LuaTable, LuaFunction — see
-// lua/src/main/java/org/mycelium/lua/runtime/) carry no
-// `@ExportLibrary(InteropLibrary.class)` annotations at all, so a polyglot Value wrapping
-// either one exposes no members/executability to another guest language — `Value.memberKeys`
-// is always empty and `Value.canExecute()` is always false for a Lua table/function. That
-// blocks the two things Mycelium's own cross-language import machinery
+// CROSS-LANGUAGE MEMBER IMPORT: SUPPORTED. The Lua runtime's own value types (LuaTable,
+// LuaFunction — see lua/src/main/java/org/mycelium/lua/runtime/) are both
+// `@ExportLibrary(InteropLibrary.class)`, with full member/array-element/execute support, so
+// a polyglot Value wrapping either one exposes real members/executability to another guest
+// language: `Value.memberKeys` enumerates a table's string keys and `Value.canExecute()` is
+// true for a LuaFunction. That's exactly what Mycelium's own cross-language import machinery
 // (ShimGenerator/InterceptingFileSystem) needs from a *target* language's return value:
-// enumerating a returned table's fields to generate a shim (so a `.lua` module written as
-// `return { add = function(a, b) ... end }` can't have `add` extracted the way a Ruby/JS
-// module's own exports already are — see ShimGenerator.generateCrossLanguageShim, which
-// walks `value.memberKeys`) and directly invoking a Lua closure from another guest language.
-// A plain `context.eval("lua", ...)` that returns a primitive (number/string/boolean/nil)
-// still crosses the polyglot boundary fine — Lua numbers/strings are ordinary boxed
-// Long/Double/String values, which every guest language's interop already understands — and
-// running a standalone `.lua` *file* via `Mycelium.runFile` works too, since neither of
-// those depends on interop on the returned value. Only cross-language *member*-based
-// import of/into Lua is affected; fixing it would require adding InteropLibrary exports to
-// LuaTable/LuaFunction in the lua/ subproject itself, which is out of scope here (this
-// LanguageSupport only wires up what the existing Lua runtime already exposes).
+// enumerating a returned table's fields to generate a shim (a `.lua` module written as
+// `return { add = function(a, b) ... end }` has `add` extracted the same way a Ruby/JS
+// module's own exports are — see ShimGenerator.generateCrossLanguageShim, which walks
+// `value.memberKeys`) and directly invoking a Lua closure from another guest language
+// (LuaFunction.execute shifts args for Lua's implicit-self convention and unwraps Lua's
+// multi-return `Object[]` down to a single interop value). Verified end-to-end by the
+// `jsImportsLua` integration test in MyceliumIntegrationTest.kt, which imports `add` from a
+// `.lua` module via `import { add } from "..."` (the same path jsImportsC exercises for C)
+// and calls it from JS. (This covers Lua as the *target* of a cross-language import only —
+// see detectFrame's own doc comment below: Lua still has no `require`-equivalent of its own
+// wired up, so Lua can't yet act as the *host* side of a cross-language import.)
 object LuaSupport : LanguageSupport {
     override val languageId = "lua"
     override val extensions = listOf("lua")
@@ -364,12 +362,17 @@ object LuaSupport : LanguageSupport {
     override fun isValidExportName(name: String) =
         identifierRegex.matches(name) && name !in reservedWords
 
-    // Unverified against a real cross-language import — see this object's own KNOWN
-    // LIMITATION doc comment above: Value.memberKeys is always empty for a Lua table/
-    // function today, so ShimGenerator never actually has any exports to hand this
-    // method in practice. Modeled on RubySupport's own generateShim (a plain top-level
-    // assignment per export) for whenever Lua gains a "Polyglot" global of its own to
-    // resolve `Polyglot.import` against.
+    // Still unexercised in practice today, but NOT for the reason a prior version of this
+    // comment claimed (that Value.memberKeys is always empty for a Lua table/function — see
+    // this object's own doc comment above: that's fixed, LuaTable/LuaFunction both export
+    // InteropLibrary, and `jsImportsLua` in MyceliumIntegrationTest.kt proves a *target*-side
+    // Lua module's exports are enumerable and callable from another guest language). The real
+    // reason this method never actually runs yet: it only fires when Lua is the *host* doing
+    // the importing (see ShimGenerator.generateCrossLanguageShim, called with `hostLang`), and
+    // Lua has no `require`-equivalent wired up to trigger that path (see detectFrame's doc
+    // comment above). Modeled on RubySupport's own generateShim (a plain top-level assignment
+    // per export) for whenever Lua gains a "Polyglot" global of its own to resolve
+    // `Polyglot.import` against.
     override fun generateShim(exports: Map<String, String>): String =
         exports.entries.joinToString("\n") { (name, key) ->
             "$name = Polyglot.import(\"$key\")"

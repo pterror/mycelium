@@ -83,10 +83,27 @@ background daemon that amortizes JVM/GraalVM startup across runs.
 
 ## Building and running
 
-Mycelium is a Kotlin/Gradle project targeting a GraalVM JDK. The Nix flake (`flake.nix`)
-provisions GraalVM CE, a JDK-21-hosted Gradle 8 (needed because Gradle's embedded Kotlin DSL
-compiler can't parse newer JDK version strings), clang, rustc, and tinygo — enter the
-project directory with direnv/`nix develop` and everything needed is on `PATH`.
+Mycelium is a Kotlin/Gradle project targeting a GraalVM JDK. You need:
+
+- **A GraalVM JDK, 25.0.x** — matching the GraalVM Maven artifact version
+  (`library/build.gradle.kts` pins `truffle-api`/`polyglot`/language jars to `25.0.0`, the
+  highest version where js/python/java/ruby/wasm/llvm are all simultaneously published to
+  Maven Central). Get one from the [GraalVM downloads page](https://www.graalvm.org/downloads/)
+  or via SDKMAN (`sdk install java 25.0.2-graal` or similar).
+- **A plain JDK 21** for Gradle itself to run on — Gradle 8's embedded Kotlin DSL compiler
+  can't parse the version string a JDK-25-based GraalVM reports. Point `JAVA_HOME` at the
+  JDK 21 and `GRAALVM_HOME` at your GraalVM install (`gradle.properties` uses
+  `GRAALVM_HOME` to resolve the project's own Java-21 toolchain); toolchain auto-download is
+  disabled, so both need to already be on disk.
+- **`clang`, `rustc`, `tinygo`** — only needed for the C, Rust, and Go language packs,
+  respectively.
+
+See [Getting Started](docs/guide/getting-started.md) for the full rundown.
+
+> **Using Nix?** `flake.nix` provisions all of the above pre-wired (GraalVM CE, a
+> JDK-21-hosted Gradle 8, clang, rustc, tinygo, and `JAVA_HOME`/`GRAALVM_HOME` already set)
+> — enter the project directory with direnv or `nix develop` and it's all on `PATH`. This is
+> a convenience, not a requirement.
 
 ```bash
 # Run a file (JVM mode, JS language pack only — the default)

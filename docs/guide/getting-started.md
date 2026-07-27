@@ -5,17 +5,38 @@ Mycelium is pre-alpha and not published anywhere — there is no release artifac
 
 ## Prerequisites
 
-Mycelium targets a GraalVM JDK. The repo ships a Nix flake (`flake.nix`) that provisions
-everything needed — GraalVM CE, a JDK-21-hosted Gradle 8 (Gradle's embedded Kotlin DSL
-compiler can't parse newer JDK version strings, so the Gradle daemon itself runs on JDK 21
-while the project's own Java toolchain still targets GraalVM's JDK), `clang` (for the C
-language pack), `rustc` (for Rust), and `tinygo` (for Go). Enter the project directory with
-direnv or `nix develop` and all of it is on `PATH`.
+Mycelium targets a GraalVM JDK. You'll need to install a few things yourself:
 
-If you aren't using the flake, you need a GraalVM JDK installed yourself, and `clang`/
-`rustc`/`tinygo` on `PATH` specifically for the C/Rust/Go language packs — every other
-language pack (JS, Ruby, Python, Lua, and the compile-to-JS languages) has no external
-compiler dependency beyond what Gradle itself resolves.
+1. **A GraalVM JDK.** `library/build.gradle.kts` pins the GraalVM Maven artifacts
+   (`truffle-api`, `polyglot`, and the per-language jars) to **25.0.0** — the highest version
+   where all of the language packs Mycelium uses (js/python/java/ruby/wasm/llvm) are
+   simultaneously published to Maven Central. Grab a matching GraalVM build (25.0.x) from
+   the [GraalVM downloads page](https://www.graalvm.org/downloads/) or a JDK version manager
+   like SDKMAN (`sdk install java 25.0.2-graal`, or check `sdk list java` for the current
+   identifier).
+2. **A plain JDK 21 for Gradle itself.** Gradle 8's embedded Kotlin DSL compiler can't parse
+   the version string a JDK-25-based GraalVM reports, so the Gradle daemon needs to run on a
+   separate JDK 21 — point `JAVA_HOME` at that JDK 21 before invoking `./gradlew`. The
+   project's own Kotlin/Java toolchain still targets language level 21 (see
+   `buildlogic.kotlin-common-conventions.gradle.kts`) and resolves against your GraalVM
+   install via `GRAALVM_HOME`: set that env var to your GraalVM's install directory —
+   `gradle.properties` points Gradle's toolchain resolution
+   (`org.gradle.java.installations.fromEnv=GRAALVM_HOME`) at it. Toolchain auto-download is
+   disabled (`org.gradle.java.installations.auto-download=false`), so both JDKs need to
+   already be installed with `JAVA_HOME`/`GRAALVM_HOME` pointing at them — Gradle won't fetch
+   anything on its own.
+3. **`clang`, `rustc`, and `tinygo` on `PATH`** — only if you want the C, Rust, or Go
+   language packs, respectively. Every other language pack (JS, Ruby, Python, Lua, and the
+   compile-to-JS languages) has no external compiler dependency beyond what Gradle itself
+   resolves.
+
+::: tip If you use Nix
+`flake.nix` provisions all of the above already wired up — GraalVM CE, a JDK-21-hosted
+Gradle 8, `clang`, `rustc`, `tinygo`, and `JAVA_HOME`/`GRAALVM_HOME` pointed at the right
+places. Enter the project directory with direnv or run `nix develop` and everything above is
+on `PATH` with no manual setup. This is a convenience, not a requirement — everything it
+provides can be installed by hand as described above.
+:::
 
 ## Building
 

@@ -1207,16 +1207,23 @@ class Mycelium(
         // Node-addon N-API, which is a different thing entirely and does not block this),
         // `Bun.sqlite`/`bun:sqlite` (would need a JVM SQLite binding, e.g. sqlite-jdbc, as a
         // new dependency — same open question TODO.md already has for Node's own
-        // `node:sqlite`), `Bun.$` (shell), `Bun.build`, `Bun.Transpiler`, `Bun.Glob`,
-        // `Bun.peek` (see its own section below for exactly why), and `bun:test`, and
-        // WebSocket upgrade support in `Bun.serve` — see docs/reference/bun-compat.md for the
+        // `node:sqlite`), `Bun.build`, `Bun.Transpiler`, `Bun.peek` (see its own section
+        // below for exactly why), `bun:test`, and WebSocket upgrade support / `Bun.connect`/
+        // `Bun.listen` in `Bun.serve` — see docs/reference/bun-compat.md for the
         // authoritative, checked-against-upstream list of what is/isn't covered. `Bun.write`,
         // `Bun.spawn`/`Bun.spawnSync`, `Bun.hash`(.*), `Bun.CryptoHasher`, `Bun.password`,
         // `Bun.deepEquals`, `Bun.escapeHTML`, `Bun.inspect`, `Bun.sleep`/`Bun.sleepSync`,
         // `Bun.nanoseconds`, `Bun.which`, `Bun.randomUUIDv7`, `Bun.gzipSync`/`gunzipSync`/
         // `deflateSync`/`inflateSync`, and `Bun.stringWidth` *are* implemented below (see
         // their own comments) — verified against real `bun` 1.3.13 via small probe scripts,
-        // same discipline as everything else in this file.
+        // same discipline as everything else in this file. So are `Bun.Glob`, `Bun.$` (a
+        // well-defined subset — see that section's own doc comment), `Bun.resolveSync`/
+        // `Bun.resolve`, and `Bun.pathToFileURL`/`Bun.fileURLToPath`. `Bun.openInEditor` is
+        // deliberately NOT implemented — low value for a headless/embedded runtime (it
+        // shells out to the user's `$EDITOR` to open a file at a given line/column, which
+        // has no obvious meaning in Mycelium's execution model) and is absent rather than
+        // stubbed, matching this comment's own "not started, not stubbed, just absent"
+        // convention.
         //
         // Golden values below (MIME-type guesses, the non-Response-return placeholder body,
         // the default-error-response body, ENOENT error shape, Bun.argv's shape) were
@@ -1231,6 +1238,10 @@ class Mycelium(
                 var JFiles = Java.type('java.nio.file.Files');
                 var JPaths = Java.type('java.nio.file.Paths');
                 var JString = Java.type('java.lang.String');
+                // Used by Bun.Glob's default-cwd fallback and Bun.$'s non-quiet console
+                // echo (see those sections below) — PROCESS_INIT_SCRIPT declares its own
+                // same-named local in its own separate IIFE, which isn't visible here.
+                var JSystem = Java.type('java.lang.System');
                 var JCharset = Java.type('java.nio.charset.StandardCharsets');
                 var JByteArray = Java.type('byte[]');
                 var JHttpServer = Java.type('com.sun.net.httpserver.HttpServer');
@@ -1240,6 +1251,14 @@ class Mycelium(
                 var JRedirect = Java.type('java.lang.ProcessBuilder${'$'}Redirect');
                 var JArrayList = Java.type('java.util.ArrayList');
                 var JFile = Java.type('java.io.File');
+                // Bun.Glob's onlyFiles/followSymlinks filtering (see that section below)
+                // needs NOFOLLOW_LINKS explicitly — java.nio.file.Files.isRegularFile(path)
+                // with no LinkOption *follows* symlinks by default, which would make a
+                // symlink-to-a-file count as "a regular file" even with followSymlinks:false;
+                // probing real Bun 1.3.13 confirmed a plain symlink-to-a-file is excluded
+                // from a default (onlyFiles:true, followSymlinks:false) scan the same way a
+                // directory is, only appearing once onlyFiles:false or followSymlinks:true.
+                var JLinkOption = Java.type('java.nio.file.LinkOption');
 
                 function toJByteArray(str) {
                     var buf = JCharset.UTF_8.encode(String(str));
@@ -3580,6 +3599,486 @@ class Mycelium(
                     return width;
                 }
 
+                // --- Bun.Glob ---
+                //
+                // Verified against real Bun 1.3.13 via small probe scripts (`nix develop -c
+                // bun -e '...'` against a scratch directory tree with plain files, nested
+                // dirs, dotfiles, and symlinks — see the task/PR this was implemented under
+                // for the exact probes). Findings:
+                //   * `new Bun.Glob(pattern)` exposes `.match(path)` (pure string test, no
+                //     filesystem access at all — critically, the `dot` option does NOT apply
+                //     to `.match()`: `new Bun.Glob("*").match(".dotfile")` is `true`, even
+                //     though a `.scan()` of the same pattern excludes dotfiles by default —
+                //     "dot" is a *scan/filesystem-traversal* filter, not part of the pattern
+                //     semantics `.match()` tests against).
+                //   * `.scan(cwdOrOptions)` returns an async-iterable of matches;
+                //     `.scanSync(cwdOrOptions)` the synchronous equivalent. Both accept either
+                //     an options object or a bare cwd string.
+                //   * Confirmed defaults: `cwd` = process cwd, `dot: false`, `absolute:
+                //     false`, `onlyFiles: true`, `followSymlinks: false`. A nonexistent `cwd`
+                //     throws an ENOENT-shaped Error.
+                //   * `onlyFiles`/`followSymlinks` interact non-obviously with symlinks: a
+                //     symlink pointing at a regular file is excluded from a *default*
+                //     (onlyFiles:true, followSymlinks:false) scan the same way a directory
+                //     is — it only appears once `onlyFiles:false` or `followSymlinks:true` is
+                //     set. This shim reproduces that exactly (see
+                //     bunIsFileForOnlyFilesFilter below) rather than following Java's own
+                //     `Files.isRegularFile(path)` default (which *does* follow symlinks).
+                //
+                // Supported glob syntax (hand-rolled matcher below, deliberately NOT
+                // `java.nio.file.FileSystems.getPathMatcher("glob:...")` — Java's glob syntax
+                // was checked and differs from Bun's in ways that matter here: Java's `**`
+                // does not mean "zero or more path segments, including zero" the way Bun's
+                // does — probing confirmed `**/*.txt` matches a *top-level* `x.txt` against
+                // real bun, which needs its own explicit zero-segment-match handling that
+                // Java's PathMatcher doesn't give a documented way to rely on; Java's
+                // PathMatcher is also filesystem-rooted, which doesn't fit matching a bare
+                // relative-path string via `.match()`):
+                //   `*`   any run of characters within one path segment
+                //   `**`  zero or more entire path segments (recursive)
+                //   `?`   a single character within one path segment
+                //   `[abc]` / `[a-z]` / `[!abc]` / `[^abc]`  POSIX-ish character classes
+                //   `{a,b,c}` brace alternation — expanded up front into N separate patterns
+                //     that are OR'd together (top-level/non-nested splitting only; a nested
+                //     `{...}` inside a group is treated as part of that group's own expansion
+                //     recursively, but comma-splitting only happens at each group's own top
+                //     level — matches what `**/*.{txt,js}` probed as against real bun)
+                // Extglob forms (`!(pattern)`, `+(pattern)`, `@(pattern)`) are deliberately
+                // NOT implemented: probing real bun found `new Bun.Glob("!(*.js)")
+                // .match("y.js")` returns `true` for BOTH a `.js` name and a non-`.js` name —
+                // i.e. real Bun's own extglob-negation handling isn't a behavior this shim
+                // could faithfully copy even if it wanted to (there's no consistent "does it
+                // actually negate" signal in real bun's own output to match against). Leading
+                // `!`/`+`/`@` before a `(` are therefore treated as ordinary literal
+                // characters here rather than faking extglob semantics.
+                function bunExpandBraces(pattern) {
+                    var start = pattern.indexOf('{');
+                    if (start === -1) return [pattern];
+                    var depth = 0, end = -1;
+                    for (var i = start; i < pattern.length; i++) {
+                        if (pattern[i] === '{') depth++;
+                        else if (pattern[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+                    }
+                    if (end === -1) return [pattern];
+                    var prefix = pattern.slice(0, start);
+                    var body = pattern.slice(start + 1, end);
+                    var suffix = pattern.slice(end + 1);
+                    var parts = [];
+                    var depth2 = 0, last = 0;
+                    for (var j = 0; j < body.length; j++) {
+                        if (body[j] === '{') depth2++;
+                        else if (body[j] === '}') depth2--;
+                        else if (body[j] === ',' && depth2 === 0) { parts.push(body.slice(last, j)); last = j + 1; }
+                    }
+                    parts.push(body.slice(last));
+                    var results = [];
+                    for (var k = 0; k < parts.length; k++) {
+                        var combined = prefix + parts[k] + suffix;
+                        var expanded = bunExpandBraces(combined);
+                        for (var m = 0; m < expanded.length; m++) results.push(expanded[m]);
+                    }
+                    return results;
+                }
+
+                var bunSegmentRegexCache = {};
+                function bunCompileSegmentRegex(seg) {
+                    if (Object.prototype.hasOwnProperty.call(bunSegmentRegexCache, seg)) return bunSegmentRegexCache[seg];
+                    var out = '';
+                    for (var i = 0; i < seg.length; i++) {
+                        var c = seg[i];
+                        if (c === '*') { out += '[^/]*'; }
+                        else if (c === '?') { out += '[^/]'; }
+                        else if (c === '[') {
+                            var j = i + 1;
+                            var negate = false;
+                            if (seg[j] === '!' || seg[j] === '^') { negate = true; j++; }
+                            var classBody = '';
+                            while (j < seg.length && seg[j] !== ']') { classBody += seg[j]; j++; }
+                            out += '[' + (negate ? '^' : '') + classBody.split('\\\\').join('\\\\\\\\') + ']';
+                            i = j;
+                        } else {
+                            out += c.replace(/[.*+?^${'$'}{}()|[\]\\]/g, '\\${'$'}&');
+                        }
+                    }
+                    var re = new RegExp('^' + out + '${'$'}');
+                    bunSegmentRegexCache[seg] = re;
+                    return re;
+                }
+
+                function bunMatchSegments(patternSegs, pathSegs, pi, si) {
+                    if (pi === patternSegs.length) return si === pathSegs.length;
+                    var seg = patternSegs[pi];
+                    if (seg === '**') {
+                        for (var k = si; k <= pathSegs.length; k++) {
+                            if (bunMatchSegments(patternSegs, pathSegs, pi + 1, k)) return true;
+                        }
+                        return false;
+                    }
+                    if (si >= pathSegs.length) return false;
+                    if (!bunCompileSegmentRegex(seg).test(pathSegs[si])) return false;
+                    return bunMatchSegments(patternSegs, pathSegs, pi + 1, si + 1);
+                }
+
+                function bunGlobMatchOne(pattern, path) {
+                    return bunMatchSegments(pattern.split('/'), path.split('/'), 0, 0);
+                }
+
+                function bunGlobMatch(pattern, path) {
+                    var alts = bunExpandBraces(pattern);
+                    for (var i = 0; i < alts.length; i++) {
+                        if (bunGlobMatchOne(alts[i], path)) return true;
+                    }
+                    return false;
+                }
+
+                function bunGlobHasDotSegment(path) {
+                    var segs = path.split('/');
+                    for (var i = 0; i < segs.length; i++) {
+                        if (segs[i].length > 0 && segs[i].charAt(0) === '.') return true;
+                    }
+                    return false;
+                }
+
+                // Manual recursive directory walk rather than java.nio.file.Files.walk's
+                // varargs FileVisitOption overload — sidesteps any ambiguity around passing a
+                // JS array through a Java varargs parameter via GraalJS interop, at the cost
+                // of no protection against symlink cycles when followSymlinks:true (accepted
+                // shim-scope limitation; real Bun presumably guards against this itself).
+                function bunGlobCollectPaths(startDir, followSymlinks) {
+                    var results = [];
+                    (function walk(dir) {
+                        var stream = JFiles.newDirectoryStream(dir);
+                        try {
+                            var it = stream.iterator();
+                            while (it.hasNext()) {
+                                var p = it.next();
+                                results.push(p);
+                                var isSymlink = JFiles.isSymbolicLink(p);
+                                var isDir = JFiles.isDirectory(p);
+                                if (isDir && (!isSymlink || followSymlinks)) {
+                                    walk(p);
+                                }
+                            }
+                        } finally {
+                            stream.close();
+                        }
+                    })(startDir);
+                    return results;
+                }
+
+                // See this section's own doc comment above for why this isn't simply
+                // `JFiles.isRegularFile(p)` (which follows symlinks by default).
+                function bunIsFileForOnlyFilesFilter(p, followSymlinks) {
+                    if (JFiles.isRegularFile(p, JLinkOption.NOFOLLOW_LINKS)) return true;
+                    if (followSymlinks && JFiles.isSymbolicLink(p) && JFiles.isRegularFile(p)) return true;
+                    return false;
+                }
+
+                function bunGlobScanEntries(pattern, options) {
+                    options = (typeof options === 'string') ? { cwd: options } : (options || {});
+                    var cwd = options.cwd ? String(options.cwd) : String(JSystem.getProperty('user.dir'));
+                    var dot = !!options.dot;
+                    var absolute = !!options.absolute;
+                    var onlyFiles = options.onlyFiles === undefined ? true : !!options.onlyFiles;
+                    var followSymlinks = !!options.followSymlinks;
+
+                    var cwdPath = JPaths.get(cwd);
+                    if (!JFiles.exists(cwdPath)) {
+                        throw new Error("ENOENT: no such file or directory, scandir '" + cwd + "'");
+                    }
+
+                    var allPaths = bunGlobCollectPaths(cwdPath, followSymlinks);
+                    var results = [];
+                    for (var i = 0; i < allPaths.length; i++) {
+                        var p = allPaths[i];
+                        var rel = cwdPath.relativize(p).toString().split(JFile.separator).join('/');
+                        if (!dot && bunGlobHasDotSegment(rel)) continue;
+                        if (onlyFiles && !bunIsFileForOnlyFilesFilter(p, followSymlinks)) continue;
+                        if (!bunGlobMatch(pattern, rel)) continue;
+                        results.push(absolute ? p.toAbsolutePath().normalize().toString() : rel);
+                    }
+                    return results;
+                }
+
+                function Glob(pattern) {
+                    this.pattern = String(pattern);
+                }
+                Glob.prototype.match = function (path) {
+                    return bunGlobMatch(this.pattern, String(path));
+                };
+                Glob.prototype.scanSync = function (options) {
+                    return bunGlobScanEntries(this.pattern, options)[Symbol.iterator]();
+                };
+                Glob.prototype.scan = function (options) {
+                    var pattern = this.pattern;
+                    return (async function* () {
+                        var entries = bunGlobScanEntries(pattern, options);
+                        for (var i = 0; i < entries.length; i++) yield entries[i];
+                    })();
+                };
+
+                // --- Bun.${'$'} (Bun Shell) ---
+                //
+                // HONEST SCOPE NOTE: real Bun ships its own from-scratch, cross-platform
+                // shell interpreter (works even on Windows) with built-in Zig
+                // implementations of common coreutils (`ls`/`cat`/`echo`/`sort`/`rm`/`mv`/
+                // `cp`/`mkdir`/`pwd`/`which`/`seq`/`yes`/...) that don't depend on ${'$'}PATH at
+                // all — confirmed by probing real bun 1.3.13: `` ${'$'}`sort` ``.env({FOO:'bar'})
+                // still finds `sort` and works even though `.env()` REPLACES the entire
+                // visible environment, dropping PATH entirely. This shim instead shells out
+                // to the real host `/bin/sh -c "<command>"` via ProcessBuilder — a
+                // deliberate, documented trade-off:
+                //   * genuine POSIX pipes (`|`), `&&`/`||`, redirection (`>`, `>>`), and
+                //     command substitution (`${'$'}(...)`) come "for free" from the real shell —
+                //     all confirmed against real bun's own behavior first (pipes/&&/||/
+                //     redirection/command-substitution probes all matched), then confirmed to
+                //     also work via a plain `/bin/sh -c`.
+                //   * in exchange, this depends on external binaries actually being on
+                //     ${'$'}PATH — unlike real Bun's built-in coreutils — and is NOT
+                //     cross-platform (no Windows; there is no `/bin/sh` there).
+                //   * because of the PATH dependency, `.env(...)` here MERGES onto the
+                //     current process's environment rather than fully replacing it the way
+                //     real Bun's `.env()` does (safe for real Bun only because its shell
+                //     builtins don't need PATH at all) — an explicit, documented divergence
+                //     rather than a silent one.
+                //   * real Bun's own shell-builtin glob expansion (bare, uninterpolated
+                //     words like `*.txt` inside a command) is NOT reimplemented here — glob
+                //     expansion of literal/unquoted words is left to whatever `/bin/sh` does
+                //     with them (on Linux, a bare shell typically does NOT expand globs
+                //     itself without `bash`'s glob support enabled — this is a known,
+                //     documented gap, not a claim of parity).
+                //
+                // Interpolation (`` ${'$'}`cmd ${'$'}{value}` ``) is ALWAYS inserted as a single
+                // shell-quoted literal argument, never re-parsed as shell syntax — verified
+                // against real bun with injection payloads (`${'$'}(...)`, a backtick command,
+                // `; ...`, `&& ...`, a bare `*.txt` glob) that all came back through `echo`
+                // completely unexpanded/uninterpreted, i.e. real Bun's interpolation does not
+                // word-split or evaluate shell metacharacters in interpolated values. This
+                // shim reproduces that by POSIX-single-quoting each interpolated value
+                // (`'` -> `'\''`) before splicing it into the command string handed to
+                // `/bin/sh -c`, which gives the same "always literal" guarantee under a real
+                // POSIX shell. An interpolated Array is joined with spaces, each element
+                // quoted individually — matches real bun's `` ${'$'}`echo ${'$'}{["x","y","z"]}` ``
+                // -> `"x y z"` probe.
+                function bunShellQuote(value) {
+                    if (Array.isArray(value)) {
+                        return value.map(bunShellQuote).join(' ');
+                    }
+                    var s = String(value);
+                    return "'" + s.split("'").join("'\\''") + "'";
+                }
+
+                function bunBuildShellCommand(strings, values) {
+                    var out = strings[0];
+                    for (var i = 0; i < values.length; i++) {
+                        out += bunShellQuote(values[i]);
+                        out += strings[i + 1];
+                    }
+                    return out;
+                }
+
+                function ShellError(message, exitCode, stdoutBuf, stderrBuf) {
+                    Error.call(this, message);
+                    this.name = 'ShellError';
+                    this.message = message;
+                    this.exitCode = exitCode;
+                    this.stdout = stdoutBuf;
+                    this.stderr = stderrBuf;
+                }
+                ShellError.prototype = Object.create(Error.prototype);
+                ShellError.prototype.constructor = ShellError;
+
+                // Wraps a captured Java byte[] as a Uint8Array with Bun's own
+                // `.text()`/`.json()` convenience methods (plus a `.toString()` override so
+                // ``${'$'}`...`.text()`` and direct `String(result.stdout)` both do the sensible
+                // UTF-8 decode) — same shape convention as the push-based stream used by
+                // Bun.spawn's stdout/stderr elsewhere in this file.
+                function bunMakeShellBuffer(jByteArray) {
+                    var len = jByteArray.length;
+                    var arr = new Uint8Array(len);
+                    for (var i = 0; i < len; i++) arr[i] = jByteArray[i] & 0xFF;
+                    arr.toString = function () {
+                        return String(new JString(jsBytesToJava(this), JCharset.UTF_8));
+                    };
+                    arr.text = function () { return this.toString(); };
+                    arr.json = function () { return JSON.parse(this.toString()); };
+                    return arr;
+                }
+
+                function bunShellExec(commandStr, opts) {
+                    var pb = new JProcessBuilder(toJavaStringList(['/bin/sh', '-c', commandStr]));
+                    if (opts.cwd) pb.directory(new JFile(String(opts.cwd)));
+                    if (opts.env) {
+                        // MERGES onto the inherited environment rather than replacing it —
+                        // see this section's own doc comment for why (real bun's shell
+                        // builtins don't need PATH; ours, backed by /bin/sh, does).
+                        var jEnv = pb.environment();
+                        for (var k in opts.env) {
+                            if (Object.prototype.hasOwnProperty.call(opts.env, k) && opts.env[k] !== undefined) {
+                                jEnv.put(String(k), String(opts.env[k]));
+                            }
+                        }
+                    }
+                    pb.redirectInput(JRedirect.from(devNullFile()));
+                    var jProcess;
+                    try {
+                        jProcess = pb.start();
+                    } catch (e) {
+                        throw new Error('mycelium: Bun.${'$'} failed to launch /bin/sh — ' + e.message);
+                    }
+                    var stdoutBytes = readAllBytes(jProcess.getInputStream());
+                    var stderrBytes = readAllBytes(jProcess.getErrorStream());
+                    var exitCode = jProcess.waitFor();
+
+                    if (!opts.quiet) {
+                        if (stdoutBytes.length > 0) JSystem.out.write(stdoutBytes, 0, stdoutBytes.length);
+                        JSystem.out.flush();
+                        if (stderrBytes.length > 0) JSystem.err.write(stderrBytes, 0, stderrBytes.length);
+                        JSystem.err.flush();
+                    }
+
+                    var stdout = bunMakeShellBuffer(stdoutBytes);
+                    var stderr = bunMakeShellBuffer(stderrBytes);
+
+                    if (exitCode !== 0 && !opts.nothrow) {
+                        throw new ShellError('Failed with exit code ' + exitCode, exitCode, stdout, stderr);
+                    }
+                    return { exitCode: exitCode, stdout: stdout, stderr: stderr };
+                }
+
+                function ShellPromise(commandStr, opts) {
+                    this._commandStr = commandStr;
+                    this._opts = opts;
+                    this._promise = null;
+                }
+                ShellPromise.prototype._run = function () {
+                    if (!this._promise) {
+                        var self = this;
+                        this._promise = new Promise(function (resolve, reject) {
+                            try {
+                                resolve(bunShellExec(self._commandStr, self._opts));
+                            } catch (e) {
+                                reject(e);
+                            }
+                        });
+                    }
+                    return this._promise;
+                };
+                ShellPromise.prototype.quiet = function () { this._opts.quiet = true; return this; };
+                ShellPromise.prototype.nothrow = function () { this._opts.nothrow = true; return this; };
+                ShellPromise.prototype.cwd = function (dir) { this._opts.cwd = dir; return this; };
+                ShellPromise.prototype.env = function (envObj) { this._opts.env = envObj; return this; };
+                ShellPromise.prototype.then = function (onFulfilled, onRejected) {
+                    return this._run().then(onFulfilled, onRejected);
+                };
+                ShellPromise.prototype.catch = function (onRejected) {
+                    return this._run().catch(onRejected);
+                };
+                ShellPromise.prototype.finally = function (onFinally) {
+                    return this._run().finally(onFinally);
+                };
+                ShellPromise.prototype.text = function () {
+                    return this._run().then(function (r) { return r.stdout.toString(); });
+                };
+                ShellPromise.prototype.json = function () {
+                    return this.text().then(function (t) { return JSON.parse(t); });
+                };
+                ShellPromise.prototype.arrayBuffer = function () {
+                    return this._run().then(function (r) {
+                        var ab = new ArrayBuffer(r.stdout.length);
+                        new Uint8Array(ab).set(r.stdout);
+                        return ab;
+                    });
+                };
+
+                function bunShellTag(strings) {
+                    var values = Array.prototype.slice.call(arguments, 1);
+                    var commandStr = bunBuildShellCommand(strings, values);
+                    return new ShellPromise(commandStr, {});
+                }
+
+                // --- Bun.resolveSync() / Bun.resolve() ---
+                //
+                // Verified against real Bun 1.3.13: `Bun.resolveSync(specifier, parent)`
+                // resolves a relative specifier (with or without an extension, including
+                // directory-index resolution, e.g. `./pkg` -> `.../pkg/index.js`) against
+                // `parent` (a directory) to an absolute path, throws a (real-bun:
+                // `ResolveMessage`; here: plain `Error`) on an unresolvable specifier, and —
+                // notably — reports a Node core module with a `node:`-prefix (e.g.
+                // `Bun.resolveSync('fs', dir)` -> `'node:fs'`) rather than a bare name.
+                // `Bun.resolve` is the same resolution, async (returns a Promise).
+                //
+                // Rather than reimplementing Node/npm module resolution a second time, this
+                // delegates to the exact same resolver that already backs CJS
+                // `require.resolve` (`__mycelium_require_resolve__`, wired in Mycelium's
+                // `init` — see InterceptingFileSystem.resolveRequireSpecifier /
+                // CjsRuntime.resolveRequireSpecifier), which already implements extensionless
+                // resolution, directory-index resolution, node_modules package resolution,
+                // and core-module recognition. The only adaptation needed here is the
+                // `node:`-prefix Bun applies to core modules (the shared resolver returns the
+                // bare specifier unchanged for those, matching Node's own `require.resolve`
+                // convention instead).
+                function bunResolveSync(specifier, parent) {
+                    if (typeof globalThis.__mycelium_require_resolve__ !== 'function') {
+                        throw new Error('mycelium: Bun.resolveSync is unavailable (no CJS resolver binding)');
+                    }
+                    var parentStr = String(parent);
+                    var parentDir = parentStr;
+                    try {
+                        var pPath = JPaths.get(parentStr);
+                        if (JFiles.exists(pPath) && !JFiles.isDirectory(pPath)) {
+                            var parentParent = pPath.getParent();
+                            if (parentParent !== null) parentDir = parentParent.toString();
+                        }
+                    } catch (e) { /* best-effort — fall through with parentStr as-is */ }
+
+                    var specStr = String(specifier);
+                    var resolved;
+                    try {
+                        resolved = globalThis.__mycelium_require_resolve__(specStr, parentDir);
+                    } catch (e) {
+                        throw new Error("Cannot find module '" + specStr + "' from '" + parentStr + "'");
+                    }
+                    var isBare = specStr.charAt(0) !== '.' && specStr.charAt(0) !== '/';
+                    if (isBare && resolved === specStr) {
+                        return 'node:' + resolved;
+                    }
+                    return resolved;
+                }
+
+                function bunResolve(specifier, parent) {
+                    return new Promise(function (resolve, reject) {
+                        try {
+                            resolve(bunResolveSync(specifier, parent));
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
+                }
+
+                // --- Bun.pathToFileURL() / Bun.fileURLToPath() ---
+                //
+                // Verified against real Bun 1.3.13: `Bun.pathToFileURL(path)` returns a
+                // `file://`-scheme `URL` object (`.href` a plain `file:///abs/path` string
+                // for an absolute input path); `Bun.fileURLToPath(url)` accepts either a
+                // `URL` object or a `file:`-scheme string and returns the plain filesystem
+                // path. Backed by `java.nio.file.Path`'s own `.toUri()`/`Paths.get(URI)`
+                // rather than hand-rolled URL-encoding logic.
+                function bunPathToFileURL(path) {
+                    var p = JPaths.get(String(path)).toAbsolutePath().normalize();
+                    return new URL(String(p.toUri().toString()));
+                }
+
+                function bunFileURLToPath(url) {
+                    var href = (url && typeof url === 'object' && typeof url.href === 'string') ? url.href : String(url);
+                    var JURI = Java.type('java.net.URI');
+                    var uri = new JURI(href);
+                    if (uri.getScheme() !== 'file') {
+                        throw new TypeError("mycelium: Bun.fileURLToPath expects a 'file:' URL, got '" + href + "'");
+                    }
+                    return String(JPaths.get(uri).toString());
+                }
+
                 // --- Bun.argv / Bun.version / Bun.revision / Bun.env ---
                 //
                 // Bun.argv's shape matches Node's process.argv convention: [execPath,
@@ -3635,6 +4134,12 @@ class Mycelium(
                     deflateSync: bunDeflateSync,
                     inflateSync: bunInflateSync,
                     stringWidth: bunStringWidth,
+                    Glob: Glob,
+                    ${'$'}: bunShellTag,
+                    resolveSync: bunResolveSync,
+                    resolve: bunResolve,
+                    pathToFileURL: bunPathToFileURL,
+                    fileURLToPath: bunFileURLToPath,
                 };
             })();
         """.trimIndent()

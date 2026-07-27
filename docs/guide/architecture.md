@@ -77,8 +77,9 @@ plug into.
 Supporting infrastructure shared across all five clients:
 
 - **`PackageCache`** — content-verified (checksum), hardlink-based, content-addressable at
-  the per-file level (SHA-256), keyed `XDG_CACHE_HOME/mycelium/packages/<ecosystem>/<name>/
-  <version>`. Handles four archive shapes transparently (npm `.tgz`, PyPI sdist/crates.io
+  the per-file level (SHA-256), keyed
+  `XDG_CACHE_HOME/mycelium/packages/<ecosystem>/<name>/<version>`. Handles four archive
+  shapes transparently (npm `.tgz`, PyPI sdist/crates.io
   `.tar.gz`, a PyPI wheel `.whl` as a flat ZIP, a Go module `.zip`, a RubyGems `.gem`'s
   nested tar).
 - **`HttpMetadataCache`** — ETag/conditional-GET caching layered onto every registry client,

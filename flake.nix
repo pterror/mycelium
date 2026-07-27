@@ -38,6 +38,9 @@
             llvmPackages.clang
             rustc
             tinygo
+            # For docs/ (VitePress site, see .github/workflows/deploy-docs.yml):
+            # `cd docs && bun install && bun run build`.
+            bun
           ];
           # graalvm-ce's setup hook exports JAVA_HOME, which would otherwise
           # win over the JDK 21 baked into the wrapped `gradle` above (Gradle

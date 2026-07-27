@@ -16,7 +16,7 @@ This document evaluates whether SpongePowered's Mixin library is worth integrati
 
 ### PatchDsl Overview
 
-Mycelium has a working, hand-written mod loader (`mod-loader/` module) with a custom **PatchDsl** — a Kotlin DSL that wraps ASM bytecode manipulation to provide common patterns:
+Mycelium has a working, hand-written mod loader (`mods/mod-loader/` module) with a custom **PatchDsl** — a Kotlin DSL that wraps ASM bytecode manipulation to provide common patterns:
 
 - `redirectCallsTo(owner, method).to(newOwner, newName)` — Replace all calls to a method with calls to a different one
 - `afterCallsTo(owner, method) { ... }` — Splice bytecode after a method call
@@ -29,20 +29,20 @@ Mycelium has a working, hand-written mod loader (`mod-loader/` module) with a cu
 
 Six working mods currently use PatchDsl:
 
-1. **cursed-addition** (`example-mod/`) — Patches `JSAddNodeGen` to add 1 to integer addition results
+1. **cursed-addition** (`mods/example-mod/`) — Patches `JSAddNodeGen` to add 1 to integer addition results
    - Uses both `redirectCallsTo` (to a replacement method) and `afterCallsTo` (for instruction splicing)
    - ~90 lines of code, straightforward
 
-2. **null-safe** (`null-safe-mod/`) — Makes `null.foo` and `null[index]` return `undefined` instead of throwing
+2. **null-safe** (`mods/null-safe-mod/`) — Makes `null.foo` and `null[index]` return `undefined` instead of throwing
    - Uses `atMethodEntry` with complex control flow and **manual StackMapTable frame construction** (the main pain point)
    - ~265 lines; ~70 lines are frame-related boilerplate
    - Two target classes with different patch strategies
 
-3. **strict-equality** (`strict-equality-mod/`) — Makes `==` behave like `===`
+3. **strict-equality** (`mods/strict-equality-mod/`) — Makes `==` behave like `===`
    - Single `redirectCallsTo` call
    - ~30 lines, minimal complexity
 
-4. **integer-division** (`integer-division-mod/`) — Makes `/` truncate toward zero (C-style)
+4. **integer-division** (`mods/integer-division-mod/`) — Makes `/` truncate toward zero (C-style)
    - Wholesale method replacement via `atMethodEntry`
    - **Heavy use of manual StackMapTable frames** for multiple branch targets
    - ~205 lines; ~90 lines are frame-related

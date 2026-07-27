@@ -29,7 +29,10 @@ export default withMermaid(
         },
         {
           text: 'Reference',
-          items: [{ text: 'Language support', link: '/reference/languages' }],
+          items: [
+            { text: 'Language support', link: '/reference/languages' },
+            { text: 'Bun compatibility', link: '/reference/bun-compat' },
+          ],
         },
         {
           text: 'Mods',

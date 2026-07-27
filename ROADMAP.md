@@ -228,13 +228,25 @@ native language after JS/Ruby).
 ## Medium term
 
 ### Bun/Deno compatibility
-- Runtime detection is **designed but not implemented**: lockfile/config-based, in priority
-  order Node → Bun → Deno (short-circuit on first match; Node signals always checked first
-  since a project with mixed signals is treated as Node — the best-tested path).
-- Present exactly one runtime's globals per package — never expose `Bun`/`Deno`/Node globals
-  simultaneously (a package with inconsistent internal detection order would enter an
-  untested mixed-codepath state).
-- Bun globals/APIs: `Bun.serve`, `Bun.file`, `Bun.spawn`, etc. — not started.
+- Bun runtime detection: **implemented** (`BunRuntime.kt`) — lockfile/config-based
+  (`bun.lockb`/`bunfig.toml`, Node signals `package-lock.json`/`pnpm-lock.yaml`/`yarn.lock`
+  checked first and win outright) plus a `bun:`-prefixed import/require specifier anywhere
+  in the source as an independent signal. Deno detection is not implemented at all yet — the
+  three-way Node → Bun → Deno priority order is still the intended design, but only the Node/
+  Bun half of it exists in code today.
+- Bun's globals are layered on top of Node's, not exclusive with them — Node-compat globals
+  (`process`/`Buffer`/`URL`/...) stay injected unconditionally regardless of Bun detection,
+  matching real Bun (which itself implements most of Node's global surface). The "never
+  expose more than one runtime's globals at once" principle below is about Bun vs. Deno,
+  not about hiding Node compat from a detected-Bun script.
+- Present exactly one of {Bun, Deno} globals per package — never expose both `Bun` and
+  `Deno` globals simultaneously (a package with inconsistent internal detection order would
+  enter an untested mixed-codepath state).
+- Bun globals/APIs: `Bun.serve`, `Bun.file`, `Bun.env`, `Bun.argv`, `Bun.version`,
+  `Bun.revision` — **implemented**, first slice. `Bun.spawn`/`Bun.write`/`Bun.$`/`Bun.hash`/
+  `Bun.password`/`Bun.build`/`Bun.Transpiler`/`Bun.dlopen`/`bun:ffi`/`bun:sqlite`/`bun:test`/
+  WebSocket support and the rest of Bun's much larger real API surface — not started. See
+  `docs/reference/bun-compat.md` for the full, checked-against-upstream breakdown.
 - Deno globals/APIs: `Deno.readFile`, `Deno.serve`, `Deno.permissions`, etc. — not started.
 - JSR registry support for Deno packages — not started.
 - Strategic framing: Node compat is the trojan horse; polyglot is the payload.

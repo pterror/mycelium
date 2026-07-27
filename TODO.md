@@ -465,13 +465,24 @@ versions, this could be straightforward packaging; if unstable, it's an ongoing 
 burden. This is the practical ceiling on the GraalVM version bump (see "GraalVM version"
 above) — matters because it blocks moving off 25.0.0 for as long as it's unresolved.
 
-### Bun/Deno runtime compat — confirmed goal, not started
-Confirmed as an actual goal ("you have code? we run code"), not just a nice-to-have. Detection
-should be import-based, not just lockfile-based: `bun:`-prefixed imports imply Bun, URL imports
-imply Deno, cross-runtime branching code should fall through to the Node path (safest, most-
-tested fallback) — see "Bun/Deno Compatibility Strategy" above for the fuller detection-order
-rationale already agreed on. The API surface for `Bun.*`/`Deno.*` globals is well-documented
-upstream but large. No implementation work started yet.
+### Bun/Deno runtime compat — Bun first slice implemented; Deno not started
+Bun side: implemented. `BunRuntime.kt` does the detection (lockfile/config signals, Node
+checked first per "Bun/Deno Compatibility Strategy" above, plus a `bun:`-prefixed import/
+require specifier anywhere in the source as an independent signal — the "import-based, not
+just lockfile-based" detection this entry used to call for); `BUN_INIT_SCRIPT` in
+`Mycelium.kt` injects a `Bun` global (only when detected, layered on top of the
+unconditional Node-compat globals, never replacing them) covering `Bun.file`, `Bun.serve`
+(backed by the same `com.sun.net.httpserver.HttpServer` primitive as `http.mjs`), `Bun.env`
+(aliases `process.env`), `Bun.argv`, `Bun.version`/`Bun.revision`. Deliberately excludes
+`Bun.dlopen`/`bun:ffi` (needs a JVM foreign-function mechanism — unrelated to Node's N-API)
+and `Bun.sqlite`/`bun:sqlite` (needs a JVM SQLite binding as a new dependency — same open
+question as Node's own `node:sqlite`), plus a long tail of Bun's real ~100+-member `Bun`
+object (`Bun.write`, `Bun.spawn`, `Bun.$`, `Bun.hash`, `Bun.password`, `Bun.build`,
+`Bun.Transpiler`, WebSocket support, ...) — see `docs/reference/bun-compat.md` for the
+checked-against-upstream "what's NOT supported" list, and `BunCompatTest.kt` for coverage
+including golden values obtained from a real `bun` 1.3.13 binary. Deno side: still not
+started at all (separate follow-up task, deliberately untouched by the Bun work) — the API
+surface for `Deno.*` globals remains well-documented upstream but large.
 
 ### Value proposition — advanced this session, not settled
 Previously "genuinely unclear beyond 'it's funny.'" This session explored it extensively and

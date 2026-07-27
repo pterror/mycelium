@@ -1,0 +1,146 @@
+# Bun compatibility
+
+Mycelium can run a small, deliberately partial subset of the [Bun](https://bun.sh) runtime's
+global API on top of GraalJS, the same way it already implements Node-compat globals
+(`process`, `Buffer`, `URL`, timers, ...) and 50+ Node core-module shims — see
+[Language support](./languages.md) for the Node side.
+
+This is a **first pass**, scoped narrowly on purpose. Read the "Not supported" section below
+before assuming any given Bun API works.
+
+## Runtime detection
+
+Unlike Node-compat globals (injected into every JS `Context` unconditionally), the `Bun`
+global is only injected when Mycelium detects the script being run/imported actually looks
+like Bun code. Detection checks, in priority order (Node signals always win — a directory
+with both a Bun signal and a Node signal is treated as Node, the best-tested path):
+
+1. **Node signals** (checked first, per the "Node is the trojan horse" strategy): a
+   `package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock` in the entry file's directory or any
+   ancestor — if found, `Bun` is **not** injected, even if a Bun signal is also present.
+2. **Bun signals**: a `bun.lockb` (Bun's binary lockfile — presence alone is checked, its
+   contents are never parsed) or `bunfig.toml` in the entry file's directory or any ancestor.
+3. **Source-level signal**: a `bun:`-prefixed import/require specifier anywhere in the
+   source being evaluated (`import ... from "bun:sqlite"`, `require("bun:ffi")`,
+   `import("bun:test")`, ...) — checked independently of the filesystem signals above, so a
+   single file using a `bun:` import gets `Bun` injected even with no lockfile around it.
+
+Node's own globals (`process`, `Buffer`, `URL`, ...) are **not** hidden when Bun is detected —
+a detected-Bun script sees both, matching real Bun (which also implements most of Node's
+global surface for compat).
+
+Deno detection/globals are a separate, unimplemented follow-up — this page and its
+implementation only ever decide "is this Bun", never "is this Deno".
+
+## What's supported
+
+### `Bun.file(path)`
+
+Returns a `BunFile`-like object. Bypasses Mycelium's `InterceptingFileSystem` entirely and
+reads directly via `java.nio.file.Files`/`Paths` — the same intentional bypass the
+`node-stdlib/fs.mjs` shim uses, and (verified against real Bun) it means a **relative** path
+resolves against the JVM process's actual working directory, not the importing script's own
+directory — matching real Bun, which also resolves `Bun.file`'s relative paths against
+`process.cwd()`, not the script's directory.
+
+- `.text()` — `Promise<string>`. Rejects with an `ENOENT`-shaped error for a missing file
+  (`.code === "ENOENT"`, message `"ENOENT: no such file or directory, open '<path>'"`) —
+  verified against real Bun 1.3.13.
+- `.exists()` — `Promise<boolean>`. `false` for a missing file, never rejects.
+- `.arrayBuffer()` — `Promise<ArrayBuffer>`. Same ENOENT rejection as `.text()` for a missing
+  file.
+- `.json()` — `Promise<any>`, sugar over `.text()` + `JSON.parse`.
+- `.size` — lazily stat'd; `0` for a missing file (not `NaN`/an exception).
+- `.type` — a MIME-type guess based purely on the file extension (never stats the file, so a
+  missing file still gets a guessed type) — verified against real Bun 1.3.13 for: `json`,
+  `txt`, `html`, `js`, `mjs`, `ts`, `css`, `md`, `xml`, `csv`, `png`, `jpg`/`jpeg`, `gif`,
+  `svg`, `wasm`, `pdf`, `zip`, and no/unknown extension (`application/octet-stream`). Real
+  Bun uses a much larger `mime-db`-backed table; anything outside this list falls back to
+  `application/octet-stream` rather than a further guess.
+- `.stream()` is **not implemented**.
+
+### `Bun.serve({ fetch, port, hostname, development, error })`
+
+Backed by the same `com.sun.net.httpserver.HttpServer` primitive as the `node-stdlib/http.mjs`
+shim's `Server` class (single JDK server, one request at a time — see that file's own
+single-threaded-Context caveat, which this inherits identically).
+
+- `fetch(req, server)` receives a minimal Fetch-API-shaped `Request` (`.method`, `.url`
+  as an absolute URL string, `.headers` — a `Headers`-like object with `.get`/`.set`/`.has`,
+  `.text()`/`.json()`/`.arrayBuffer()`/`.clone()`).
+- Returning a `Response` (constructor: `new Response(body, { status, statusText, headers })`,
+  with `.status`/`.headers`/`.text()`/`.json()`/`.ok`) sends it back verbatim.
+- Returning something that isn't a `Response` is treated as **success**, not an error —
+  verified against real Bun 1.3.13: status 200, body exactly `"Welcome to Bun! To get
+  started, return a Response object."`
+- A thrown/rejected `fetch` is logged to stderr and answered with a fixed 500 response —
+  verified against real Bun 1.3.13 with `development: false`: body exactly `"Something went
+  wrong!"`, `Content-Type: text/plain`. This shim **always** behaves like
+  `development: false`; real Bun's actual dev-mode default is a large inline HTML error
+  overlay, which is deliberately not replicated.
+- An `error(err)` option, if provided, is tried first (sync or async); falling through to
+  the fixed 500 above if it itself throws/rejects or returns nothing.
+- Default port (when `port` is omitted) is `3000`, matching Bun's documented default.
+  `Request`/`Response`/`Headers` are injected as bare globals too (only within a
+  Bun-detected script — they are not leaked into plain Node-compat scripts).
+- Returned server handle: `.port`, `.hostname`, `.development`, `.url`, `.fetch`, `.stop()`,
+  `.reload({ fetch })`.
+- **Not implemented**: WebSocket upgrades (`server.upgrade(req)`), TLS options, unix socket
+  listening, `idleTimeout`, request/response streaming bodies (bodies are read/written
+  fully-buffered, never as a `ReadableStream`).
+
+### `Bun.env`
+
+The exact same object as `process.env` (`Bun.env === process.env` is `true`, verified against
+real Bun 1.3.13) — reads/writes go through the same env-override-tracking proxy
+`PROCESS_INIT_SCRIPT` already sets up, not a separate implementation.
+
+### `Bun.argv`
+
+Shape matches Node's `process.argv` convention: `[execPath, scriptPath, ...args]` — verified
+against real Bun 1.3.13 (`bun run script.js foo bar` reports
+`[<bun binary path>, <script path>, "foo", "bar"]`). Mycelium's shim can only reconstruct the
+first two elements: `argv[0]` comes from `ProcessHandle.current().info().command()` (the
+running JVM launcher's own path — not a real `bun` binary path, since there isn't one),
+`argv[1]` is the entry script's path when run via `Mycelium.runFile` (absent when the Bun
+global was instead triggered via `Mycelium.evalModule`, which has no file path to report).
+**No trailing CLI arguments are available at all** — Mycelium doesn't thread real process
+argv through to guest code today (this is also why plain `process.argv` is unconditionally
+`[]`; `Bun.argv` inherits the same limitation rather than fabricating values).
+
+### `Bun.version` / `Bun.revision`
+
+Non-empty, semver-shaped strings (`"1.3.13"` / an opaque revision marker) — explicitly
+**not** a claim that Mycelium replicates that Bun release's behavior; the task's own scope
+only required "plausible", not "matching your installed Bun".
+
+## Not supported
+
+Everything below is genuinely absent — not stubbed, not throwing a clear "not implemented"
+error in every case, just not there. This list was checked against Bun's own published API
+reference (not assumed from memory) and is **not exhaustive** — Bun's real `Bun` object has
+well over 100 top-level members; only the ones most likely to be reached for are called out
+by name:
+
+- **`Bun.dlopen` / `bun:ffi`** — would need a JVM-side foreign-function mechanism (Java's
+  Foreign Function & Memory API, or JNI). This is unrelated to Node's N-API (the ABI Node
+  uses to load compiled `.node` addons) — conflating the two would be a factual error. Out of
+  scope here because implementing FFI on the JVM is a separate, nontrivial effort, full stop.
+- **`Bun.sqlite` / `bun:sqlite`** — would need a JVM SQLite binding (e.g. `sqlite-jdbc`) as a
+  new dependency, plus a binding-shape decision. Not Bun-specific: Node's own `node:sqlite`
+  has the identical open question in `TODO.md`.
+- **`Bun.write`**, **`Bun.spawn`/`Bun.spawnSync`**, **`Bun.$`** (shell), **`Bun.hash`**,
+  **`Bun.password`**, **`Bun.build`**, **`Bun.Transpiler`**, **`Bun.Glob`**,
+  **`Bun.S3Client`/`Bun.s3`**, **`Bun.redis`**, **`Bun.SQL`/`Bun.sql`**, **`Bun.CryptoHasher`**,
+  **`Bun.color`**, **`Bun.semver`**, **`Bun.Cookie`/`Bun.CookieMap`**, **`Bun.Worker`**,
+  **`Bun.connect`/`Bun.listen`/`Bun.udpSocket`** (raw TCP/UDP), **`Bun.FileSystemRouter`**,
+  **`Bun.plugin`**, **`Bun.peek`**, **`Bun.deepEquals`/`Bun.deepMatch`** — none implemented.
+- **`bun:test`** — Bun's built-in test runner is not available; Mycelium has no Bun-specific
+  test-runner integration.
+- WebSocket support anywhere (`Bun.serve`'s `server.upgrade`, `new WebSocket(...)`,
+  `Bun.serve`'s `websocket` handler option).
+- `Bun.serve`'s streaming request/response bodies, TLS, unix sockets, `idleTimeout`.
+- Deno compatibility (`Deno.*`) — a separate, unimplemented follow-up; not attempted here at
+  all, including no detection logic for it.
+
+If a script needs any of the above today, it needs to run under real Bun/Node, not Mycelium.

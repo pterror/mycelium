@@ -528,6 +528,14 @@ class Mycelium(
         val code = if (language == "js") CoreModuleRegistry.normalizeCoreModuleSpecifiers(rawCode) else rawCode
         val source = Source.newBuilder(language, code, path).build()
         val dir = file.absoluteFile.parentFile.toPath()
+        // Bun-compat globals (the `Bun` object — see BUN_INIT_SCRIPT) are injected only
+        // when this specific entry file/project looks like Bun code, layered on top of the
+        // Node-compat globals injected unconditionally in `init` above — see
+        // BunRuntime.detect's own doc comment for why Node-compat itself stays
+        // unconditional rather than being made part of the same conditional.
+        if (language == "js") {
+            maybeInjectBunGlobals(dir.toFile(), code, path)
+        }
         filesystem.withSourceDirectory(dir) { context.eval(source) }
         // Mirrors Node: the process (here, this call) stays alive only as long as a ref'd
         // timer/handle remains pending — evaluating the entry file above may have
@@ -579,8 +587,32 @@ class Mycelium(
         // string, not resolved as a file through the FileSystem).
         val normalizedCode = if (languageId == "js") CoreModuleRegistry.normalizeCoreModuleSpecifiers(code) else code
         tmpFile.writeText(normalizedCode)
+        // Same conditional Bun-globals injection as runFile — see that method's own
+        // comment and BunRuntime.detect's doc comment. No entry-file path is available
+        // here (the source is an in-memory string, not a file the caller named), so the
+        // project-directory signal check falls back to this Mycelium instance's own `cwd`
+        // (or the JVM's real working directory when `cwd` is null, matching every other
+        // cwd fallback in this class).
+        if (languageId == "js") {
+            maybeInjectBunGlobals(cwd?.let { File(it) }, normalizedCode, null)
+        }
         val source = Source.newBuilder(languageId, tmpFile).build()
         return context.eval(source)
+    }
+
+    // Shared by runFile/evalModule — see their own comments. Evaluates BUN_INIT_SCRIPT
+    // (idempotent: it no-ops if `globalThis.Bun` already exists) only when BunRuntime.detect
+    // says this particular script/project looks like Bun code. `scriptPath`, when known
+    // (runFile has one; evalModule's in-memory module body doesn't), backs Bun.argv's
+    // second element the same way real Bun's argv[1] is the script path — see
+    // BUN_INIT_SCRIPT's own comment for why argv can't do much better than this without
+    // Mycelium threading real CLI args through to guest code at all (it currently doesn't;
+    // process.argv is `[]` unconditionally for the same reason, see PROCESS_INIT_SCRIPT).
+    private fun maybeInjectBunGlobals(projectDir: File?, source: String, scriptPath: String?) {
+        if (!jsAvailable) return
+        if (!BunRuntime.detect(projectDir, source)) return
+        context.getBindings("js").putMember("__mycelium_bun_script_path__", scriptPath ?: "")
+        context.eval("js", BUN_INIT_SCRIPT)
     }
 
     fun getBindings(languageId: String): org.graalvm.polyglot.Value =
@@ -1156,6 +1188,469 @@ class Mycelium(
                         globalThis.URLSearchParams = urlModule.URLSearchParams;
                     }
                 }
+            })();
+        """.trimIndent()
+
+        // Bun-compat globals — the `Bun` object real Bun scripts assume exists ambiently,
+        // matching the same "assume npm/Bun packages reach for a bare global" rationale as
+        // PROCESS_INIT_SCRIPT/GLOBAL_BUFFER_INIT_SCRIPT/GLOBAL_URL_INIT_SCRIPT above, except
+        // this one is injected *conditionally* — only when Mycelium.maybeInjectBunGlobals
+        // decides (via BunRuntime.detect) that the script being run/imported looks like Bun
+        // code, never unconditionally like the Node-compat globals. Idempotent (bails out
+        // immediately if `globalThis.Bun` already exists) so it's safe to eval on every
+        // Bun-detected runFile/evalModule call without re-defining classes each time.
+        //
+        // Deliberately a partial slice of Bun's real API surface — scope was fixed by the
+        // task this was implemented under, and explicitly excludes (not started, not
+        // stubbed, just absent): `Bun.dlopen`/`bun:ffi` (would need a JVM-side foreign-
+        // function mechanism — Java's Foreign Function & Memory API or JNI — unrelated to
+        // Node-addon N-API, which is a different thing entirely and does not block this),
+        // `Bun.sqlite`/`bun:sqlite` (would need a JVM SQLite binding, e.g. sqlite-jdbc, as a
+        // new dependency — same open question TODO.md already has for Node's own
+        // `node:sqlite`), `Bun.write`, `Bun.spawn`/`Bun.spawnSync`, `Bun.$` (shell), `Bun.hash`,
+        // `Bun.password`, `Bun.build`, `Bun.Transpiler`, `bun:test`, and WebSocket upgrade
+        // support in `Bun.serve` — see docs/reference/bun-compat.md for the authoritative,
+        // checked-against-upstream list of what is/isn't covered.
+        //
+        // Golden values below (MIME-type guesses, the non-Response-return placeholder body,
+        // the default-error-response body, ENOENT error shape, Bun.argv's shape) were
+        // obtained by running a real `bun` 1.3.13 binary (via `nix develop -c bun run
+        // <script>`, this repo's flake.nix devShell) against small probe scripts during
+        // development — not assumed from memory. See BunCompatTest.kt for the equivalent
+        // assertions and a note on which behaviors could/couldn't be cross-checked this way.
+        private val BUN_INIT_SCRIPT = """
+            (function () {
+                if (typeof globalThis.Bun !== 'undefined') return;
+
+                var JFiles = Java.type('java.nio.file.Files');
+                var JPaths = Java.type('java.nio.file.Paths');
+                var JString = Java.type('java.lang.String');
+                var JCharset = Java.type('java.nio.charset.StandardCharsets');
+                var JByteArray = Java.type('byte[]');
+                var JHttpServer = Java.type('com.sun.net.httpserver.HttpServer');
+                var JInetSocketAddress = Java.type('java.net.InetSocketAddress');
+                var JProcessHandle = Java.type('java.lang.ProcessHandle');
+
+                function toJByteArray(str) {
+                    var buf = JCharset.UTF_8.encode(String(str));
+                    var len = buf.remaining();
+                    var bytes = new JByteArray(len);
+                    buf.get(bytes);
+                    return bytes;
+                }
+
+                function readAllBytes(inputStream) {
+                    if (inputStream === null) return new JByteArray(0);
+                    var JByteArrayOutputStream = Java.type('java.io.ByteArrayOutputStream');
+                    var baos = new JByteArrayOutputStream();
+                    var chunk = new JByteArray(8192);
+                    var n;
+                    while ((n = inputStream.read(chunk, 0, chunk.length)) !== -1) {
+                        baos.write(chunk, 0, n);
+                    }
+                    inputStream.close();
+                    return baos.toByteArray();
+                }
+
+                // Verified against real `bun` 1.3.13 (`Bun.file(name).type` for a touched,
+                // empty file of each extension — see the BunCompatTest.kt comment citing the
+                // exact probe script). Extensions not in this table (including ones not
+                // individually re-verified, like .htm/.jsx/.tsx/.cjs) fall back to
+                // 'application/octet-stream' rather than guessing further — real Bun uses a
+                // much larger mime-db-backed table this intentionally does not replicate in
+                // full.
+                var MIME_TYPES = {
+                    json: 'application/json;charset=utf-8',
+                    txt: 'text/plain;charset=utf-8',
+                    html: 'text/html;charset=utf-8',
+                    js: 'text/javascript;charset=utf-8',
+                    mjs: 'text/javascript;charset=utf-8',
+                    ts: 'text/javascript;charset=utf-8',
+                    css: 'text/css;charset=utf-8',
+                    md: 'text/markdown',
+                    xml: 'application/xml',
+                    csv: 'text/csv',
+                    png: 'image/png',
+                    jpg: 'image/jpeg',
+                    jpeg: 'image/jpeg',
+                    gif: 'image/gif',
+                    svg: 'image/svg+xml',
+                    wasm: 'application/wasm',
+                    pdf: 'application/pdf',
+                    zip: 'application/zip',
+                };
+
+                function guessMimeType(path) {
+                    var idx = path.lastIndexOf('.');
+                    if (idx === -1 || idx === path.length - 1) return 'application/octet-stream';
+                    var ext = path.slice(idx + 1).toLowerCase();
+                    return MIME_TYPES[ext] || 'application/octet-stream';
+                }
+
+                // Matches real Bun's ENOENT shape for a missing-file read (verified: `name`
+                // 'Error', `code` 'ENOENT', message "ENOENT: no such file or directory, open
+                // '<path>'") — same convention Node's own `fs` shims elsewhere in this
+                // codebase already use for missing-file errors.
+                function notFoundError(path) {
+                    var err = new Error("ENOENT: no such file or directory, open '" + path + "'");
+                    err.code = 'ENOENT';
+                    err.errno = -2;
+                    err.path = path;
+                    err.syscall = 'open';
+                    return err;
+                }
+
+                // --- Bun.file() ---
+
+                function BunFile(path) {
+                    this._path = String(path);
+                }
+                BunFile.prototype = {
+                    get size() {
+                        try {
+                            return Number(JFiles.size(JPaths.get(this._path)));
+                        } catch (e) {
+                            return 0;
+                        }
+                    },
+                    get type() {
+                        // Real Bun infers `.type` from the path alone, even for a file that
+                        // doesn't exist (verified: Bun.file('does-not-exist.json').type is
+                        // still 'application/json;charset=utf-8') — no stat is performed here.
+                        return guessMimeType(this._path);
+                    },
+                    exists: function () {
+                        var p = this._path;
+                        return Promise.resolve().then(function () {
+                            return JFiles.exists(JPaths.get(p));
+                        });
+                    },
+                    text: function () {
+                        var p = this._path;
+                        return Promise.resolve().then(function () {
+                            var jp = JPaths.get(p);
+                            if (!JFiles.exists(jp)) throw notFoundError(p);
+                            var bytes = JFiles.readAllBytes(jp);
+                            return String(new JString(bytes, JCharset.UTF_8));
+                        });
+                    },
+                    arrayBuffer: function () {
+                        var p = this._path;
+                        return Promise.resolve().then(function () {
+                            var jp = JPaths.get(p);
+                            if (!JFiles.exists(jp)) throw notFoundError(p);
+                            var bytes = JFiles.readAllBytes(jp);
+                            var ab = new ArrayBuffer(bytes.length);
+                            var view = new Uint8Array(ab);
+                            for (var i = 0; i < bytes.length; i++) view[i] = bytes[i] & 0xFF;
+                            return ab;
+                        });
+                    },
+                    json: function () {
+                        return this.text().then(function (t) { return JSON.parse(t); });
+                    },
+                };
+
+                // --- Minimal Fetch-API-shaped Request/Response/Headers, just enough for
+                // Bun.serve's fetch(req) => Response contract. Not exposed unconditionally
+                // (only within this Bun-detected script), unlike a real browser/Bun/Deno
+                // runtime, which exposes these as always-on globals — see BunRuntime.kt's
+                // doc comment for why Bun's surface here stays scoped to detected-Bun
+                // scripts rather than leaking into every JS Context.
+
+                function MyceliumHeaders(init) {
+                    this._map = new Map();
+                    if (init) {
+                        if (init instanceof MyceliumHeaders) {
+                            init._map.forEach((function (v, k) { this._map.set(k, v); }).bind(this));
+                        } else if (Array.isArray(init)) {
+                            for (var i = 0; i < init.length; i++) this.set(init[i][0], init[i][1]);
+                        } else {
+                            for (var k in init) if (Object.prototype.hasOwnProperty.call(init, k)) this.set(k, init[k]);
+                        }
+                    }
+                }
+                MyceliumHeaders.prototype.set = function (name, value) {
+                    this._map.set(String(name).toLowerCase(), String(value));
+                };
+                MyceliumHeaders.prototype.get = function (name) {
+                    var v = this._map.get(String(name).toLowerCase());
+                    return v === undefined ? null : v;
+                };
+                MyceliumHeaders.prototype.has = function (name) {
+                    return this._map.has(String(name).toLowerCase());
+                };
+                MyceliumHeaders.prototype.delete = function (name) {
+                    this._map.delete(String(name).toLowerCase());
+                };
+                MyceliumHeaders.prototype.append = function (name, value) {
+                    var key = String(name).toLowerCase();
+                    if (this._map.has(key)) {
+                        this._map.set(key, this._map.get(key) + ', ' + value);
+                    } else {
+                        this._map.set(key, String(value));
+                    }
+                };
+                MyceliumHeaders.prototype.forEach = function (cb) {
+                    this._map.forEach(function (v, k) { cb(v, k); });
+                };
+                MyceliumHeaders.prototype.entries = function () { return this._map.entries(); };
+                MyceliumHeaders.prototype[Symbol.iterator] = function () { return this._map.entries(); };
+
+                function MyceliumRequest(url, init) {
+                    init = init || {};
+                    this.url = String(url);
+                    this.method = String(init.method || 'GET').toUpperCase();
+                    this.headers = init.headers instanceof MyceliumHeaders ? init.headers : new MyceliumHeaders(init.headers);
+                    this._bodyText = init._bodyText !== undefined
+                        ? init._bodyText
+                        : (init.body === undefined || init.body === null ? '' : String(init.body));
+                }
+                MyceliumRequest.prototype.text = function () {
+                    var self = this;
+                    return Promise.resolve().then(function () { return self._bodyText; });
+                };
+                MyceliumRequest.prototype.json = function () {
+                    return this.text().then(function (t) { return JSON.parse(t); });
+                };
+                MyceliumRequest.prototype.arrayBuffer = function () {
+                    var self = this;
+                    return Promise.resolve().then(function () {
+                        var bytes = toJByteArray(self._bodyText);
+                        var ab = new ArrayBuffer(bytes.length);
+                        var view = new Uint8Array(ab);
+                        for (var i = 0; i < bytes.length; i++) view[i] = bytes[i] & 0xFF;
+                        return ab;
+                    });
+                };
+                MyceliumRequest.prototype.clone = function () {
+                    return new MyceliumRequest(this.url, {
+                        method: this.method, headers: this.headers, _bodyText: this._bodyText,
+                    });
+                };
+
+                function MyceliumResponse(body, init) {
+                    init = init || {};
+                    this.status = init.status !== undefined ? init.status : 200;
+                    this.statusText = init.statusText !== undefined ? String(init.statusText) : '';
+                    this.headers = init.headers instanceof MyceliumHeaders ? init.headers : new MyceliumHeaders(init.headers);
+                    if (body === undefined || body === null) {
+                        this._bodyText = '';
+                    } else if (typeof body === 'string') {
+                        this._bodyText = body;
+                        // Matches real Bun/browser fetch default: a bare string body gets a
+                        // text/plain content-type unless the caller already set one
+                        // (verified: `new Response("...")`'s default content-type is
+                        // 'text/plain;charset=utf-8').
+                        if (!this.headers.has('content-type')) {
+                            this.headers.set('content-type', 'text/plain;charset=utf-8');
+                        }
+                    } else {
+                        this._bodyText = String(body);
+                    }
+                    this.ok = this.status >= 200 && this.status < 300;
+                }
+                MyceliumResponse.prototype.text = function () {
+                    var self = this;
+                    return Promise.resolve().then(function () { return self._bodyText; });
+                };
+                MyceliumResponse.prototype.json = function () {
+                    return this.text().then(function (t) { return JSON.parse(t); });
+                };
+
+                if (typeof globalThis.Headers === 'undefined') globalThis.Headers = MyceliumHeaders;
+                if (typeof globalThis.Request === 'undefined') globalThis.Request = MyceliumRequest;
+                if (typeof globalThis.Response === 'undefined') globalThis.Response = MyceliumResponse;
+
+                // --- Bun.serve() ---
+                //
+                // Backed by the same com.sun.net.httpserver.HttpServer primitive as the
+                // node-stdlib http.mjs shim's `Server` class (see that file's own class-level
+                // comment for the single-threaded-Context caveat this inherits: the JDK
+                // server's own accept thread invokes the JS `fetch` handler, which works only
+                // because GraalJS transfers Context ownership to whichever thread calls into
+                // it, and no other thread may concurrently be inside the Context at the same
+                // moment — true here the same way it's true for http.mjs).
+                function bunServe(options) {
+                    options = options || {};
+                    var fetchHandler = options.fetch;
+                    if (typeof fetchHandler !== 'function') {
+                        throw new TypeError('Bun.serve() requires a "fetch" function');
+                    }
+                    var errorHandler = typeof options.error === 'function' ? options.error : null;
+                    var host = options.hostname || '0.0.0.0';
+                    var requestedPort = options.port !== undefined ? Number(options.port) : 3000;
+
+                    var httpServer = JHttpServer.create(new JInetSocketAddress(host, requestedPort), 0);
+                    var displayHost = host === '0.0.0.0' ? 'localhost' : host;
+
+                    httpServer.createContext('/', function (exchange) {
+                        function sendBytes(status, bytes, headers) {
+                            try {
+                                var respHeaders = exchange.getResponseHeaders();
+                                if (headers) headers.forEach(function (v, k) { respHeaders.set(k, v); });
+                                exchange.sendResponseHeaders(status, bytes.length);
+                                if (bytes.length > 0) {
+                                    var out = exchange.getResponseBody();
+                                    out.write(bytes, 0, bytes.length);
+                                    out.close();
+                                } else {
+                                    exchange.getResponseBody().close();
+                                }
+                                exchange.close();
+                            } catch (sendErr) {
+                                // best-effort — nothing more to do if even the error path fails
+                            }
+                        }
+
+                        // Real Bun's default (non-development) fetch-handler-threw response,
+                        // verified against real `bun` 1.3.13 with `development: false`: 500
+                        // status, plain-text body "Something went wrong!", content-type
+                        // text/plain. (Bun's *development-mode* default is a much richer HTML
+                        // error overlay — deliberately not replicated here; this shim always
+                        // behaves like `development: false`.)
+                        function sendDefault500() {
+                            var msg = 'Something went wrong!';
+                            sendBytes(500, toJByteArray(msg), (function () {
+                                var h = new MyceliumHeaders();
+                                h.set('content-type', 'text/plain');
+                                return h;
+                            })());
+                        }
+
+                        function sendResponse(responseLike) {
+                            var response = responseLike instanceof MyceliumResponse
+                                ? responseLike
+                                // Real Bun: a fetch handler returning anything other than a
+                                // Response is treated as *success*, not an error — verified
+                                // with `fetch(){ return "not a response" }` against real bun
+                                // 1.3.13: status 200, this exact placeholder body.
+                                : new MyceliumResponse('Welcome to Bun! To get started, return a Response object.');
+                            sendBytes(response.status, toJByteArray(response._bodyText || ''), response.headers);
+                        }
+
+                        function handleThrown(e) {
+                            console.error('mycelium: Bun.serve fetch handler threw:', e && e.stack ? e.stack : e);
+                            if (errorHandler) {
+                                try {
+                                    var errResult = errorHandler(e);
+                                    if (errResult && typeof errResult.then === 'function') {
+                                        errResult.then(function (r) {
+                                            if (r) sendResponse(r); else sendDefault500();
+                                        }, function () { sendDefault500(); });
+                                        return;
+                                    }
+                                    if (errResult) {
+                                        sendResponse(errResult);
+                                        return;
+                                    }
+                                } catch (e2) {
+                                    // fall through to the default 500 below
+                                }
+                            }
+                            sendDefault500();
+                        }
+
+                        try {
+                            var method = String(exchange.getRequestMethod());
+                            var fullUrl = 'http://' + displayHost + ':' + httpServer.getAddress().getPort()
+                                + String(exchange.getRequestURI().toString());
+                            var bodyBytes = readAllBytes(exchange.getRequestBody());
+                            var bodyText = bodyBytes.length > 0 ? String(new JString(bodyBytes, JCharset.UTF_8)) : '';
+                            var headersInit = {};
+                            var hdrs = exchange.getRequestHeaders();
+                            var it = hdrs.entrySet().iterator();
+                            while (it.hasNext()) {
+                                var entry = it.next();
+                                if (entry.getKey() === null) continue;
+                                var values = entry.getValue();
+                                var joined = [];
+                                var vit = values.iterator();
+                                while (vit.hasNext()) joined.push(String(vit.next()));
+                                headersInit[String(entry.getKey())] = joined.join(', ');
+                            }
+                            var req = new MyceliumRequest(fullUrl, { method: method, headers: headersInit, _bodyText: bodyText });
+
+                            var result;
+                            try {
+                                result = fetchHandler(req, serverHandle);
+                            } catch (syncErr) {
+                                handleThrown(syncErr);
+                                return;
+                            }
+                            if (result && typeof result.then === 'function') {
+                                result.then(sendResponse, handleThrown);
+                            } else {
+                                sendResponse(result);
+                            }
+                        } catch (outerErr) {
+                            try {
+                                exchange.sendResponseHeaders(500, 0);
+                                exchange.close();
+                            } catch (e4) {
+                                // best-effort
+                            }
+                        }
+                    });
+                    httpServer.setExecutor(null);
+                    httpServer.start();
+
+                    var actualPort = httpServer.getAddress().getPort();
+                    var serverHandle = {
+                        port: actualPort,
+                        hostname: host,
+                        development: !!options.development,
+                        fetch: fetchHandler,
+                        get url() {
+                            return new globalThis.URL('http://' + displayHost + ':' + actualPort + '/');
+                        },
+                        stop: function () {
+                            httpServer.stop(0);
+                        },
+                        reload: function (newOptions) {
+                            if (newOptions && typeof newOptions.fetch === 'function') fetchHandler = newOptions.fetch;
+                        },
+                    };
+                    return serverHandle;
+                }
+
+                // --- Bun.argv / Bun.version / Bun.revision / Bun.env ---
+                //
+                // Bun.argv's shape matches Node's process.argv convention: [execPath,
+                // scriptPath, ...args] — verified against real `bun` 1.3.13 (`bun run
+                // script.js foo bar` reports Bun.argv as
+                // [<absolute bun binary path>, <absolute script path>, "foo", "bar"]). This
+                // shim can only reconstruct the first two elements (no extra CLI args are
+                // threaded through Mycelium to guest code at all today — process.argv is `[]`
+                // unconditionally for the same reason, see PROCESS_INIT_SCRIPT above), so
+                // trailing args are simply absent rather than fabricated.
+                var argv = [];
+                try {
+                    var cmdOpt = JProcessHandle.current().info().command();
+                    argv.push(cmdOpt.isPresent() ? String(cmdOpt.get()) : 'bun');
+                } catch (e) {
+                    argv.push('bun');
+                }
+                if (typeof globalThis.__mycelium_bun_script_path__ !== 'undefined' && globalThis.__mycelium_bun_script_path__) {
+                    argv.push(String(globalThis.__mycelium_bun_script_path__));
+                }
+
+                globalThis.Bun = {
+                    // Shares the exact same env source `process.env` already uses (see
+                    // PROCESS_INIT_SCRIPT above, which always runs before this script) rather
+                    // than duplicating the env-reading/mutation-tracking logic.
+                    env: globalThis.process.env,
+                    argv: argv,
+                    // Non-load-bearing per the task scope ("doesn't need to match Bun's actual
+                    // version, just be a non-empty semver-looking string") — set to the
+                    // version of the real `bun` binary this shim was developed/verified
+                    // against (1.3.13, via this repo's flake.nix devShell), not a claim that
+                    // Mycelium actually replicates that exact release's behavior everywhere.
+                    version: '1.3.13',
+                    revision: 'mycelium-bun-compat-shim',
+                    file: function (path) { return new BunFile(path); },
+                    serve: bunServe,
+                };
             })();
         """.trimIndent()
     }

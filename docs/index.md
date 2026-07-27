@@ -7,8 +7,11 @@ hero:
   tagline: One shared Context for JS, Ruby, Lua, and compiled/compile-to-JS languages, with npm/PyPI/RubyGems import and a JVM-level mod loader for changing language semantics itself.
   actions:
     - theme: brand
-      text: Mod authoring guide
-      link: /mod-authoring
+      text: Getting started
+      link: /guide/getting-started
+    - theme: alt
+      text: Language support
+      link: /reference/languages
     - theme: alt
       text: View on GitHub
       link: https://github.com/pterror/mycelium
@@ -24,4 +27,11 @@ features:
     details: Bytecode-patches Truffle/GraalJS runtime classes at class-load time to change language semantics — null-safe access, strict equality, C-style integer division, proper tail calls, operator overloading.
 ---
 
-See the [README](https://github.com/pterror/mycelium#readme) for the full feature list, build/run instructions, and architecture overview. `TODO.md` and `ROADMAP.md` in the repo root are the project's ground-truth session log and forward-looking plan.
+**Pre-alpha, actively evolving, not published anywhere** — there is no release yet; you run
+Mycelium from source via Gradle. See [Getting Started](/guide/getting-started) to build and
+run it, [Architecture](/guide/architecture) for how the runtime is put together,
+[Language support](/reference/languages) for what each of the 18 importable languages can
+and can't do today, and [Mods](/mods/) for the JVM-level mod system. The
+[README](https://github.com/pterror/mycelium#readme) has the full feature list; `TODO.md`
+and `ROADMAP.md` in the repo root are the project's ground-truth session log and
+forward-looking plan, respectively, and take precedence over this site if anything drifts.

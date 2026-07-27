@@ -1207,10 +1207,12 @@ class Mycelium(
         // Node-addon N-API, which is a different thing entirely and does not block this),
         // `Bun.sqlite`/`bun:sqlite` (would need a JVM SQLite binding, e.g. sqlite-jdbc, as a
         // new dependency — same open question TODO.md already has for Node's own
-        // `node:sqlite`), `Bun.write`, `Bun.spawn`/`Bun.spawnSync`, `Bun.$` (shell), `Bun.hash`,
-        // `Bun.password`, `Bun.build`, `Bun.Transpiler`, `bun:test`, and WebSocket upgrade
-        // support in `Bun.serve` — see docs/reference/bun-compat.md for the authoritative,
-        // checked-against-upstream list of what is/isn't covered.
+        // `node:sqlite`), `Bun.$` (shell), `Bun.hash`, `Bun.password`, `Bun.build`,
+        // `Bun.Transpiler`, `bun:test`, and WebSocket upgrade support in `Bun.serve` — see
+        // docs/reference/bun-compat.md for the authoritative, checked-against-upstream list
+        // of what is/isn't covered. `Bun.write` and `Bun.spawn`/`Bun.spawnSync` *are*
+        // implemented below (see their own comments) — verified against real `bun` 1.3.13
+        // via small probe scripts, same discipline as everything else in this file.
         //
         // Golden values below (MIME-type guesses, the non-Response-return placeholder body,
         // the default-error-response body, ENOENT error shape, Bun.argv's shape) were
@@ -1230,6 +1232,10 @@ class Mycelium(
                 var JHttpServer = Java.type('com.sun.net.httpserver.HttpServer');
                 var JInetSocketAddress = Java.type('java.net.InetSocketAddress');
                 var JProcessHandle = Java.type('java.lang.ProcessHandle');
+                var JProcessBuilder = Java.type('java.lang.ProcessBuilder');
+                var JRedirect = Java.type('java.lang.ProcessBuilder${'$'}Redirect');
+                var JArrayList = Java.type('java.util.ArrayList');
+                var JFile = Java.type('java.io.File');
 
                 function toJByteArray(str) {
                     var buf = JCharset.UTF_8.encode(String(str));
@@ -1351,6 +1357,444 @@ class Mycelium(
                     },
                 };
 
+                // --- Bun.write() ---
+                //
+                // Verified against real Bun 1.3.13: `Bun.write(path, data)` returns a
+                // `Promise<number>` of bytes written, accepts a plain string, an
+                // ArrayBuffer/TypedArray, or anything with an `.arrayBuffer()` method
+                // (a `Bun.file()`-returned `BunFile`, or a `Response`) as `data`, and —
+                // notably unlike Node's `fs.writeFile`/`fs.promises.writeFile` — silently
+                // *creates any missing parent directories* rather than rejecting with
+                // ENOENT (verified: `Bun.write('nosuchdir/out.txt', 'x')` succeeds and
+                // creates `nosuchdir/`).
+
+                // Converts a JS byte-value array-like (plain Array or any TypedArray view)
+                // into a Java byte[] — same signed/unsigned wraparound convention already
+                // used by node-stdlib/child_process.mjs's own toJByteArray helper (JS values
+                // 0-255 map onto Java's signed byte range).
+                function jsBytesToJava(view) {
+                    var bytes = new JByteArray(view.length);
+                    for (var i = 0; i < view.length; i++) {
+                        var v = view[i];
+                        bytes[i] = v > 127 ? v - 256 : v;
+                    }
+                    return bytes;
+                }
+
+                // Normalizes any of Bun.write()'s accepted "data" shapes down to a Java
+                // byte[], as a Promise (synchronous for string/ArrayBuffer/TypedArray;
+                // asynchronous — via the source's own `.arrayBuffer()` — for a BunFile or
+                // Response source).
+                function javaBytesFromWriteData(data) {
+                    if (typeof data === 'string') {
+                        return Promise.resolve(toJByteArray(data));
+                    }
+                    if (data instanceof ArrayBuffer) {
+                        return Promise.resolve(jsBytesToJava(new Uint8Array(data)));
+                    }
+                    if (ArrayBuffer.isView(data)) {
+                        return Promise.resolve(jsBytesToJava(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
+                    }
+                    if (data && typeof data.arrayBuffer === 'function') {
+                        return data.arrayBuffer().then(function (ab) { return jsBytesToJava(new Uint8Array(ab)); });
+                    }
+                    return Promise.resolve(toJByteArray(String(data)));
+                }
+
+                function bunWrite(destination, data) {
+                    var pathStr = String(destination);
+                    return javaBytesFromWriteData(data).then(function (jBytes) {
+                        var jp = JPaths.get(pathStr);
+                        var parent = jp.getParent();
+                        if (parent !== null) JFiles.createDirectories(parent);
+                        JFiles.write(jp, jBytes);
+                        return jBytes.length;
+                    });
+                }
+
+                // --- Bun.spawn() / Bun.spawnSync() ---
+                //
+                // Backed by java.lang.ProcessBuilder, the same primitive
+                // node-stdlib/child_process.mjs uses — see that file's own doc comment for
+                // the pipe-deadlock/thread-safety caveats this inherits identically:
+                // spawnSync reads stdout to completion before starting on stderr (a real
+                // concurrent-drain implementation would avoid the classic full-pipe
+                // deadlock, same simplification already accepted elsewhere in this
+                // codebase), and the async spawn() path polls via globalThis.setTimeout
+                // ticks rather than a dedicated Java Thread, for the exact
+                // single-Context-ownership reason documented in that file (a bare `Thread`
+                // started from guest code has no guaranteed clean shot at re-entering the
+                // GraalJS Context and can silently die before its own try/catch runs;
+                // `setTimeout`'s own one-shot-daemon-thread machinery doesn't hit this).
+                //
+                // Scope intentionally narrower than child_process.mjs and real Bun: only
+                // the string stdio modes 'pipe'/'ignore'/'inherit' are supported for
+                // stdin/stdout/stderr (not a numeric fd, not a Bun.file()/Blob redirect
+                // target, not options.timeout). `Subprocess#stdout`/`#stderr` (when
+                // 'pipe') are a deliberately simplified push-based stream-like object
+                // (supports `.getReader()`, `.text()`/`.arrayBuffer()`/`.json()`, and
+                // async-iteration) rather than a true WHATWG ReadableStream instance —
+                // `instanceof ReadableStream` is false here unless the script also
+                // separately imports node:stream/web's own class. Real Bun's
+                // `Subprocess#stdout` genuinely is a WHATWG ReadableStream; this shim's
+                // simplification is documented, not silently passed off as the real thing.
+
+                // POSIX signal-number -> name table, used to decode a terminated child's
+                // raw exit status (128+signum, the same convention `sh`/most shells use for
+                // a signal-killed child, and what Java's Process#waitFor()/#exitValue()
+                // themselves already return on Linux — Java exposes no other way to learn
+                // "was this a signal" short of this exact heuristic, since it doesn't wrap
+                // the raw POSIX wait status). Verified against real Bun 1.3.13: a child that
+                // self-terminates via a SIGTERM sent to its own pid reports
+                // `exitCode: null, signalCode: 'SIGTERM'` from spawnSync — this heuristic
+                // reproduces that.
+                var SIGNAL_NAMES = {
+                    1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 4: 'SIGILL', 5: 'SIGTRAP',
+                    6: 'SIGABRT', 7: 'SIGBUS', 8: 'SIGFPE', 9: 'SIGKILL', 10: 'SIGUSR1',
+                    11: 'SIGSEGV', 12: 'SIGUSR2', 13: 'SIGPIPE', 14: 'SIGALRM', 15: 'SIGTERM',
+                    16: 'SIGSTKFLT', 17: 'SIGCHLD', 18: 'SIGCONT', 19: 'SIGSTOP', 20: 'SIGTSTP',
+                    21: 'SIGTTIN', 22: 'SIGTTOU', 23: 'SIGURG', 24: 'SIGXCPU', 25: 'SIGXFSZ',
+                    26: 'SIGVTALRM', 27: 'SIGPROF', 28: 'SIGWINCH', 29: 'SIGIO', 30: 'SIGPWR',
+                    31: 'SIGSYS',
+                };
+                function decodeExitStatus(status) {
+                    if (status !== null && status > 128 && status <= 128 + 64) {
+                        var signum = status - 128;
+                        return { exitCode: null, signalCode: SIGNAL_NAMES[signum] || ('SIG' + signum) };
+                    }
+                    return { exitCode: status, signalCode: null };
+                }
+
+                // Verified against real Bun 1.3.13: Bun.spawn(["nonexistent_cmd"]) throws
+                // *synchronously* (not a rejected `.exited`) with `code` 'ENOENT', `errno`
+                // -2, `path` set to the attempted executable, message exactly
+                // 'Executable not found in ${'$'}PATH: "<cmd>"'.
+                function spawnNotFoundError(file) {
+                    var err = new Error('Executable not found in ${'$'}PATH: "' + file + '"');
+                    err.code = 'ENOENT';
+                    err.errno = -2;
+                    err.path = file;
+                    return err;
+                }
+
+                function validateBunStdioMode(mode, label) {
+                    if (mode !== 'pipe' && mode !== 'ignore' && mode !== 'inherit') {
+                        throw new TypeError(
+                            'mycelium: Bun.spawn/spawnSync "' + label + '" option only supports '
+                            + '"pipe"/"ignore"/"inherit" in this shim (got ' + JSON.stringify(mode) + ')'
+                        );
+                    }
+                }
+
+                function toJavaStringList(arr) {
+                    var list = new JArrayList();
+                    for (var i = 0; i < arr.length; i++) list.add(String(arr[i]));
+                    return list;
+                }
+
+                function devNullFile() {
+                    var plat = globalThis.process && globalThis.process.platform;
+                    return new JFile(plat === 'win32' ? 'NUL' : '/dev/null');
+                }
+
+                function applyBunStdio(pb, spec) {
+                    // spec = [stdinMode, stdoutMode, stderrMode]
+                    if (spec[0] === 'inherit') pb.redirectInput(JRedirect.INHERIT);
+                    else if (spec[0] === 'ignore') pb.redirectInput(JRedirect.from(devNullFile()));
+
+                    if (spec[1] === 'inherit') pb.redirectOutput(JRedirect.INHERIT);
+                    else if (spec[1] === 'ignore') pb.redirectOutput(JRedirect.to(devNullFile()));
+
+                    if (spec[2] === 'inherit') pb.redirectError(JRedirect.INHERIT);
+                    else if (spec[2] === 'ignore') pb.redirectError(JRedirect.to(devNullFile()));
+                }
+
+                function buildBunProcessBuilder(cmd, options) {
+                    if (!Array.isArray(cmd)) throw new TypeError('cmd must be an array');
+                    if (cmd.length === 0) throw new TypeError('cmd must not be empty');
+                    var file = String(cmd[0]);
+                    var args = cmd.slice(1).map(String);
+                    var pb = new JProcessBuilder(toJavaStringList([file].concat(args)));
+                    if (options.cwd) pb.directory(new JFile(String(options.cwd)));
+                    if (options.env) {
+                        var jEnv = pb.environment();
+                        jEnv.clear();
+                        for (var k in options.env) {
+                            if (Object.prototype.hasOwnProperty.call(options.env, k) && options.env[k] !== undefined) {
+                                jEnv.put(String(k), String(options.env[k]));
+                            }
+                        }
+                    }
+                    return { pb: pb, file: file };
+                }
+
+                // A minimal push-based byte stream: NOT a real WHATWG ReadableStream (see
+                // this section's own doc comment above) — just enough surface
+                // (getReader().read(), text/arrayBuffer/json, async-iteration) for the
+                // common "read a spawned process's whole output" use case.
+                function makeByteStream() {
+                    var chunks = [];
+                    var waiters = [];
+                    var closed = false;
+                    var locked = false;
+
+                    function push(u8) {
+                        if (u8.length === 0) return;
+                        if (waiters.length > 0) waiters.shift()({ value: u8, done: false });
+                        else chunks.push(u8);
+                    }
+                    function close() {
+                        closed = true;
+                        while (waiters.length > 0) waiters.shift()({ value: undefined, done: true });
+                    }
+                    function collectAll() {
+                        var reader = stream.getReader();
+                        var parts = [];
+                        function step() {
+                            return reader.read().then(function (r) {
+                                if (r.done) {
+                                    reader.releaseLock();
+                                    var total = 0;
+                                    for (var i = 0; i < parts.length; i++) total += parts[i].length;
+                                    var out = new Uint8Array(total);
+                                    var off = 0;
+                                    for (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }
+                                    return out;
+                                }
+                                parts.push(r.value);
+                                return step();
+                            });
+                        }
+                        return step();
+                    }
+                    var stream = {
+                        locked: false,
+                        getReader: function () {
+                            if (locked) throw new TypeError('mycelium: stream already locked to a reader');
+                            locked = true;
+                            stream.locked = true;
+                            return {
+                                read: function () {
+                                    return new Promise(function (resolve) {
+                                        if (chunks.length > 0) resolve({ value: chunks.shift(), done: false });
+                                        else if (closed) resolve({ value: undefined, done: true });
+                                        else waiters.push(resolve);
+                                    });
+                                },
+                                releaseLock: function () { locked = false; stream.locked = false; },
+                                cancel: function () { return Promise.resolve(); },
+                            };
+                        },
+                        text: function () {
+                            return collectAll().then(function (bytes) {
+                                return String(new JString(jsBytesToJava(bytes), JCharset.UTF_8));
+                            });
+                        },
+                        arrayBuffer: function () {
+                            return collectAll().then(function (bytes) {
+                                var ab = new ArrayBuffer(bytes.length);
+                                new Uint8Array(ab).set(bytes);
+                                return ab;
+                            });
+                        },
+                        json: function () {
+                            return stream.text().then(function (t) { return JSON.parse(t); });
+                        },
+                    };
+                    stream[Symbol.asyncIterator] = function () {
+                        var reader = stream.getReader();
+                        return { next: function () { return reader.read(); } };
+                    };
+                    return { push: push, close: close, stream: stream };
+                }
+
+                function makeStdinSink(jOutputStream) {
+                    return {
+                        write: function (data) {
+                            var jBytes;
+                            if (typeof data === 'string') jBytes = toJByteArray(data);
+                            else if (data instanceof ArrayBuffer) jBytes = jsBytesToJava(new Uint8Array(data));
+                            else if (ArrayBuffer.isView(data)) jBytes = jsBytesToJava(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+                            else jBytes = toJByteArray(String(data));
+                            jOutputStream.write(jBytes, 0, jBytes.length);
+                            jOutputStream.flush();
+                            return jBytes.length;
+                        },
+                        end: function () {
+                            try { jOutputStream.close(); } catch (e) { /* best-effort */ }
+                        },
+                        flush: function () {
+                            try { jOutputStream.flush(); } catch (e) { /* best-effort */ }
+                        },
+                    };
+                }
+
+                function bunSpawn(cmd, options) {
+                    options = options || {};
+                    var stdinMode = options.stdin || 'ignore';
+                    var stdoutMode = options.stdout || 'pipe';
+                    var stderrMode = options.stderr || 'inherit';
+                    validateBunStdioMode(stdinMode, 'stdin');
+                    validateBunStdioMode(stdoutMode, 'stdout');
+                    validateBunStdioMode(stderrMode, 'stderr');
+
+                    var built = buildBunProcessBuilder(cmd, options);
+                    applyBunStdio(built.pb, [stdinMode, stdoutMode, stderrMode]);
+
+                    var jProcess;
+                    try {
+                        jProcess = built.pb.start();
+                    } catch (e) {
+                        throw spawnNotFoundError(built.file);
+                    }
+
+                    var outByteStream = stdoutMode === 'pipe' ? makeByteStream() : null;
+                    var errByteStream = stderrMode === 'pipe' ? makeByteStream() : null;
+
+                    var resolveExited;
+                    var exitedPromise = new Promise(function (res) { resolveExited = res; });
+
+                    var subprocess = {
+                        pid: Number(jProcess.pid()),
+                        stdin: stdinMode === 'pipe' ? makeStdinSink(jProcess.getOutputStream()) : undefined,
+                        stdout: outByteStream ? outByteStream.stream : undefined,
+                        stderr: errByteStream ? errByteStream.stream : undefined,
+                        exitCode: null,
+                        signalCode: null,
+                        killed: false,
+                        exited: exitedPromise,
+                        kill: function (signal) {
+                            if (subprocess.exitCode !== null || subprocess.signalCode !== null) return;
+                            subprocess._killedSignal = signal || 'SIGTERM';
+                            subprocess.killed = true;
+                            if (subprocess._killedSignal === 'SIGKILL' || subprocess._killedSignal === 9) jProcess.destroyForcibly();
+                            else jProcess.destroy();
+                        },
+                    };
+
+                    var outStream = outByteStream ? jProcess.getInputStream() : null;
+                    var errStream = errByteStream ? jProcess.getErrorStream() : null;
+                    var buf = new JByteArray(65536);
+
+                    function pollOnce(inStream, byteStream) {
+                        var avail;
+                        try { avail = inStream.available(); } catch (e) { return false; }
+                        if (avail <= 0) return false;
+                        var n;
+                        try { n = inStream.read(buf, 0, Math.min(buf.length, avail)); } catch (e) { return false; }
+                        if (n <= 0) return false;
+                        var u8 = new Uint8Array(n);
+                        for (var i = 0; i < n; i++) u8[i] = buf[i] & 0xFF;
+                        byteStream.push(u8);
+                        return true;
+                    }
+
+                    function drainRemaining(inStream, byteStream) {
+                        var n;
+                        try {
+                            while ((n = inStream.read(buf)) !== -1) {
+                                var u8 = new Uint8Array(n);
+                                for (var i = 0; i < n; i++) u8[i] = buf[i] & 0xFF;
+                                byteStream.push(u8);
+                            }
+                        } catch (e) { /* best-effort final drain */ }
+                    }
+
+                    function tick() {
+                        var readAny = false;
+                        if (outStream) readAny = pollOnce(outStream, outByteStream) || readAny;
+                        if (errStream) readAny = pollOnce(errStream, errByteStream) || readAny;
+
+                        if (!jProcess.isAlive()) {
+                            if (outStream) drainRemaining(outStream, outByteStream);
+                            if (errStream) drainRemaining(errStream, errByteStream);
+                            if (outByteStream) outByteStream.close();
+                            if (errByteStream) errByteStream.close();
+                            var code;
+                            try { code = jProcess.waitFor(); } catch (e) { code = null; }
+                            if (subprocess._killedSignal) {
+                                subprocess.exitCode = null;
+                                subprocess.signalCode = subprocess._killedSignal;
+                            } else {
+                                var decoded = decodeExitStatus(code);
+                                subprocess.exitCode = decoded.exitCode;
+                                subprocess.signalCode = decoded.signalCode;
+                            }
+                            resolveExited(code);
+                            return;
+                        }
+                        globalThis.setTimeout(tick, readAny ? 0 : 5);
+                    }
+                    globalThis.setTimeout(tick, 0);
+
+                    return subprocess;
+                }
+
+                function readAllBytesSyncBun(inputStream) {
+                    if (inputStream === null || inputStream === undefined) return new JByteArray(0);
+                    var JByteArrayOutputStream = Java.type('java.io.ByteArrayOutputStream');
+                    var baos = new JByteArrayOutputStream();
+                    var chunk = new JByteArray(8192);
+                    var n;
+                    while ((n = inputStream.read(chunk, 0, chunk.length)) !== -1) {
+                        baos.write(chunk, 0, n);
+                    }
+                    return baos.toByteArray();
+                }
+
+                function bunSpawnSync(cmd, options) {
+                    options = options || {};
+                    var stdinMode = options.stdin || 'ignore';
+                    var stdoutMode = options.stdout || 'pipe';
+                    var stderrMode = options.stderr || 'pipe';
+                    validateBunStdioMode(stdinMode, 'stdin');
+                    validateBunStdioMode(stdoutMode, 'stdout');
+                    validateBunStdioMode(stderrMode, 'stderr');
+
+                    var built = buildBunProcessBuilder(cmd, options);
+                    applyBunStdio(built.pb, [stdinMode, stdoutMode, stderrMode]);
+
+                    var jProcess;
+                    try {
+                        jProcess = built.pb.start();
+                    } catch (e) {
+                        throw spawnNotFoundError(built.file);
+                    }
+
+                    var pid = Number(jProcess.pid());
+
+                    if (stdinMode === 'pipe') {
+                        try {
+                            jProcess.getOutputStream().close();
+                        } catch (e) { /* best-effort — the child may not read stdin at all */ }
+                    }
+
+                    // See this section's own doc comment for why stdout is fully drained
+                    // before stderr is even started on, rather than concurrently.
+                    var outBytes = stdoutMode === 'pipe' ? readAllBytesSyncBun(jProcess.getInputStream()) : new JByteArray(0);
+                    var errBytes = stderrMode === 'pipe' ? readAllBytesSyncBun(jProcess.getErrorStream()) : new JByteArray(0);
+
+                    jProcess.waitFor();
+                    var status = jProcess.exitValue();
+                    var decoded = decodeExitStatus(status);
+
+                    function toBuffer(jBytes) {
+                        var u8 = new Uint8Array(jBytes.length);
+                        for (var i = 0; i < jBytes.length; i++) u8[i] = jBytes[i] & 0xFF;
+                        return globalThis.Buffer.from(u8);
+                    }
+
+                    return {
+                        pid: pid,
+                        exitCode: decoded.exitCode,
+                        signalCode: decoded.signalCode,
+                        stdout: toBuffer(outBytes),
+                        stderr: toBuffer(errBytes),
+                        success: decoded.exitCode === 0,
+                        resourceUsage: {},
+                    };
+                }
+
                 // --- Minimal Fetch-API-shaped Request/Response/Headers, just enough for
                 // Bun.serve's fetch(req) => Response contract. Not exposed unconditionally
                 // (only within this Bun-detected script), unlike a real browser/Bun/Deno
@@ -1456,6 +1900,21 @@ class Mycelium(
                 };
                 MyceliumResponse.prototype.json = function () {
                     return this.text().then(function (t) { return JSON.parse(t); });
+                };
+                // Added alongside Bun.write() support (which accepts a Response as a data
+                // source, per real Bun 1.3.13 — verified: `Bun.write(path, new
+                // Response("body"))` writes the body text) — without this, a Response
+                // passed to Bun.write() would fall through to `String(data)` ("[object
+                // Object]") rather than its actual body.
+                MyceliumResponse.prototype.arrayBuffer = function () {
+                    var self = this;
+                    return Promise.resolve().then(function () {
+                        var bytes = toJByteArray(self._bodyText);
+                        var ab = new ArrayBuffer(bytes.length);
+                        var view = new Uint8Array(ab);
+                        for (var i = 0; i < bytes.length; i++) view[i] = bytes[i] & 0xFF;
+                        return ab;
+                    });
                 };
 
                 if (typeof globalThis.Headers === 'undefined') globalThis.Headers = MyceliumHeaders;
@@ -1649,6 +2108,9 @@ class Mycelium(
                     version: '1.3.13',
                     revision: 'mycelium-bun-compat-shim',
                     file: function (path) { return new BunFile(path); },
+                    write: bunWrite,
+                    spawn: bunSpawn,
+                    spawnSync: bunSpawnSync,
                     serve: bunServe,
                 };
             })();

@@ -114,6 +114,83 @@ Non-empty, semver-shaped strings (`"1.3.13"` / an opaque revision marker) — ex
 **not** a claim that Mycelium replicates that Bun release's behavior; the task's own scope
 only required "plausible", not "matching your installed Bun".
 
+### `Bun.write(destination, data)`
+
+Bypasses `InterceptingFileSystem` the same way `Bun.file` does (relative `destination`
+paths resolve against the JVM process's real cwd, not the running script's own directory —
+see `Bun.file`'s note above for the same caveat). Returns `Promise<number>` (bytes
+written), backed by `java.nio.file.Files.write`.
+
+- `data` may be a string, an `ArrayBuffer`/`TypedArray`, or anything with an
+  `.arrayBuffer()` method — this covers a `Bun.file()`-returned `BunFile` and a `Response`
+  (verified against real Bun 1.3.13 that both are valid `Bun.write` sources).
+- **Auto-creates missing parent directories** — verified against real Bun 1.3.13:
+  `Bun.write('nosuchdir/out.txt', 'x')` succeeds and creates `nosuchdir/`, unlike Node's
+  `fs.writeFile`/`fs.promises.writeFile`, which requires the directory to already exist and
+  rejects `ENOENT` otherwise. This shim replicates that exact auto-create behavior via
+  `Files.createDirectories` on the destination's parent before writing.
+- Does **not** support a `Response`/`BunFile` as the *destination* (only as the `data`
+  source) — real Bun's `Bun.write` accepts a `BunFile` destination too (writing to that
+  file's path); this shim only accepts a plain path string as `destination`.
+
+### `Bun.spawn(cmd, options)` / `Bun.spawnSync(cmd, options)`
+
+Backed by `java.lang.ProcessBuilder`, the same primitive `node-stdlib/child_process.mjs`
+uses (see that file's own doc comment, which this inherits identically: `spawnSync` reads
+stdout to completion before stderr, so a command that fills the stderr pipe buffer while
+blocked writing to a full stdout pipe could still hang; the async `spawn()` path polls via
+`globalThis.setTimeout` ticks rather than a dedicated `Thread`, for the same
+GraalJS-Context-reentrancy reason).
+
+- `cmd` must be an array (`["cmd", "arg1", ...]`) — verified against real Bun 1.3.13 that a
+  bare string `cmd` is rejected (`"cmd must be an array"`) and an empty array is rejected
+  (`"cmd must not be empty"`); this shim throws the same `TypeError`s.
+- `options.cwd` / `options.env` are supported (env replaces the child's environment
+  wholesale when provided, matching `child_process.mjs`'s `applyEnv`).
+- `options.stdin` / `options.stdout` / `options.stderr` only support the string modes
+  `'pipe'` / `'ignore'` / `'inherit'` — **not** a numeric fd, not a `Bun.file()`/`Blob`
+  write-target redirection (real Bun supports piping a subprocess's stdout straight to a
+  file), and not `options.timeout`. An unsupported value throws a clear `TypeError` rather
+  than silently misbehaving.
+- Default modes match real Bun 1.3.13 (verified live): `spawn()` defaults to
+  `stdin: 'ignore'`, `stdout: 'pipe'`, `stderr: 'inherit'`; `spawnSync()` defaults to
+  `stdin: 'ignore'`, `stdout: 'pipe'`, `stderr: 'pipe'`.
+- **`Bun.spawn(...)` throws synchronously** (not a rejected `.exited`) when the executable
+  can't be found — verified against real Bun 1.3.13: `code: 'ENOENT'`, `errno: -2`, `path`
+  set to the attempted executable, message exactly
+  `Executable not found in $PATH: "<cmd>"`. `Bun.spawnSync` throws the same shape
+  synchronously too.
+- `Subprocess#stdout`/`#stderr` (when `'pipe'`) are a **deliberately simplified push-based
+  stream-like object** — not a true WHATWG `ReadableStream` instance
+  (`instanceof ReadableStream` is `false` here even though Mycelium separately implements a
+  real one for `node:stream/web`, since this object is a different, simpler class).
+  Supports `.getReader().read()` (standard `{ value, done }` shape), async-iteration, and
+  non-standard convenience helpers `.text()`/`.arrayBuffer()`/`.json()` (real Bun requires
+  wrapping in `new Response(stream)` or `Bun.readableStreamToText(stream)` for the
+  equivalent — these are provided directly as a pragmatic shortcut, not a claim of matching
+  real Bun's surface).
+- `Subprocess#stdin` (when `'pipe'`) is a minimal `{ write(data), end(), flush() }` object,
+  not a real `FileSink`.
+- `Subprocess#exited` is a `Promise<number>` resolving to the process's raw exit status
+  (matching real Bun: a `SIGTERM`-killed child's `.exited` resolves to `143`, i.e.
+  `128 + 15`). `Subprocess#exitCode`/`#signalCode` follow Node's `child_process`
+  convention instead (`exitCode: null, signalCode: 'SIGTERM'` for a signal-terminated
+  child) — verified this exact asymmetry against real Bun 1.3.13.
+- **Signal detection is a heuristic**: a raw exit status in `129..192` is decoded as
+  `128 + signum` and reported as `exitCode: null, signalCode: 'SIG...'`, because Java's
+  `Process` API exposes no other way to learn "this was a signal" (it doesn't expose the
+  raw POSIX wait status the way libuv does). This correctly reproduces real Bun's behavior
+  for the common case (verified: a child that self-terminates via `SIGTERM` reports
+  `exitCode: null, signalCode: 'SIGTERM'` from `spawnSync`, matching real Bun 1.3.13) but is
+  not a guaranteed-correct decode in every case (e.g. a process that legitimately calls
+  `exit(143)` itself, without any signal involved, would be misreported as
+  signal-terminated) — a real wait-status decode would need JNI or similar, out of scope
+  here.
+- `spawnSync`'s `resourceUsage` is always `{}` — real Bun populates OS resource-usage
+  stats here; this shim doesn't (Java's `Process` API has no portable equivalent).
+- `options.timeout`/`killSignal` (present on `node-stdlib/child_process.mjs`'s `spawn`) are
+  **not** implemented for `Bun.spawn`/`Bun.spawnSync`.
+
 ## Not supported
 
 Everything below is genuinely absent — not stubbed, not throwing a clear "not implemented"
@@ -129,8 +206,8 @@ by name:
 - **`Bun.sqlite` / `bun:sqlite`** — would need a JVM SQLite binding (e.g. `sqlite-jdbc`) as a
   new dependency, plus a binding-shape decision. Not Bun-specific: Node's own `node:sqlite`
   has the identical open question in `TODO.md`.
-- **`Bun.write`**, **`Bun.spawn`/`Bun.spawnSync`**, **`Bun.$`** (shell), **`Bun.hash`**,
-  **`Bun.password`**, **`Bun.build`**, **`Bun.Transpiler`**, **`Bun.Glob`**,
+- **`Bun.$`** (shell), **`Bun.hash`**, **`Bun.password`**, **`Bun.build`**,
+  **`Bun.Transpiler`**, **`Bun.Glob`**,
   **`Bun.S3Client`/`Bun.s3`**, **`Bun.redis`**, **`Bun.SQL`/`Bun.sql`**, **`Bun.CryptoHasher`**,
   **`Bun.color`**, **`Bun.semver`**, **`Bun.Cookie`/`Bun.CookieMap`**, **`Bun.Worker`**,
   **`Bun.connect`/`Bun.listen`/`Bun.udpSocket`** (raw TCP/UDP), **`Bun.FileSystemRouter`**,

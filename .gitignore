@@ -17,3 +17,8 @@ build
 .normalize/*
 !.normalize/config.toml
 !.normalize/memory/
+
+# VitePress docs site
+docs/node_modules
+docs/.vitepress/dist
+docs/.vitepress/cache

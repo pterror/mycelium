@@ -32,8 +32,10 @@ up to date every session and are more reliable than any snapshot in this README.
 
 What *is* solid: Node stdlib coverage (50+ modules with export-parity tests against a real
 Node binary), a real npm/CJS/ESM resolver (27/28 packages in the compatibility acid test
-suite pass, including express, fastify, mongoose, pino, and yargs), 17 importable
-languages, and a background daemon that amortizes JVM/GraalVM startup across runs.
+suite pass, including express, fastify, mongoose, pino, and yargs), 18 importable
+languages — including a from-scratch native Lua 5.1 implementation on Truffle, acid-tested
+against real Lua libraries (luaunit, penlight, middleclass, json, inspect, serpent) — and a
+background daemon that amortizes JVM/GraalVM startup across runs.
 
 ## Key features
 
@@ -51,8 +53,14 @@ languages, and a background daemon that amortizes JVM/GraalVM startup across run
   interop and cross-checked against a real Node binary. `process`, `Buffer`, `URL`,
   `TextEncoder`/`TextDecoder`, `crypto.randomUUID`, `queueMicrotask`, and
   `Error.captureStackTrace` are polyfilled as bare globals the way Node exposes them.
-- **17 importable languages**, spanning three execution strategies:
-  - **Native Truffle languages** — JavaScript/TypeScript, Ruby, Python (guest-eval only).
+- **18 importable languages**, spanning three execution strategies:
+  - **Native Truffle languages** — JavaScript/TypeScript, Ruby, Python (guest-eval only),
+    and Lua 5.1 (guest-eval and standalone-file execution; implemented from scratch in
+    `lua/` — parser, tables/metatables, coroutines, and the string/math/table/io/os/debug
+    standard libraries. `LuaTable`/`LuaFunction` don't yet export `InteropLibrary`, so
+    cross-language *member* import of a `.lua` module's exports — `import { add } from
+    "./foo.lua"` — isn't wired up yet; running a `.lua` file directly, or a plain
+    `Polyglot.eval("lua", ...)` that returns a primitive, both work today).
   - **Compiled to LLVM bitcode/WASM** and loaded through GraalVM's LLVM/WebAssembly
     runtimes — C (clang), Rust (rustc), Go (via TinyGo → WASM).
   - **Compiled to plain JS** and executed as an ordinary ES module — CoffeeScript, Civet,
@@ -86,7 +94,10 @@ project directory with direnv/`nix develop` and everything needed is on `PATH`.
 
 # Add more language packs as needed
 ./gradlew :app:jvmRun --args="run path/to/file.rb" -Planguages=js,ruby
-# available packs: js, ruby, python, java, llvm, wasm
+# available packs: js, ruby, python, java, llvm, wasm, lua
+
+# Run a Lua file
+./gradlew :app:jvmRun --args="run path/to/file.lua" -Planguages=lua
 
 # Run tests
 ./gradlew test
@@ -118,6 +129,12 @@ per-language-JAR loading, ~17GB to build, produced an ~887MB binary). JVM mode
   the JS-source Node core-module polyfills, loaded via Java interop.
 - **`app/`** — the CLI entry point (`App.kt`): argument parsing, subcommand dispatch
   (`run`, `compiler`, `daemon`, `version`), and the daemon-vs-in-process routing decision.
+- **`lua/`** — a from-scratch Lua 5.1 implementation on GraalVM Truffle (Java, not Kotlin
+  — Truffle's DSL annotation processor targets Java sources): lexer/parser, AST nodes with
+  Truffle specializations, `LuaTable` (the unified array/hash structure with metatables),
+  coroutines, and the `string`/`math`/`table`/`io`/`os`/`debug`/`package` standard
+  libraries. Registered as language ID `lua`, loaded via the `luaLang` Gradle
+  configuration like any other language pack.
 - **`mod-loader/`** — the generic Java agent (bytecode-patching DSL over ASM) that loads
   and applies mods described by a `mod.json` manifest.
 - **`example-mod/`, `null-safe-mod/`, `strict-equality-mod/`, `integer-division-mod/`,
@@ -132,6 +149,12 @@ GraalVM's `FileSystem` — the only officially sanctioned interception point in 
 polyglot API (there's no module-resolver or `Source`-level hook) — rather than by
 patching GraalJS's module loader or embedding a separate Node.js binary. Everything
 Mycelium does with imports flows through that one seam.
+
+## Docs
+
+`docs/` is a VitePress site (mod authoring guide + research write-ups); run `bun install &&
+bun run dev` inside `docs/` to preview it locally, or see the rendered guide directly:
+[`docs/mod-authoring.md`](docs/mod-authoring.md).
 
 ## Contributing
 

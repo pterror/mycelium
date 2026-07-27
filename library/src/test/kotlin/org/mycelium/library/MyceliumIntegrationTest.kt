@@ -2667,15 +2667,17 @@ class MyceliumIntegrationTest {
 
     // --- Lua 5.1 (org.mycelium.lua — Mycelium's own from-scratch Truffle language) ---
     //
-    // See LuaSupport's own KNOWN LIMITATION doc comment (Languages.kt): LuaTable/LuaFunction
-    // carry no InteropLibrary exports yet, so a Value wrapping either one has no usable
-    // members/executability from another guest language — only plain-primitive (number/
-    // string/boolean/nil) results cross the polyglot boundary today. Every test below is
-    // scoped to what that actually supports: evaluating Lua directly (mc.eval("lua", ...)),
-    // running a standalone .lua file (mc.runFile), and JS/Ruby reaching into Lua (never the
-    // other direction, and never by reading a returned table's fields from outside Lua)
-    // via the target language's own built-in Polyglot.eval, exactly like the existing
-    // Ruby-only chain tests above (chainJsToRubyToJs, etc.) already do for Ruby.
+    // LuaTable/LuaFunction both export InteropLibrary (see LuaSupport's own doc comment in
+    // Languages.kt), so a Value wrapping either one exposes real members/executability to
+    // another guest language — enumerating a returned table's fields and calling a Lua
+    // closure both work from outside Lua. Every test below still includes evaluating Lua
+    // directly (mc.eval("lua", ...)), running a standalone .lua file (mc.runFile), and JS/
+    // Ruby reaching into Lua via the target language's own built-in Polyglot.eval (mirroring
+    // the existing Ruby-only chain tests above, e.g. chainJsToRubyToJs) — plus, further down,
+    // `jsImportsLua`, which verifies genuine cross-language *member* import: JS importing a
+    // named export out of a `.lua` module's returned table via `import { add } from "..."`,
+    // the same mechanism jsImportsC exercises for C. (Lua can only be the *target* of such an
+    // import today, not the *host* — see detectFrame's doc comment on LuaSupport for why.)
 
     @Test fun polyglotEvalLua() {
         val mc = vm
@@ -2761,5 +2763,25 @@ class MyceliumIntegrationTest {
             Polyglot.eval("ruby", 'Polyglot.eval("lua", "return 6 * 7")')
         """)
         assertEquals(42, result.asInt())
+    }
+
+    // --- Cross-language member import: JS importing a Lua module's exports ---
+    //
+    // Verifies that Mycelium's generic ShimGenerator/InterceptingFileSystem cross-import
+    // mechanism (the same `import { name } from "path"` path exercised by jsImportsC above)
+    // works against a `.lua` module's own table return value, exactly like it does for C.
+    // LuaTable/LuaFunction both export InteropLibrary (see LuaTable.java/LuaFunction.java),
+    // so `value.memberKeys`/`value.getMember(k)` in ShimGenerator.generateCrossLanguageShim
+    // enumerate and read a Lua module's `return { ... }` table just like any other guest
+    // language's exports.
+    @Test fun jsImportsLua() {
+        val mc = vm
+        val path = testResourcePath("add.lua")
+        runJsWithImports(mc, """
+            import { add } from "$path";
+            globalThis.__testResult = add(2, 3);
+        """.trimIndent())
+        val result = mc.eval("js", "globalThis.__testResult")
+        assertEquals(5, result.asInt())
     }
 }

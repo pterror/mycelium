@@ -293,7 +293,7 @@ If two mods target the same class, both patches apply — the lower-priority mod
 
 Mycelium includes three example mods in the codebase:
 
-### cursed-addition (example-mod/)
+### cursed-addition (mods/example-mod/)
 
 Patches `JSAddNodeGen` to make integer addition return one extra:
 
@@ -317,7 +317,7 @@ class CursedAdditionTransformer : ModTransformer {
 
 This demonstrates both `redirectCallsTo` (routing to a replacement method) and `afterCallsTo` (splicing bytecode).
 
-### null-safe (null-safe-mod/)
+### null-safe (mods/null-safe-mod/)
 
 Patches property access to return `undefined` instead of throwing when accessing null/undefined:
 
@@ -341,7 +341,7 @@ class NullSafeTransformer : ModTransformer {
 
 This shows a more complex patch using `atMethodEntry` with careful stack frame management.
 
-### strict-equality (strict-equality-mod/)
+### strict-equality (mods/strict-equality-mod/)
 
 Makes `==` behave like `===` by redirecting the factory method:
 

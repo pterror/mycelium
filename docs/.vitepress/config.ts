@@ -24,6 +24,7 @@ export default withMermaid(
           items: [
             { text: 'Getting started', link: '/guide/getting-started' },
             { text: 'Architecture', link: '/guide/architecture' },
+            { text: 'Examples', link: '/guide/examples' },
           ],
         },
         {

@@ -214,6 +214,197 @@ GraalJS-Context-reentrancy reason).
 - `options.timeout`/`killSignal` (present on `node-stdlib/child_process.mjs`'s `spawn`) are
   **not** implemented for `Bun.spawn`/`Bun.spawnSync`.
 
+### `Bun.hash(data, seed?)` / `Bun.hash.*`
+
+Real Bun 1.3.13 exposes `Bun.hash` as a callable (default algorithm: `wyhash`) that also
+carries named sub-algorithms as properties — probed live via `Object.keys(Bun.hash)`:
+`wyhash`, `adler32`, `crc32`, `cityHash32`, `cityHash64`, `xxHash32`, `xxHash64`, `xxHash3`,
+`murmur32v2`, `murmur32v3`, `murmur64v2`, `rapidhash`. None of these are cryptographic, and
+none are implemented by `java.security`/`java.util.zip` — each one had to be hand-ported to
+JS and checked byte-for-byte against real Bun (many input lengths, not just one short
+string), not assumed correct from a reference implementation alone. **Implemented and
+verified bit-exact:**
+
+- **`Bun.hash(data, seed?)`** (bare call) and **`Bun.hash.wyhash(data, seed?)`** — ported from
+  the public "wyhash final4"-era reference algorithm (the same lineage Zig's
+  `std.hash.Wyhash`/Bun's own Zig codebase would plausibly use). Verified against real Bun
+  across 0–200+ byte inputs and both seeded/unseeded calls — every value matched exactly.
+- **`Bun.hash.crc32(data, seed?)`** — standard zlib-flavored CRC-32. `seed` uses zlib's
+  "continuation" convention (register initialized to `seed ^ 0xffffffff`) — verified with
+  several non-zero seeds.
+- **`Bun.hash.adler32(data, seed?)`** — standard Adler-32. **Known real-Bun quirk, replicated
+  deliberately**: real Bun 1.3.13 itself silently *ignores* the `seed` argument for
+  `adler32` (verified: `Bun.hash.adler32(x, 7) === Bun.hash.adler32(x)` for several `x`/seed
+  combinations) — this shim reproduces that exact behavior rather than "fixing" it.
+- **`Bun.hash.murmur32v2`** (MurmurHash2, 32-bit), **`Bun.hash.murmur32v3`** (MurmurHash3
+  x86, 32-bit), **`Bun.hash.murmur64v2`** (MurmurHash2, 64-bit "MurmurHash64A") — verified
+  bit-exact across seeded/unseeded calls and 0–100+ byte inputs.
+- **`Bun.hash.cityHash64(data, seed?)`** — ported from Google's public CityHash v1.1
+  reference (`city.cc`), verified bit-exact across the entire length-dispatch range (0–16,
+  17–32, 33–64, and the >64 iterative-mixing path) and seeded calls. Real Bun's *unseeded*
+  `cityHash64(x)` was empirically confirmed to equal `CityHash64WithSeeds(x, k2, 0)`, **not**
+  plain unseeded `CityHash64(x)` (the two differ) — this shim always goes through the seeded
+  path with `seed` defaulting to `0n`, matching that.
+
+**Deliberately not implemented** (attempted, but not achieved bit-exactly — left out rather
+than risk a silently-wrong hash):
+
+- **`Bun.hash.cityHash32`** — matches real Bun exactly for inputs of 24 bytes or fewer (every
+  length-dispatch branch through `Hash32Len13to24` was verified live), but the >24-byte
+  iterative mixing loop could not be reverse-engineered to bit-exactness from public
+  reference material within reasonable effort (several transcriptions of the loop's
+  rotate/permute/byte-swap sequence were tried and all diverged from real Bun past 24
+  bytes). Rather than ship a hash that's silently wrong for the common case of "the input is
+  longer than 24 bytes", `cityHash32` is absent from `Bun.hash` entirely (`typeof
+  Bun.hash.cityHash32 === 'undefined'`).
+- **`Bun.hash.xxHash32` / `.xxHash64` / `.xxHash3` / `.rapidhash`** — not attempted at all;
+  genuinely absent, not stubbed.
+- Non-string/non-buffer inputs (e.g. a bare number) fall back to `String(data)` +
+  UTF-8-encode, which is **not verified** to match real Bun's own internal encoding for such
+  inputs — only `string`/`ArrayBuffer`/`TypedArray` inputs are checked against live Bun.
+
+### `Bun.CryptoHasher`
+
+Backed by `java.security.MessageDigest` (plain hash mode) and `javax.crypto.Mac` (HMAC mode,
+triggered by passing a `key` as the constructor's 2nd argument — verified against real Bun
+that `new CryptoHasher('sha256', 'key').update(x).digest('hex')` matches a standard
+HMAC-SHA256). `.copy()` uses `MessageDigest`/`Mac`'s own `clone()`. Calling `.digest()` twice
+in a row (no `update()` in between) hashes the empty string the second time — verified this
+matches real Bun exactly, and falls out "for free" from `MessageDigest.digest()`'s own
+documented reset-after-finalize behavior, no special-casing needed.
+
+**Supported algorithms** (`Bun.CryptoHasher.algorithms`): `md5`, `sha1`, `sha224`, `sha256`,
+`sha384`, `sha512`, `sha512-224`, `sha512-256`, `sha3-224`, `sha3-256`, `sha3-384`,
+`sha3-512` — every one a standard JDK `MessageDigest` algorithm, verified bit-exact against
+real Bun for at least `sha256` (chained `.update()` calls) and `md5` (`base64` digest
+encoding). HMAC mode supports the same list except `sha512-224`/`sha512-256` (no standard JDK
+`Mac` algorithm name for those).
+
+**Not supported**: real Bun's `CryptoHasher.algorithms` (probed live) also lists
+`blake2b256`, `blake2b512`, `blake2s256`, `md4`, `ripemd160`, `shake128`, `shake256` — none of
+which are standard `java.security.MessageDigest` algorithms. Supporting them for real would
+need a third-party JCE provider (e.g. Bouncy Castle), which isn't a dependency of this
+project — a genuine "the JVM can't back this out of the box" case, not an oversight.
+Requesting one of these throws a clear error naming the unsupported algorithm rather than
+silently doing the wrong thing.
+
+### `Bun.password`
+
+Real Bun 1.3.13's default algorithm is `argon2id` (verified: a bare `Bun.password.hash(pw)`
+produces a `$argon2id$...` PHC-format string), with `bcrypt` also selectable. **Neither
+argon2 nor bcrypt is implemented by any standard JDK security provider** — supporting them
+for real would need a third-party JCE provider (e.g. Bouncy Castle), which isn't a dependency
+of this project.
+
+What this shim does instead: `.hash()`/`.hashSync()` derive a key via **PBKDF2-HMAC-SHA256**
+(`javax.crypto.SecretKeyFactory`, a real JDK-standard KDF — not faked) at a fixed 210,000
+iterations, and format the output as `$mycelium-pbkdf2-sha256$i=<n>$<salt>$<hash>` (base64) —
+a **Mycelium-specific format**, deliberately **not** real Bun's `$argon2id$.../$2b$...` PHC
+strings. This is intentional: producing an `$argon2id$`-prefixed string that's actually
+PBKDF2 output underneath would be actively misleading to any downstream code/tool that
+inspects the prefix. `algorithm`/`cost`/`memoryCost`/`timeCost` options are accepted (so
+scripts that pass them don't crash) but **ignored** — every hash is always PBKDF2-SHA256
+regardless of what was requested.
+
+`.verify()`/`.verifySync()` **throw a clear error** (rather than silently returning `false`,
+which would look exactly like "wrong password") for any hash string not in this shim's own
+`$mycelium-pbkdf2-sha256$...` format — in particular, **a real-Bun-produced argon2id/bcrypt
+hash cannot be verified by this shim at all**. Hash-and-verify round-trips entirely within
+Mycelium work correctly; interop with real Bun's own password hashes does not.
+
+### `Bun.deepEquals(a, b, strict?)`
+
+Verified against real Bun 1.3.13 across primitives (uses `Object.is` semantics, not
+`==`/`===` — `deepEquals(0, -0)` is `false`, `deepEquals(NaN, NaN)` is `true`), arrays
+(including sparse-array holes treated as `undefined` — `deepEquals([1,,3], [1,undefined,3])`
+is `true`), `Date`/`RegExp`/`Map`/`Set` (the latter two compared order-independently), and
+plain objects. The only behavioral difference `strict` was observed to make: a `strict`
+comparison requires object own-key-sets to match *exactly*, `undefined`-valued keys included
+(`deepEquals({a:1,b:undefined}, {a:1}, true)` is `false`), while non-strict treats a
+`undefined`-valued key as equivalent to an absent one (same call without `true` is `true`).
+Not independently re-derived for every possible JS value shape (e.g. `Proxy` objects,
+getters/setters, non-plain prototypes beyond the built-ins listed above are not
+special-cased) — the shapes above are what was actually checked live.
+
+### `Bun.escapeHTML(value)`
+
+Verified against real Bun 1.3.13: only strings and non-`null` objects are escaped (objects
+are coerced via `String(value)` first, *then* escaped — `escapeHTML({toString(){return
+"<x>"}})` is `"&lt;x&gt;"`); numbers, booleans, `null`, and `undefined` pass through
+completely unchanged — **not stringified** (`escapeHTML(123)` is the number `123`, not the
+string `"123"`); a `Symbol` throws `TypeError: Cannot convert a symbol to a string`, matching
+what an implicit `String(symbol)` coercion does anywhere else in JS.
+
+### `Bun.inspect(value, options?)` / `Bun.inspect.custom`
+
+A best-effort `util.inspect`-style formatter, **not a claim of matching real Bun's exact
+whitespace/line-wrapping**: real Bun's formatter (JavaScriptCore-backed) wraps/pads nested
+values in a particular multi-line, trailing-comma style that would take considerably more
+than this task's effort budget to replicate character-for-character (verified live that it
+does this — e.g. a nested array containing an object gets its own indented block). What this
+shim does aim to match: the general shape code actually depends on — unquoted object keys,
+JS-syntax (single-quoted) string output, `Map`/`Set`/`Date`/`RegExp`/function/class/`bigint`
+formatting, and circular-reference detection (`[Circular *1]`, matching Bun's own marker).
+`Bun.inspect.custom` is `Symbol.for('nodejs.util.inspect.custom')`, verified to match real
+Bun exactly.
+
+**Known, accepted divergence**: `Bun.inspect(errorInstance)` in real Bun produces an
+elaborate colorized source-frame snippet (reading the original source file and pointing at
+the throw site with an arrow) — this shim instead falls back to the error's own `.stack`
+string, a much plainer (but not wrong) rendering.
+
+### `Bun.sleep(ms)` / `Bun.sleepSync(ms)`
+
+`Bun.sleep` returns a `Promise` that resolves after `ms` (via the same host-side
+`TimerManager`-backed `setTimeout` used everywhere else — see `Mycelium.kt`).
+`Bun.sleepSync` blocks the calling thread via `java.lang.Thread.sleep`.
+
+### `Bun.nanoseconds()`
+
+Real Bun measures nanoseconds elapsed since the **process** started, as a plain `number` (not
+a `bigint` — verified). This shim can only measure since `BUN_INIT_SCRIPT` itself was first
+evaluated (the first time a Bun-detected script ran on this Context) — there is no way to
+read the JVM process's own start instant at nanosecond resolution comparable to
+`System.nanoTime()`'s arbitrary epoch (`ProcessHandle.info().startInstant()` is
+millisecond-resolution wall-clock time). Matches real Bun's `number`-not-`bigint` return type
+and its resulting precision loss past 2^53 ns (~104 days).
+
+### `Bun.which(command, options?)`
+
+Synchronous (verified against real Bun 1.3.13 — no `await` needed, returns a plain string or
+`null` directly). `options.PATH` overrides the searched `PATH` — verified: passing a bogus
+`PATH` makes `which('ls')` return `null` even though `ls` is genuinely on the real `PATH`.
+
+### `Bun.randomUUIDv7(encoding?, timestampMs?)`
+
+Verified against real Bun 1.3.13: a 48-bit big-endian millisecond timestamp, a `7` version
+nibble, and the standard variant bits (RFC 9562 UUIDv7 layout). `encoding`:
+`undefined`/`"hex"` both produce the canonical dashed 36-character string (verified — real
+Bun's `"hex"` is **not** a bare 32-hex-digit string, both forms are dashed);
+`"base64"`/`"base64url"` produce the compact 16-byte encoding of the same bits.
+
+### `Bun.gzipSync` / `Bun.gunzipSync` / `Bun.deflateSync` / `Bun.inflateSync`
+
+Verified against real Bun 1.3.13: all four return a plain `Uint8Array` (not a Node `Buffer`,
+not a bare `ArrayBuffer`). Backed by `java.util.zip.Deflater`/`Inflater` (raw `deflate`) and
+`GZIPOutputStream`/`GZIPInputStream` (`gzip`) — standard, interoperable DEFLATE/gzip. An
+exact byte-for-byte match against real Bun's own compressed output is **not** attempted
+(DEFLATE doesn't guarantee one canonical bitstream per input across implementations/
+compression-level choices) — what's verified instead, live, is the property that actually
+matters: real Bun can `gunzipSync` what this shim's `gzipSync` produces, and vice versa
+(interop round-trip in both directions).
+
+### `Bun.stringWidth(str, options?)`
+
+Approximates Bun's `wcwidth`-based terminal display-width calculation: strips ANSI escape
+sequences (unless `options.countAnsiEscapeCodes` is `true`, verified against real Bun to make
+escape-code bytes count toward the width instead of being stripped), then counts most code
+points as width 1 except a curated set of "wide" ranges (CJK, fullwidth forms, common emoji
+blocks) counted as width 2 — verified against real Bun for plain ASCII and a CJK string.
+**Not** a full Unicode East-Asian-Width/emoji-ZWJ-sequence implementation — a code point
+outside the curated wide-ranges list always counts as width 1, which won't match real Bun for
+the long tail of exotic wide/combining/zero-width scripts.
+
 ## Not supported
 
 Everything below is genuinely absent — not stubbed, not throwing a clear "not implemented"
@@ -229,12 +420,26 @@ by name:
 - **`Bun.sqlite` / `bun:sqlite`** — would need a JVM SQLite binding (e.g. `sqlite-jdbc`) as a
   new dependency, plus a binding-shape decision. Not Bun-specific: Node's own `node:sqlite`
   has the identical open question in `TODO.md`.
-- **`Bun.$`** (shell), **`Bun.hash`**, **`Bun.password`**, **`Bun.build`**,
-  **`Bun.Transpiler`**, **`Bun.Glob`**,
-  **`Bun.S3Client`/`Bun.s3`**, **`Bun.redis`**, **`Bun.SQL`/`Bun.sql`**, **`Bun.CryptoHasher`**,
+- **`Bun.$`** (shell), **`Bun.build`**, **`Bun.Transpiler`**, **`Bun.Glob`**,
+  **`Bun.S3Client`/`Bun.s3`**, **`Bun.redis`**, **`Bun.SQL`/`Bun.sql`**,
   **`Bun.color`**, **`Bun.semver`**, **`Bun.Cookie`/`Bun.CookieMap`**, **`Bun.Worker`**,
   **`Bun.connect`/`Bun.listen`/`Bun.udpSocket`** (raw TCP/UDP), **`Bun.FileSystemRouter`**,
-  **`Bun.plugin`**, **`Bun.peek`**, **`Bun.deepEquals`/`Bun.deepMatch`** — none implemented.
+  **`Bun.plugin`**, **`Bun.deepMatch`**, **`Bun.hash.cityHash32`/`.xxHash32`/`.xxHash64`/
+  `.xxHash3`/`.rapidhash`** — none implemented (`Bun.hash`'s other sub-algorithms, plus
+  `CryptoHasher`/`password`/`deepEquals`/`escapeHTML`/`inspect`/`sleep`/`sleepSync`/
+  `nanoseconds`/`which`/`randomUUIDv7`/`gzipSync`-family/`stringWidth`, ARE implemented —
+  see "What's supported" above).
+- **`Bun.peek` / `Bun.peek.status`** — genuinely not implementable purely in JS: real Bun's
+  `peek()` synchronously reads a `Promise`'s internal `[[PromiseState]]`/`[[PromiseResult]]`
+  slots, a JavaScriptCore-specific reflection capability with no ECMAScript-level
+  equivalent. A promise's resolution *value* only becomes observable to script code via a
+  `.then()` reaction, which runs as a microtask — by the time any synchronous code after
+  `Promise.resolve(x)` executes, that reaction hasn't run yet, so there's no way to
+  synchronously "peek" at an arbitrary promise's settled value from pure JS without an
+  engine-level hook. GraalJS's Promise implementation doesn't expose an equivalent hook
+  reachable via `Java.type(...)` interop. Implementing this would need either patching
+  GraalJS internals or waiting a microtask turn (which would silently violate `peek`'s whole
+  synchronous contract) — left unimplemented rather than faked.
 - **`bun:test`** — Bun's built-in test runner is not available; Mycelium has no Bun-specific
   test-runner integration.
 - WebSocket support anywhere (`Bun.serve`'s `server.upgrade`, `new WebSocket(...)`,

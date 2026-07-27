@@ -1207,12 +1207,16 @@ class Mycelium(
         // Node-addon N-API, which is a different thing entirely and does not block this),
         // `Bun.sqlite`/`bun:sqlite` (would need a JVM SQLite binding, e.g. sqlite-jdbc, as a
         // new dependency — same open question TODO.md already has for Node's own
-        // `node:sqlite`), `Bun.$` (shell), `Bun.hash`, `Bun.password`, `Bun.build`,
-        // `Bun.Transpiler`, `bun:test`, and WebSocket upgrade support in `Bun.serve` — see
-        // docs/reference/bun-compat.md for the authoritative, checked-against-upstream list
-        // of what is/isn't covered. `Bun.write` and `Bun.spawn`/`Bun.spawnSync` *are*
-        // implemented below (see their own comments) — verified against real `bun` 1.3.13
-        // via small probe scripts, same discipline as everything else in this file.
+        // `node:sqlite`), `Bun.$` (shell), `Bun.build`, `Bun.Transpiler`, `Bun.Glob`,
+        // `Bun.peek` (see its own section below for exactly why), and `bun:test`, and
+        // WebSocket upgrade support in `Bun.serve` — see docs/reference/bun-compat.md for the
+        // authoritative, checked-against-upstream list of what is/isn't covered. `Bun.write`,
+        // `Bun.spawn`/`Bun.spawnSync`, `Bun.hash`(.*), `Bun.CryptoHasher`, `Bun.password`,
+        // `Bun.deepEquals`, `Bun.escapeHTML`, `Bun.inspect`, `Bun.sleep`/`Bun.sleepSync`,
+        // `Bun.nanoseconds`, `Bun.which`, `Bun.randomUUIDv7`, `Bun.gzipSync`/`gunzipSync`/
+        // `deflateSync`/`inflateSync`, and `Bun.stringWidth` *are* implemented below (see
+        // their own comments) — verified against real `bun` 1.3.13 via small probe scripts,
+        // same discipline as everything else in this file.
         //
         // Golden values below (MIME-type guesses, the non-Response-return placeholder body,
         // the default-error-response body, ENOENT error shape, Bun.argv's shape) were
@@ -2528,6 +2532,1054 @@ class Mycelium(
                     return serverHandle;
                 }
 
+                // --- Bun.hash() / Bun.hash.* ---
+                //
+                // Real Bun 1.3.13 exposes `Bun.hash` as a callable (default algorithm:
+                // `wyhash`, matching its own `Bun.hash.wyhash` bit-for-bit — verified) that
+                // also carries named sub-algorithms as properties:
+                // `wyhash/adler32/crc32/cityHash32/cityHash64/xxHash32/xxHash64/xxHash3/
+                // murmur32v2/murmur32v3/murmur64v2/rapidhash` (probed via
+                // `Object.keys(Bun.hash)` against the real binary). Every one of these is a
+                // non-cryptographic, publicly-specified (or at least reverse-engineerable)
+                // hash algorithm — NOT a case of "the JVM lacks a primitive", just "each one
+                // has to be hand-ported to JS and checked byte-for-byte against real Bun,
+                // since none of them are in java.security/java.util.zip". This section only
+                // implements the subset that was actually verified bit-exact (via small
+                // probe scripts run against real `bun` 1.3.13, comparing every output,
+                // across many input lengths, not just one short string):
+                //   - `crc32` / `adler32`: standard zlib-flavored CRC-32 and Adler-32.
+                //     `crc32` additionally supports the `seed` argument as the zlib
+                //     "continuation" convention (`register = seed ^ 0xffffffff` going in) —
+                //     verified against real Bun with several non-zero seeds. `adler32`'s
+                //     `seed` argument is accepted but real Bun 1.3.13 itself silently
+                //     *ignores* it (verified: `Bun.hash.adler32(x, 7)` ===
+                //     `Bun.hash.adler32(x)` for the same `x`, for several `x`/seed
+                //     combinations) — this is a real-Bun quirk, not a shim bug, and this
+                //     shim replicates that exact (mis)behavior rather than "fixing" it.
+                //   - `murmur32v2` (MurmurHash2, 32-bit), `murmur32v3` (MurmurHash3 x86,
+                //     32-bit), `murmur64v2` (MurmurHash2, 64-bit "MurmurHash64A" variant) —
+                //     all standard/public reference algorithms, verified bit-exact across
+                //     seeded and unseeded calls and many input lengths (0 to 100+ bytes).
+                //   - `wyhash` (and therefore the bare `Bun.hash(data, seed?)` call, which is
+                //     just `wyhash` under a different name) — ported from the public
+                //     "wyhash final4"-era reference algorithm (the same one Zig's
+                //     `std.hash.Wyhash`/Bun's own Zig codebase would plausibly use), verified
+                //     bit-exact across 0..200+ byte inputs and both seeded/unseeded calls.
+                //   - `cityHash64` — ported from Google's public CityHash v1.1 reference
+                //     (`city.cc`), verified bit-exact across the *entire* length-dispatch
+                //     range (0-16, 17-32, 33-64, and the >64 iterative-mixing path) as well
+                //     as seeded calls. Real Bun's unseeded `cityHash64(x)` was empirically
+                //     confirmed to equal `CityHash64WithSeeds(x, k2, 0)`, not plain
+                //     unseeded `CityHash64(x)` (the two differ) — this shim always goes
+                //     through the seeded path with `seed` defaulting to `0n`, matching that.
+                //
+                // Deliberately NOT implemented (attempted, but not achieved bit-exactly, so
+                // left out rather than risk a silently-wrong hash — see
+                // docs/reference/bun-compat.md for the full accounting):
+                //   - `cityHash32`: matches real Bun exactly for inputs of 24 bytes or
+                //     fewer (every length-dispatch branch up to and including
+                //     `Hash32Len13to24` was verified against real Bun), but the >24-byte
+                //     iterative mixing loop could not be reverse-engineered to bit-exactness
+                //     from public reference material within reasonable effort (several
+                //     transcriptions of the loop's rotate/permute/byte-swap sequence were
+                //     tried and all diverged from real Bun on inputs past 24 bytes) — rather
+                //     than ship a hash function that's silently wrong for the common case of
+                //     "the input is longer than 24 bytes", `cityHash32` is left out of this
+                //     shim entirely.
+                //   - `xxHash32` / `xxHash64` / `xxHash3` / `rapidhash`: not attempted at
+                //     all — out of scope given the above already consumed the available
+                //     effort budget for this task; genuinely absent, not stubbed.
+                function makeCrc32Table() {
+                    var table = new Uint32Array(256);
+                    for (var n = 0; n < 256; n++) {
+                        var c = n;
+                        for (var k = 0; k < 8; k++) {
+                            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+                        }
+                        table[n] = c >>> 0;
+                    }
+                    return table;
+                }
+                var CRC32_TABLE = makeCrc32Table();
+
+                function bytesFromHashInput(data) {
+                    if (typeof data === 'string') return new TextEncoder().encode(data);
+                    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+                    if (ArrayBuffer.isView(data)) {
+                        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                    }
+                    // Not verified against real Bun for non-string/non-buffer inputs (e.g. a
+                    // bare number) — real Bun accepts these too but this shim's fallback
+                    // (stringify then UTF-8 encode) is not guaranteed to match its internal
+                    // encoding for such inputs. Documented in bun-compat.md.
+                    return new TextEncoder().encode(String(data));
+                }
+
+                function hashCrc32(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var crc = (seed === undefined ? 0 : (seed >>> 0)) ^ 0xffffffff;
+                    for (var i = 0; i < bytes.length; i++) {
+                        crc = (CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8)) >>> 0;
+                    }
+                    return (crc ^ 0xffffffff) >>> 0;
+                }
+
+                function hashAdler32(data) {
+                    // `seed` is deliberately not read here at all — see the comment above
+                    // this section: real Bun 1.3.13 itself ignores it for `adler32`.
+                    var bytes = bytesFromHashInput(data);
+                    var MOD = 65521;
+                    var a = 1, b = 0;
+                    for (var i = 0; i < bytes.length; i++) {
+                        a = (a + bytes[i]) % MOD;
+                        b = (b + a) % MOD;
+                    }
+                    return ((b << 16) | a) >>> 0;
+                }
+
+                function rotl32(v, s) { return ((v << s) | (v >>> (32 - s))) >>> 0; }
+
+                function hashMurmur32v3(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var s = seed === undefined ? 0 : (seed >>> 0);
+                    var c1 = 0xcc9e2d51, c2 = 0x1b873593;
+                    var len = bytes.length;
+                    var remainder = len & 3;
+                    var nblocks = len - remainder;
+                    var h1 = s;
+                    var i = 0;
+                    while (i < nblocks) {
+                        var k1 = (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)) >>> 0;
+                        i += 4;
+                        k1 = Math.imul(k1, c1) >>> 0;
+                        k1 = rotl32(k1, 15);
+                        k1 = Math.imul(k1, c2) >>> 0;
+                        h1 = (h1 ^ k1) >>> 0;
+                        h1 = rotl32(h1, 13);
+                        h1 = (Math.imul(h1, 5) + 0xe6546b64) >>> 0;
+                    }
+                    var k1tail = 0;
+                    if (remainder === 3) k1tail ^= bytes[i + 2] << 16;
+                    if (remainder >= 2) k1tail ^= bytes[i + 1] << 8;
+                    if (remainder >= 1) {
+                        k1tail ^= bytes[i];
+                        k1tail = Math.imul(k1tail, c1) >>> 0;
+                        k1tail = rotl32(k1tail, 15);
+                        k1tail = Math.imul(k1tail, c2) >>> 0;
+                        h1 = (h1 ^ k1tail) >>> 0;
+                    }
+                    h1 = (h1 ^ len) >>> 0;
+                    h1 = (h1 ^ (h1 >>> 16)) >>> 0;
+                    h1 = Math.imul(h1, 0x85ebca6b) >>> 0;
+                    h1 = (h1 ^ (h1 >>> 13)) >>> 0;
+                    h1 = Math.imul(h1, 0xc2b2ae35) >>> 0;
+                    h1 = (h1 ^ (h1 >>> 16)) >>> 0;
+                    return h1 >>> 0;
+                }
+
+                function hashMurmur32v2(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var m = 0x5bd1e995;
+                    var r = 24;
+                    var len = bytes.length;
+                    var h = ((seed === undefined ? 0 : (seed >>> 0)) ^ len) >>> 0;
+                    var i = 0;
+                    var remaining = len;
+                    while (remaining >= 4) {
+                        var k = (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)) >>> 0;
+                        k = Math.imul(k, m) >>> 0;
+                        k = (k ^ (k >>> r)) >>> 0;
+                        k = Math.imul(k, m) >>> 0;
+                        h = Math.imul(h, m) >>> 0;
+                        h = (h ^ k) >>> 0;
+                        i += 4; remaining -= 4;
+                    }
+                    if (remaining === 3) h ^= bytes[i + 2] << 16;
+                    if (remaining >= 2) h ^= bytes[i + 1] << 8;
+                    if (remaining >= 1) {
+                        h ^= bytes[i];
+                        h = Math.imul(h, m) >>> 0;
+                    }
+                    h = (h ^ (h >>> 13)) >>> 0;
+                    h = Math.imul(h, m) >>> 0;
+                    h = (h ^ (h >>> 15)) >>> 0;
+                    return h >>> 0;
+                }
+
+                var MASK64 = (1n << 64n) - 1n;
+
+                function hashMurmur64v2(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var m = 0xc6a4a7935bd1e995n;
+                    var r = 47n;
+                    var len = BigInt(bytes.length);
+                    var seedBig = seed === undefined ? 0n : BigInt.asUintN(64, BigInt(seed));
+                    var h = (seedBig ^ ((len * m) & MASK64)) & MASK64;
+                    var i = 0;
+                    var nblocks = bytes.length >> 3;
+                    for (var blk = 0; blk < nblocks; blk++) {
+                        var k = 0n;
+                        for (var j = 0; j < 8; j++) k |= BigInt(bytes[i + j]) << BigInt(8 * j);
+                        i += 8;
+                        k = (k * m) & MASK64;
+                        k ^= (k >> r);
+                        k = (k * m) & MASK64;
+                        h ^= k;
+                        h = (h * m) & MASK64;
+                    }
+                    var rem = bytes.length & 7;
+                    var tail = 0n;
+                    for (var t = rem - 1; t >= 0; t--) tail = (tail << 8n) | BigInt(bytes[i + t]);
+                    if (rem > 0) {
+                        h ^= tail;
+                        h = (h * m) & MASK64;
+                    }
+                    h ^= (h >> r);
+                    h = (h * m) & MASK64;
+                    h ^= (h >> r);
+                    return h;
+                }
+
+                function wymum(a, b) {
+                    var r = (a & MASK64) * (b & MASK64);
+                    return [r & MASK64, (r >> 64n) & MASK64];
+                }
+                function wymix(a, b) {
+                    var p = wymum(a, b);
+                    return p[0] ^ p[1];
+                }
+                var WY_SECRET = [
+                    0xa0761d6478bd642fn, 0xe7037ed1a0b428dbn, 0x8ebc6af09c88c6e3n, 0x589965cc75374cc3n,
+                ];
+                function wyRead(bytes, i, n) {
+                    var v = 0n;
+                    for (var j = 0; j < n; j++) {
+                        var byte = i + j < bytes.length ? bytes[i + j] : 0;
+                        v |= BigInt(byte) << BigInt(8 * j);
+                    }
+                    return v;
+                }
+                function wyr3(bytes, i, k) {
+                    return (BigInt(bytes[i]) << 16n) | (BigInt(bytes[i + (k >> 1)]) << 8n) | BigInt(bytes[i + k - 1]);
+                }
+
+                function hashWyhash(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var len = bytes.length;
+                    var s = seed === undefined ? 0n : BigInt.asUintN(64, BigInt(seed));
+                    s = s ^ wymix(s ^ WY_SECRET[0], WY_SECRET[1]);
+                    var a, b;
+                    if (len <= 16) {
+                        if (len >= 4) {
+                            a = (wyRead(bytes, 0, 4) << 32n) | wyRead(bytes, (len >> 3) << 2, 4);
+                            b = (wyRead(bytes, len - 4, 4) << 32n) | wyRead(bytes, len - 4 - ((len >> 3) << 2), 4);
+                        } else if (len > 0) {
+                            a = wyr3(bytes, 0, len);
+                            b = 0n;
+                        } else {
+                            a = 0n; b = 0n;
+                        }
+                    } else {
+                        var i = len, off = 0;
+                        if (i > 48) {
+                            var see1 = s, see2 = s;
+                            do {
+                                s = wymix(wyRead(bytes, off, 8) ^ WY_SECRET[1], wyRead(bytes, off + 8, 8) ^ s);
+                                see1 = wymix(wyRead(bytes, off + 16, 8) ^ WY_SECRET[2], wyRead(bytes, off + 24, 8) ^ see1);
+                                see2 = wymix(wyRead(bytes, off + 32, 8) ^ WY_SECRET[3], wyRead(bytes, off + 40, 8) ^ see2);
+                                off += 48; i -= 48;
+                            } while (i > 48);
+                            s = s ^ see1 ^ see2;
+                        }
+                        while (i > 16) {
+                            s = wymix(wyRead(bytes, off, 8) ^ WY_SECRET[1], wyRead(bytes, off + 8, 8) ^ s);
+                            i -= 16; off += 16;
+                        }
+                        a = wyRead(bytes, off + i - 16, 8);
+                        b = wyRead(bytes, off + i - 8, 8);
+                    }
+                    a = a ^ WY_SECRET[1];
+                    b = b ^ s;
+                    var p = wymum(a, b);
+                    return wymix(p[0] ^ WY_SECRET[0] ^ BigInt(len), p[1] ^ WY_SECRET[1]);
+                }
+
+                var CITY_K0 = 0xc3a5c85c97cb3127n, CITY_K1 = 0xb492b66fbe98f273n, CITY_K2 = 0x9ae16a3b2f90404fn;
+                var CITY_KMUL = 0x9ddfea08eb382d69n;
+                function cityMul(a, b) { return (a * b) & MASK64; }
+                function cityRot(v, s) {
+                    s = BigInt(s) & 63n;
+                    if (s === 0n) return v;
+                    return ((v >> s) | (v << (64n - s))) & MASK64;
+                }
+                function cityShiftmix(v) { return (v ^ (v >> 47n)) & MASK64; }
+                function cityBswap64(v) {
+                    var r = 0n;
+                    for (var i = 0; i < 8; i++) { r = (r << 8n) | (v & 0xffn); v >>= 8n; }
+                    return r & MASK64;
+                }
+                function cityFetch64(bytes, i) {
+                    var v = 0n;
+                    for (var j = 0; j < 8; j++) v |= BigInt(bytes[i + j]) << BigInt(8 * j);
+                    return v;
+                }
+                function cityFetch32(bytes, i) {
+                    return BigInt((bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)) >>> 0);
+                }
+                function cityHashLen16(u, v, m) {
+                    m = m === undefined ? CITY_KMUL : m;
+                    var a = cityMul(u ^ v, m);
+                    a ^= (a >> 47n);
+                    var b = cityMul(v ^ a, m);
+                    b ^= (b >> 47n);
+                    b = cityMul(b, m);
+                    return b & MASK64;
+                }
+                function cityHashLen0to16(bytes, len) {
+                    if (len >= 8) {
+                        var m = (CITY_K2 + BigInt(len) * 2n) & MASK64;
+                        var a = (cityFetch64(bytes, 0) + CITY_K2) & MASK64;
+                        var b = cityFetch64(bytes, len - 8);
+                        var c = (cityMul(cityRot(b, 37), m) + a) & MASK64;
+                        var d = cityMul((cityRot(a, 25) + b) & MASK64, m);
+                        return cityHashLen16(c, d, m);
+                    }
+                    if (len >= 4) {
+                        var m2 = (CITY_K2 + BigInt(len) * 2n) & MASK64;
+                        var a2 = cityFetch32(bytes, 0);
+                        return cityHashLen16((BigInt(len) + (a2 << 3n)) & MASK64, cityFetch32(bytes, len - 4), m2);
+                    }
+                    if (len > 0) {
+                        var av = BigInt(bytes[0]);
+                        var bv = BigInt(bytes[len >> 1]);
+                        var cv = BigInt(bytes[len - 1]);
+                        var y = (av + (bv << 8n)) & MASK64;
+                        var z = (BigInt(len) + (cv << 2n)) & MASK64;
+                        return cityMul(cityShiftmix(cityMul(y, CITY_K2) ^ cityMul(z, CITY_K0)), CITY_K2);
+                    }
+                    return CITY_K2;
+                }
+                function cityHashLen17to32(bytes, len) {
+                    var m = (CITY_K2 + BigInt(len) * 2n) & MASK64;
+                    var a = cityMul(cityFetch64(bytes, 0), CITY_K1);
+                    var b = cityFetch64(bytes, 8);
+                    var c = cityMul(cityFetch64(bytes, len - 8), m);
+                    var d = cityMul(cityFetch64(bytes, len - 16), CITY_K2);
+                    return cityHashLen16(
+                        (cityRot((a + b) & MASK64, 43) + cityRot(c, 30) + d) & MASK64,
+                        (a + cityRot((b + CITY_K2) & MASK64, 18) + c) & MASK64,
+                        m
+                    );
+                }
+                function cityWeakHashLen32WithSeeds6(w, x, y, z, a, b) {
+                    a = (a + w) & MASK64;
+                    b = cityRot((b + a + z) & MASK64, 21);
+                    var c = a;
+                    a = (a + x) & MASK64;
+                    a = (a + y) & MASK64;
+                    b = (b + cityRot(a, 44)) & MASK64;
+                    return [(a + z) & MASK64, (b + c) & MASK64];
+                }
+                function cityWeakHashLen32WithSeeds(bytes, off, a, b) {
+                    return cityWeakHashLen32WithSeeds6(
+                        cityFetch64(bytes, off), cityFetch64(bytes, off + 8),
+                        cityFetch64(bytes, off + 16), cityFetch64(bytes, off + 24), a, b
+                    );
+                }
+                function cityHashLen33to64(bytes, len) {
+                    var m = (CITY_K2 + BigInt(len) * 2n) & MASK64;
+                    var a = cityMul(cityFetch64(bytes, 0), CITY_K2);
+                    var b = cityFetch64(bytes, 8);
+                    var c = cityFetch64(bytes, len - 24);
+                    var d = cityFetch64(bytes, len - 32);
+                    var e = cityMul(cityFetch64(bytes, 16), CITY_K2);
+                    var f = cityMul(cityFetch64(bytes, 24), 9n);
+                    var g = cityFetch64(bytes, len - 8);
+                    var h = cityMul(cityFetch64(bytes, len - 16), m);
+                    var u = (cityRot((a + g) & MASK64, 43) + cityMul((cityRot(b, 30) + c) & MASK64, 9n)) & MASK64;
+                    var v = (((a + g) & MASK64 ^ d) + f + 1n) & MASK64;
+                    var w = (cityBswap64(cityMul((u + v) & MASK64, m)) + h) & MASK64;
+                    var x = (cityRot((e + f) & MASK64, 42) + c) & MASK64;
+                    var y = cityMul((cityBswap64(cityMul((v + w) & MASK64, m)) + g) & MASK64, m);
+                    var z = (e + f + c) & MASK64;
+                    a = (cityBswap64((cityMul((x + z) & MASK64, m) + y) & MASK64) + b) & MASK64;
+                    b = cityMul(cityShiftmix((cityMul((z + a) & MASK64, m) + d + h) & MASK64), m);
+                    return (b + x) & MASK64;
+                }
+                function cityHash64NoSeed(bytes) {
+                    var len = bytes.length;
+                    if (len <= 32) {
+                        if (len <= 16) return cityHashLen0to16(bytes, len);
+                        return cityHashLen17to32(bytes, len);
+                    } else if (len <= 64) {
+                        return cityHashLen33to64(bytes, len);
+                    }
+                    var x = cityFetch64(bytes, len - 40);
+                    var y = (cityFetch64(bytes, len - 16) + cityFetch64(bytes, len - 56)) & MASK64;
+                    var z = cityHashLen16((cityFetch64(bytes, len - 48) + BigInt(len)) & MASK64, cityFetch64(bytes, len - 24));
+                    var v = cityWeakHashLen32WithSeeds(bytes, len - 64, BigInt(len), z);
+                    var w = cityWeakHashLen32WithSeeds(bytes, len - 32, (y + CITY_K1) & MASK64, x);
+                    x = (cityMul(x, CITY_K1) + cityFetch64(bytes, 0)) & MASK64;
+                    var remaining = (len - 1) & ~63;
+                    var off = 0;
+                    do {
+                        x = cityMul(cityRot((x + y + v[0] + cityFetch64(bytes, off + 8)) & MASK64, 37), CITY_K1);
+                        y = cityMul(cityRot((y + v[1] + cityFetch64(bytes, off + 48)) & MASK64, 42), CITY_K1);
+                        x ^= w[1];
+                        y = (y + v[0] + cityFetch64(bytes, off + 40)) & MASK64;
+                        z = cityMul(cityRot((z + w[0]) & MASK64, 33), CITY_K1);
+                        v = cityWeakHashLen32WithSeeds(bytes, off, cityMul(v[1], CITY_K1), (x + w[0]) & MASK64);
+                        w = cityWeakHashLen32WithSeeds(bytes, off + 32, (z + w[1]) & MASK64, (y + cityFetch64(bytes, off + 16)) & MASK64);
+                        var tmp = z; z = x; x = tmp;
+                        off += 64;
+                        remaining -= 64;
+                    } while (remaining !== 0);
+                    return cityHashLen16(
+                        (cityHashLen16(v[0], w[0]) + cityMul(cityShiftmix(y), CITY_K1) + z) & MASK64,
+                        (cityHashLen16(v[1], w[1]) + x) & MASK64
+                    );
+                }
+                function hashCityHash64(data, seed) {
+                    var bytes = bytesFromHashInput(data);
+                    var seedBig = seed === undefined ? 0n : BigInt.asUintN(64, BigInt(seed));
+                    return cityHashLen16((cityHash64NoSeed(bytes) - CITY_K2) & MASK64, seedBig);
+                }
+
+                function bunHash(data, seed) {
+                    return hashWyhash(data, seed);
+                }
+                bunHash.wyhash = hashWyhash;
+                bunHash.crc32 = hashCrc32;
+                bunHash.adler32 = hashAdler32;
+                bunHash.cityHash64 = hashCityHash64;
+                bunHash.murmur32v2 = hashMurmur32v2;
+                bunHash.murmur32v3 = hashMurmur32v3;
+                bunHash.murmur64v2 = hashMurmur64v2;
+
+                // --- Bun.CryptoHasher ---
+                //
+                // Backed by `java.security.MessageDigest` (plain hash mode) and
+                // `javax.crypto.Mac` (HMAC mode, when a `key` is passed as the 2nd
+                // constructor argument — verified against real Bun 1.3.13 that
+                // `new CryptoHasher('sha256', 'key').update(x).digest('hex')` matches a
+                // standard HMAC-SHA256). Only algorithms the JDK's default security
+                // providers actually implement are supported — real Bun's
+                // `CryptoHasher.algorithms` (probed live) also lists `blake2b256`,
+                // `blake2b512`, `blake2s256`, `md4`, `ripemd160`, `shake128`, `shake256`,
+                // none of which are standard `java.security.MessageDigest` algorithms (they'd
+                // need a third-party JCE provider, e.g. Bouncy Castle, which isn't a
+                // dependency of this project) — those names are deliberately absent from
+                // `algorithms` below and throw a clear error if requested, rather than being
+                // silently wrong. `.copy()` uses `MessageDigest`/`Mac`'s own `clone()`.
+                var CRYPTO_HASHER_ALGORITHMS = {
+                    'md5': 'MD5',
+                    'sha1': 'SHA-1',
+                    'sha224': 'SHA-224',
+                    'sha256': 'SHA-256',
+                    'sha384': 'SHA-384',
+                    'sha512': 'SHA-512',
+                    'sha512-224': 'SHA-512/224',
+                    'sha512-256': 'SHA-512/256',
+                    'sha3-224': 'SHA3-224',
+                    'sha3-256': 'SHA3-256',
+                    'sha3-384': 'SHA3-384',
+                    'sha3-512': 'SHA3-512',
+                };
+                var CRYPTO_HASHER_HMAC_ALGORITHMS = {
+                    'md5': 'HmacMD5',
+                    'sha1': 'HmacSHA1',
+                    'sha224': 'HmacSHA224',
+                    'sha256': 'HmacSHA256',
+                    'sha384': 'HmacSHA384',
+                    'sha512': 'HmacSHA512',
+                    'sha3-224': 'HmacSHA3-224',
+                    'sha3-256': 'HmacSHA3-256',
+                    'sha3-384': 'HmacSHA3-384',
+                    'sha3-512': 'HmacSHA3-512',
+                };
+
+                function toJCharArray(str) {
+                    var JCharArray = Java.type('char[]');
+                    str = String(str);
+                    var arr = new JCharArray(str.length);
+                    for (var i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i);
+                    return arr;
+                }
+
+                function bytesToJs(javaBytes) {
+                    var out = new Array(javaBytes.length);
+                    for (var i = 0; i < javaBytes.length; i++) out[i] = javaBytes[i] & 0xff;
+                    return out;
+                }
+
+                function encodeDigestBytes(jsBytes, encoding) {
+                    var buf = globalThis.Buffer.from(jsBytes);
+                    if (encoding === undefined || encoding === null) return buf;
+                    return buf.toString(encoding);
+                }
+
+                function CryptoHasher(algorithm, keyOrOptions) {
+                    var algo = String(algorithm).toLowerCase();
+                    var hasKey = typeof keyOrOptions === 'string' ||
+                        (keyOrOptions && typeof keyOrOptions === 'object' && (keyOrOptions.buffer || ArrayBuffer.isView(keyOrOptions)));
+                    if (hasKey) {
+                        var macName = CRYPTO_HASHER_HMAC_ALGORITHMS[algo];
+                        if (!macName) {
+                            throw new Error(
+                                "mycelium: Bun.CryptoHasher HMAC mode doesn't support algorithm '" + algorithm +
+                                "' — see docs/reference/bun-compat.md for the supported list"
+                            );
+                        }
+                        var JMac = Java.type('javax.crypto.Mac');
+                        var JSecretKeySpec = Java.type('javax.crypto.spec.SecretKeySpec');
+                        var keyBytes = bytesFromHashInput(keyOrOptions);
+                        var jKeyBytes = new JByteArray(keyBytes.length);
+                        for (var ki = 0; ki < keyBytes.length; ki++) jKeyBytes[ki] = keyBytes[ki] << 24 >> 24;
+                        var mac = JMac.getInstance(macName);
+                        mac.init(new JSecretKeySpec(jKeyBytes, macName));
+                        this._mac = mac;
+                        this._algorithm = algo;
+                    } else {
+                        var mdName = CRYPTO_HASHER_ALGORITHMS[algo];
+                        if (!mdName) {
+                            throw new Error(
+                                "mycelium: Bun.CryptoHasher doesn't support algorithm '" + algorithm +
+                                "' — see docs/reference/bun-compat.md for the supported list"
+                            );
+                        }
+                        this._digest = Java.type('java.security.MessageDigest').getInstance(mdName);
+                        this._algorithm = algo;
+                    }
+                }
+                CryptoHasher.algorithms = Object.keys(CRYPTO_HASHER_ALGORITHMS);
+                CryptoHasher.prototype = {
+                    get algorithm() { return this._algorithm; },
+                    update: function (data, encoding) {
+                        var bytes;
+                        if (typeof data === 'string' && encoding) {
+                            bytes = bytesFromHashInput(globalThis.Buffer.from(data, encoding));
+                        } else {
+                            bytes = bytesFromHashInput(data);
+                        }
+                        var jBytes = new JByteArray(bytes.length);
+                        for (var i = 0; i < bytes.length; i++) jBytes[i] = bytes[i] << 24 >> 24;
+                        if (this._mac) this._mac.update(jBytes); else this._digest.update(jBytes);
+                        return this;
+                    },
+                    digest: function (encoding) {
+                        var jResult = this._mac ? this._mac.doFinal() : this._digest.digest();
+                        return encodeDigestBytes(bytesToJs(jResult), encoding);
+                    },
+                    copy: function () {
+                        var clone = Object.create(CryptoHasher.prototype);
+                        clone._algorithm = this._algorithm;
+                        try {
+                            if (this._mac) clone._mac = this._mac.clone(); else clone._digest = this._digest.clone();
+                        } catch (e) {
+                            throw new Error('mycelium: Bun.CryptoHasher.copy() failed — ' + (e.message || e));
+                        }
+                        return clone;
+                    },
+                };
+                CryptoHasher.hash = function (algorithm, input, encoding) {
+                    var h = new CryptoHasher(algorithm);
+                    h.update(input);
+                    return h.digest(encoding);
+                };
+
+                // --- Bun.password ---
+                //
+                // Real Bun 1.3.13's default algorithm is `argon2id` (verified: a bare
+                // `Bun.password.hash(pw)` produces a `${'$'}argon2id$...` PHC-format string), with
+                // `bcrypt` also selectable. Neither argon2 nor bcrypt is implemented by any
+                // standard JDK security provider (`java.security`/`javax.crypto` have no
+                // Argon2/bcrypt `MessageDigest`/`SecretKeyFactory` algorithm) — supporting
+                // them for real would need a third-party JCE provider (e.g. Bouncy Castle),
+                // which isn't a dependency of this project, so this is a case of "the JVM
+                // genuinely can't back this out of the box" rather than a shim oversight.
+                //
+                // What this shim does instead: hashes with PBKDF2-HMAC-SHA256
+                // (`javax.crypto.SecretKeyFactory`, a real JDK-standard KDF, not a fake) at a
+                // fixed 210,000 iterations (an OWASP-recommended-era PBKDF2 iteration count),
+                // and formats the output as `${'$'}mycelium-pbkdf2-sha256${'$'}i=<n>$<salt>$<hash>`
+                // (base64, RFC 4648, no padding stripped) — a Mycelium-specific format, NOT
+                // real Bun's `${'$'}argon2id$...`/`$2b$...` PHC strings. This is a deliberate
+                // choice: faking an `${'$'}argon2id$`-prefixed string containing PBKDF2 output
+                // would be actively misleading (it would look like an argon2id hash to any
+                // downstream code/tool that inspects the prefix, but not verify as one
+                // anywhere else). `algorithm`/`cost`/`memoryCost`/`timeCost` options are
+                // accepted (so scripts that pass them don't crash) but ignored — every hash
+                // is always PBKDF2-SHA256 regardless of what was requested. `.verify()`
+                // throws a clear error (rather than silently returning `false`, which would
+                // look like "wrong password") for any hash string not in this shim's own
+                // format — in particular, a real-Bun-produced argon2id/bcrypt hash cannot be
+                // verified here at all.
+                var PBKDF2_ITERATIONS = 210000;
+                var PBKDF2_PREFIX = '${'$'}mycelium-pbkdf2-sha256$';
+
+                function pbkdf2Derive(passwordChars, saltBytes, iterations) {
+                    var JPBEKeySpec = Java.type('javax.crypto.spec.PBEKeySpec');
+                    var JSecretKeyFactory = Java.type('javax.crypto.SecretKeyFactory');
+                    var jSalt = new JByteArray(saltBytes.length);
+                    for (var i = 0; i < saltBytes.length; i++) jSalt[i] = saltBytes[i] << 24 >> 24;
+                    var spec = new JPBEKeySpec(passwordChars, jSalt, iterations, 256);
+                    var factory = JSecretKeyFactory.getInstance('PBKDF2WithHmacSHA256');
+                    var key = factory.generateSecret(spec);
+                    return bytesToJs(key.getEncoded());
+                }
+
+                function bunPasswordHashSync(password, algorithmOrOptions) {
+                    var JSecureRandom = Java.type('java.security.SecureRandom');
+                    var sr = new JSecureRandom();
+                    var jSalt = new JByteArray(16);
+                    sr.nextBytes(jSalt);
+                    var salt = bytesToJs(jSalt);
+                    var hash = pbkdf2Derive(toJCharArray(password), salt, PBKDF2_ITERATIONS);
+                    var saltB64 = globalThis.Buffer.from(salt).toString('base64');
+                    var hashB64 = globalThis.Buffer.from(hash).toString('base64');
+                    return PBKDF2_PREFIX + 'i=' + PBKDF2_ITERATIONS + '$' + saltB64 + '$' + hashB64;
+                }
+
+                function bunPasswordVerifySync(password, hash, algorithm) {
+                    if (typeof hash !== 'string' || hash.indexOf(PBKDF2_PREFIX) !== 0) {
+                        throw new Error(
+                            "mycelium: Bun.password.verify() can't verify this hash — it wasn't " +
+                            'produced by this shim\'s Bun.password.hash() (real Bun\'s argon2id/' +
+                            'bcrypt-format hashes are not supported here; see docs/reference/bun-compat.md)'
+                        );
+                    }
+                    var rest = hash.slice(PBKDF2_PREFIX.length);
+                    var parts = rest.split('$');
+                    if (parts.length !== 3 || parts[0].indexOf('i=') !== 0) {
+                        throw new Error('mycelium: malformed Bun.password hash string');
+                    }
+                    var iterations = parseInt(parts[0].slice(2), 10);
+                    var salt = bytesFromHashInput(globalThis.Buffer.from(parts[1], 'base64'));
+                    var expected = globalThis.Buffer.from(parts[2], 'base64');
+                    var actual = pbkdf2Derive(toJCharArray(password), salt, iterations);
+                    var actualBuf = globalThis.Buffer.from(actual);
+                    if (actualBuf.length !== expected.length) return false;
+                    var diff = 0;
+                    for (var i = 0; i < actualBuf.length; i++) diff |= actualBuf[i] ^ expected[i];
+                    return diff === 0;
+                }
+
+                var bunPassword = {
+                    hash: function (password, algorithmOrOptions) {
+                        var pw = password, opt = algorithmOrOptions;
+                        return Promise.resolve().then(function () { return bunPasswordHashSync(pw, opt); });
+                    },
+                    verify: function (password, hash, algorithm) {
+                        var pw = password, h = hash, a = algorithm;
+                        return Promise.resolve().then(function () { return bunPasswordVerifySync(pw, h, a); });
+                    },
+                    hashSync: bunPasswordHashSync,
+                    verifySync: bunPasswordVerifySync,
+                };
+
+                // --- Bun.deepEquals(a, b, strict?) ---
+                //
+                // Verified against real Bun 1.3.13 across primitives (uses `Object.is`
+                // semantics, not `==`/`===` — e.g. `deepEquals(0, -0)` is `false`,
+                // `deepEquals(NaN, NaN)` is `true`, matching `Object.is`), arrays (including
+                // sparse-array holes treated as `undefined` — `deepEquals([1,,3],
+                // [1,undefined,3])` is `true`), `Date`/`RegExp`/`Map`/`Set` (the latter two
+                // compared order-independently), and plain objects. The only observed
+                // difference `strict` makes in probing was around object keys whose value is
+                // `undefined`: non-strict treats `{a:1, b:undefined}` as equal to `{a:1}`
+                // (an absent key), strict does not (own-key-set must match exactly,
+                // `undefined`-valued keys included) — replicated below.
+                function deepEqualsImpl(a, b, strict, seen) {
+                    if (Object.is(a, b)) return true;
+                    if (typeof a !== typeof b) return false;
+                    if (a === null || b === null) return false;
+                    if (typeof a !== 'object') return false;
+                    if (a instanceof Date || b instanceof Date) {
+                        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+                    }
+                    if (a instanceof RegExp || b instanceof RegExp) {
+                        return a instanceof RegExp && b instanceof RegExp &&
+                            a.source === b.source && a.flags === b.flags;
+                    }
+                    if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+                        if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
+                        if (a.length !== b.length || a.constructor !== b.constructor) return false;
+                        for (var ti = 0; ti < a.length; ti++) if (a[ti] !== b[ti]) return false;
+                        return true;
+                    }
+                    if (a instanceof Map || b instanceof Map) {
+                        if (!(a instanceof Map) || !(b instanceof Map) || a.size !== b.size) return false;
+                        var aEntries = Array.from(a.entries());
+                        var bEntries = Array.from(b.entries());
+                        var usedBM = new Array(bEntries.length).fill(false);
+                        for (var mi = 0; mi < aEntries.length; mi++) {
+                            var matched = false;
+                            for (var bi = 0; bi < bEntries.length; bi++) {
+                                if (!usedBM[bi] &&
+                                    deepEqualsImpl(aEntries[mi][0], bEntries[bi][0], strict, seen) &&
+                                    deepEqualsImpl(aEntries[mi][1], bEntries[bi][1], strict, seen)) {
+                                    usedBM[bi] = true;
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if (!matched) return false;
+                        }
+                        return true;
+                    }
+                    if (a instanceof Set || b instanceof Set) {
+                        if (!(a instanceof Set) || !(b instanceof Set) || a.size !== b.size) return false;
+                        var aVals = Array.from(a.values());
+                        var bVals = Array.from(b.values());
+                        var usedB = new Array(bVals.length).fill(false);
+                        for (var si = 0; si < aVals.length; si++) {
+                            var siMatched = false;
+                            for (var sj = 0; sj < bVals.length; sj++) {
+                                if (!usedB[sj] && deepEqualsImpl(aVals[si], bVals[sj], strict, seen)) {
+                                    usedB[sj] = true;
+                                    siMatched = true;
+                                    break;
+                                }
+                            }
+                            if (!siMatched) return false;
+                        }
+                        return true;
+                    }
+                    if (Array.isArray(a) || Array.isArray(b)) {
+                        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+                        for (var ai = 0; ai < a.length; ai++) {
+                            if (!deepEqualsImpl(a[ai], b[ai], strict, seen)) return false;
+                        }
+                        return true;
+                    }
+                    var aKeys = Object.keys(a);
+                    var bKeys = Object.keys(b);
+                    if (!strict) {
+                        aKeys = aKeys.filter(function (k) { return a[k] !== undefined; });
+                        bKeys = bKeys.filter(function (k) { return b[k] !== undefined; });
+                    }
+                    if (aKeys.length !== bKeys.length) return false;
+                    aKeys.sort();
+                    bKeys.sort();
+                    for (var ki = 0; ki < aKeys.length; ki++) {
+                        if (aKeys[ki] !== bKeys[ki]) return false;
+                    }
+                    for (var kj = 0; kj < aKeys.length; kj++) {
+                        if (!deepEqualsImpl(a[aKeys[kj]], b[aKeys[kj]], strict, seen)) return false;
+                    }
+                    return true;
+                }
+                function bunDeepEquals(a, b, strict) {
+                    return deepEqualsImpl(a, b, !!strict, []);
+                }
+
+                // --- Bun.escapeHTML(value) ---
+                //
+                // Verified against real Bun 1.3.13: only strings and non-null objects are
+                // escaped (objects are first coerced via `String(value)`, THEN escaped —
+                // `escapeHTML({toString(){return "<x>"}})` is `"&lt;x&gt;"`); numbers,
+                // booleans, `null`, and `undefined` pass through completely unchanged (NOT
+                // stringified — `escapeHTML(123)` is the number `123`, not the string
+                // `"123"`); a `Symbol` throws `TypeError: Cannot convert a symbol to a
+                // string`, matching what an implicit `String(symbol)` coercion would do.
+                function bunEscapeHTML(value) {
+                    if (typeof value === 'symbol') {
+                        throw new TypeError('Cannot convert a symbol to a string');
+                    }
+                    if (value === null || (typeof value !== 'string' && typeof value !== 'object')) {
+                        return value;
+                    }
+                    var str = typeof value === 'string' ? value : String(value);
+                    var out = '';
+                    for (var i = 0; i < str.length; i++) {
+                        var ch = str[i];
+                        if (ch === '<') out += '&lt;';
+                        else if (ch === '>') out += '&gt;';
+                        else if (ch === '&') out += '&amp;';
+                        else if (ch === '"') out += '&quot;';
+                        else if (ch === "'") out += '&#x27;';
+                        else out += ch;
+                    }
+                    return out;
+                }
+
+                // --- Bun.inspect(value) ---
+                //
+                // A best-effort `util.inspect`-style formatter — NOT a claim of matching
+                // real Bun's exact whitespace/line-wrapping (verified against real Bun that
+                // its formatter, backed by JavaScriptCore, wraps/pads nested objects in a
+                // particular way — e.g. a nested array of primitives-then-an-object gets
+                // its own multi-line block with trailing commas — that would take a lot
+                // more than this task's effort budget to replicate character-for-character).
+                // What this DOES aim to match: the general shape real code actually depends
+                // on — unquoted object keys, JS-syntax (not JSON) string quoting, `Map`/`Set`/
+                // `Date`/`RegExp`/function/class/`bigint` formatting, and circular-reference
+                // detection (`[Circular *1]`, matching Bun's own marker verified live).
+                // Known, accepted divergence: `Bun.inspect(errorInstance)` in real Bun
+                // produces an elaborate colorized source-frame snippet (reading the
+                // original source file and pointing at the throw site) — this shim instead
+                // falls back to the error's own `.stack` string, which is a much plainer
+                // (but not wrong) rendering.
+                function inspectValue(value, seen, depth) {
+                    if (value === null) return 'null';
+                    if (value === undefined) return 'undefined';
+                    var t = typeof value;
+                    if (t === 'string') return "'" + value.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+                    if (t === 'number' || t === 'boolean') return String(value);
+                    if (t === 'bigint') return value.toString() + 'n';
+                    if (t === 'symbol') return value.toString();
+                    if (t === 'function') {
+                        var name = value.name || '(anonymous)';
+                        var isClass = /^class\s/.test(Function.prototype.toString.call(value));
+                        return isClass ? '[class ' + name + ']' : '[Function: ' + name + ']';
+                    }
+                    if (seen.indexOf(value) !== -1) return '[Circular *1]';
+                    if (value instanceof Error) return value.stack || (value.name + ': ' + value.message);
+                    if (value instanceof Date) return value.toISOString();
+                    if (value instanceof RegExp) return value.toString();
+                    if (depth !== undefined && depth < 0) {
+                        return Array.isArray(value) ? '[Array]' : '[Object]';
+                    }
+                    var nextDepth = depth === undefined ? undefined : depth - 1;
+                    var nextSeen = seen.concat([value]);
+                    if (Array.isArray(value)) {
+                        var items = value.map(function (v) { return inspectValue(v, nextSeen, nextDepth); });
+                        return '[ ' + items.join(', ') + ' ]';
+                    }
+                    if (value instanceof Map) {
+                        var mapItems = Array.from(value.entries()).map(function (e) {
+                            return inspectValue(e[0], nextSeen, nextDepth) + ' => ' + inspectValue(e[1], nextSeen, nextDepth);
+                        });
+                        return 'Map(' + value.size + ') {' + (mapItems.length ? ' ' + mapItems.join(', ') + ' ' : '') + '}';
+                    }
+                    if (value instanceof Set) {
+                        var setItems = Array.from(value.values()).map(function (v) { return inspectValue(v, nextSeen, nextDepth); });
+                        return 'Set(' + value.size + ') {' + (setItems.length ? ' ' + setItems.join(', ') + ' ' : '') + '}';
+                    }
+                    if (ArrayBuffer.isView(value) && typeof value.length === 'number') {
+                        return value.constructor.name + '(' + value.length + ') [ ' + Array.prototype.join.call(value, ', ') + ' ]';
+                    }
+                    var ctorName = value.constructor && value.constructor !== Object ? value.constructor.name + ' ' : '';
+                    var keys = Object.keys(value);
+                    var props = keys.map(function (k) {
+                        var key = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'";
+                        return key + ': ' + inspectValue(value[k], nextSeen, nextDepth);
+                    });
+                    return ctorName + '{' + (props.length ? ' ' + props.join(', ') + ' ' : '') + '}';
+                }
+                function bunInspect(value, options) {
+                    var depth = options && typeof options.depth === 'number' ? options.depth : undefined;
+                    return inspectValue(value, [], depth);
+                }
+                bunInspect.custom = Symbol.for('nodejs.util.inspect.custom');
+
+                // --- Bun.sleep(ms) / Bun.sleepSync(ms) ---
+                function bunSleep(ms) {
+                    var delay = typeof ms === 'number' ? ms : 0;
+                    return new Promise(function (resolve) {
+                        globalThis.setTimeout(resolve, delay);
+                    });
+                }
+                function bunSleepSync(ms) {
+                    var delay = typeof ms === 'number' ? ms : 0;
+                    if (delay <= 0) return;
+                    Java.type('java.lang.Thread').sleep(Math.round(delay));
+                }
+
+                // --- Bun.nanoseconds() ---
+                //
+                // Real Bun measures nanoseconds elapsed since the *process* started. This
+                // shim can only measure since `BUN_INIT_SCRIPT` itself was evaluated (the
+                // first time a Bun-detected script ran on this Context) — there's no hook
+                // into the JVM's own process-start instant with nanosecond resolution
+                // (`ProcessHandle.info().startInstant()` is millisecond-resolution wall-clock
+                // time, not comparable to `System.nanoTime()`'s arbitrary epoch). Returns a
+                // plain `number` (matching real Bun, which does NOT return a `bigint` here),
+                // so — also matching real Bun — precision degrades past 2^53 ns (~104 days).
+                var NANOSECONDS_ORIGIN = Java.type('java.lang.System').nanoTime();
+                function bunNanoseconds() {
+                    return Number(Java.type('java.lang.System').nanoTime() - NANOSECONDS_ORIGIN);
+                }
+
+                // --- Bun.which(command, options?) ---
+                //
+                // Synchronous (verified against real Bun 1.3.13 — no `await` needed, returns
+                // a plain string or `null` directly), unlike `child_process`-style async
+                // lookups. `options.PATH` overrides the `PATH` searched (verified: passing a
+                // bogus `PATH` makes `which('ls')` return `null` even though `ls` is
+                // genuinely on the real `PATH`).
+                function bunWhich(command, options) {
+                    var cmd = String(command);
+                    var JFile2 = Java.type('java.io.File');
+                    function isExecutableFile(f) {
+                        return f.isFile() && f.canExecute();
+                    }
+                    if (cmd.indexOf('/') !== -1) {
+                        var direct = new JFile2(cmd);
+                        return isExecutableFile(direct) ? direct.getAbsolutePath() : null;
+                    }
+                    var pathEnv = (options && options.PATH !== undefined)
+                        ? String(options.PATH)
+                        : String(globalThis.process.env.PATH || '');
+                    var dirs = pathEnv.split(JFile2.pathSeparator);
+                    for (var i = 0; i < dirs.length; i++) {
+                        if (!dirs[i]) continue;
+                        var candidate = new JFile2(dirs[i], cmd);
+                        if (isExecutableFile(candidate)) return candidate.getAbsolutePath();
+                    }
+                    return null;
+                }
+
+                // --- Bun.randomUUIDv7(encoding?, timestampMs?) ---
+                //
+                // Verified against real Bun 1.3.13: a 48-bit big-endian millisecond
+                // timestamp, a `7` version nibble, 74 bits of randomness, and the standard
+                // variant bits (`10`) — the standard UUIDv7 layout (RFC 9562). `encoding`:
+                // `undefined`/`"hex"` both produce the canonical dashed 36-character string
+                // (verified — real Bun's `"hex"` is NOT a bare 32-hex-digit string, both
+                // forms are dashed); `"base64"`/`"base64url"` produce the compact 16-byte
+                // encoding of the same bits.
+                function bunRandomUUIDv7(encoding, timestampMs) {
+                    var ts = typeof timestampMs === 'number' ? Math.floor(timestampMs) : Date.now();
+                    var JSecureRandom2 = Java.type('java.security.SecureRandom');
+                    var sr = new JSecureRandom2();
+                    var randBytes = new JByteArray(10);
+                    sr.nextBytes(randBytes);
+                    var bytes = new Array(16);
+                    bytes[0] = Math.floor(ts / 1099511627776) & 0xff;
+                    bytes[1] = Math.floor(ts / 4294967296) & 0xff;
+                    bytes[2] = Math.floor(ts / 16777216) & 0xff;
+                    bytes[3] = Math.floor(ts / 65536) & 0xff;
+                    bytes[4] = Math.floor(ts / 256) & 0xff;
+                    bytes[5] = ts & 0xff;
+                    bytes[6] = ((0x7 << 4) | ((randBytes[0] & 0xff) >>> 4)) & 0xff;
+                    bytes[7] = randBytes[1] & 0xff;
+                    bytes[8] = ((0x2 << 6) | ((randBytes[2] & 0xff) >>> 2)) & 0xff;
+                    for (var i = 9; i < 16; i++) bytes[i] = randBytes[i - 6] & 0xff;
+                    var enc = encoding || 'hex';
+                    if (enc === 'base64' || enc === 'base64url') {
+                        return globalThis.Buffer.from(bytes).toString(enc);
+                    }
+                    function hex(n) { return (n < 16 ? '0' : '') + n.toString(16); }
+                    var h = bytes.map(hex).join('');
+                    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' +
+                        h.slice(16, 20) + '-' + h.slice(20);
+                }
+
+                // --- Bun.gzipSync / Bun.gunzipSync / Bun.deflateSync / Bun.inflateSync ---
+                //
+                // Verified against real Bun 1.3.13: all four return a plain `Uint8Array`
+                // (not a Node `Buffer`, not an `ArrayBuffer`). Backed by
+                // `java.util.zip.Deflater`/`Inflater` (raw `deflate`/`inflate`) and
+                // `java.util.zip.GZIPOutputStream`/`GZIPInputStream` (`gzip`/`gunzip`) —
+                // standard DEFLATE/gzip, so this is a real, standard, interoperable
+                // compressed format — but an exact byte-for-byte match against real Bun's
+                // own zlib output isn't attempted/asserted (DEFLATE doesn't guarantee one
+                // true bitstream per input across implementations/compression-level
+                // choices) — only that Mycelium's own gzip/gunzip and deflate/inflate
+                // round-trip correctly, and that real Bun can successfully gunzip/inflate
+                // what this shim produces (and vice versa), which is the property that
+                // actually matters for interoperability.
+                function bunGzipSync(data, options) {
+                    var bytes = bytesFromHashInput(data);
+                    var jBytes = new JByteArray(bytes.length);
+                    for (var i = 0; i < bytes.length; i++) jBytes[i] = bytes[i] << 24 >> 24;
+                    var JByteArrayOutputStream = Java.type('java.io.ByteArrayOutputStream');
+                    var JGZIPOutputStream = Java.type('java.util.zip.GZIPOutputStream');
+                    var baos = new JByteArrayOutputStream();
+                    var gzos = new JGZIPOutputStream(baos);
+                    gzos.write(jBytes, 0, jBytes.length);
+                    gzos.close();
+                    return new Uint8Array(bytesToJs(baos.toByteArray()));
+                }
+                function bunGunzipSync(data) {
+                    var bytes = bytesFromHashInput(data);
+                    var jBytes = new JByteArray(bytes.length);
+                    for (var i = 0; i < bytes.length; i++) jBytes[i] = bytes[i] << 24 >> 24;
+                    var JByteArrayInputStream = Java.type('java.io.ByteArrayInputStream');
+                    var JGZIPInputStream = Java.type('java.util.zip.GZIPInputStream');
+                    var gzis = new JGZIPInputStream(new JByteArrayInputStream(jBytes));
+                    return new Uint8Array(bytesToJs(readAllBytes(gzis)));
+                }
+                function bunDeflateSync(data, options) {
+                    var bytes = bytesFromHashInput(data);
+                    var jBytes = new JByteArray(bytes.length);
+                    for (var i = 0; i < bytes.length; i++) jBytes[i] = bytes[i] << 24 >> 24;
+                    var JDeflater = Java.type('java.util.zip.Deflater');
+                    var level = (options && typeof options.level === 'number') ? options.level : JDeflater.DEFAULT_COMPRESSION;
+                    var deflater = new JDeflater(level);
+                    deflater.setInput(jBytes);
+                    deflater.finish();
+                    var JByteArrayOutputStream2 = Java.type('java.io.ByteArrayOutputStream');
+                    var out = new JByteArrayOutputStream2();
+                    var chunk = new JByteArray(8192);
+                    while (!deflater.finished()) {
+                        var n = deflater.deflate(chunk);
+                        out.write(chunk, 0, n);
+                    }
+                    deflater.end();
+                    return new Uint8Array(bytesToJs(out.toByteArray()));
+                }
+                function bunInflateSync(data) {
+                    var bytes = bytesFromHashInput(data);
+                    var jBytes = new JByteArray(bytes.length);
+                    for (var i = 0; i < bytes.length; i++) jBytes[i] = bytes[i] << 24 >> 24;
+                    var JInflater = Java.type('java.util.zip.Inflater');
+                    var inflater = new JInflater();
+                    inflater.setInput(jBytes);
+                    var JByteArrayOutputStream3 = Java.type('java.io.ByteArrayOutputStream');
+                    var out2 = new JByteArrayOutputStream3();
+                    var chunk2 = new JByteArray(8192);
+                    while (!inflater.finished()) {
+                        var n2 = inflater.inflate(chunk2);
+                        if (n2 === 0) {
+                            if (inflater.needsInput() || inflater.needsDictionary()) break;
+                        }
+                        out2.write(chunk2, 0, n2);
+                    }
+                    inflater.end();
+                    return new Uint8Array(bytesToJs(out2.toByteArray()));
+                }
+
+                // --- Bun.stringWidth(str, options?) ---
+                //
+                // Approximates Bun's `wcwidth`-based terminal display-width calculation:
+                // strips ANSI escape sequences (unless `options.countAnsiEscapeCodes` is
+                // `true` — verified against real Bun that this option makes escape-code
+                // bytes count toward the width instead of being stripped), then counts each
+                // code point as width 1, except a curated set of "wide" ranges (CJK,
+                // fullwidth forms, common emoji blocks) counted as width 2 — verified against
+                // real Bun for plain ASCII, a CJK string, and an emoji. NOT a full Unicode
+                // East-Asian-Width/emoji-ZWJ-sequence implementation (real Bun's is far more
+                // exhaustive) — a codepoint outside the curated wide-ranges list here always
+                // counts as width 1, which won't match real Bun for the long tail of exotic
+                // wide/combining/zero-width scripts.
+                var ANSI_ESCAPE_RE = new RegExp(String.fromCharCode(0x1b) + '\\[[0-9;]*[a-zA-Z]', 'g');
+                function isWideCodePoint(cp) {
+                    return (
+                        (cp >= 0x1100 && cp <= 0x115f) ||
+                        (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+                        (cp >= 0xac00 && cp <= 0xd7a3) ||
+                        (cp >= 0xf900 && cp <= 0xfaff) ||
+                        (cp >= 0xff00 && cp <= 0xff60) ||
+                        (cp >= 0xffe0 && cp <= 0xffe6) ||
+                        (cp >= 0x1f300 && cp <= 0x1faff)
+                    );
+                }
+                function bunStringWidth(str, options) {
+                    var s = String(str);
+                    if (!(options && options.countAnsiEscapeCodes)) {
+                        s = s.replace(ANSI_ESCAPE_RE, '');
+                    }
+                    var width = 0;
+                    for (var i = 0; i < s.length; i++) {
+                        var code = s.codePointAt(i);
+                        if (code > 0xffff) i++;
+                        width += isWideCodePoint(code) ? 2 : 1;
+                    }
+                    return width;
+                }
+
                 // --- Bun.argv / Bun.version / Bun.revision / Bun.env ---
                 //
                 // Bun.argv's shape matches Node's process.argv convention: [execPath,
@@ -2567,6 +3619,22 @@ class Mycelium(
                     spawn: bunSpawn,
                     spawnSync: bunSpawnSync,
                     serve: bunServe,
+                    hash: bunHash,
+                    CryptoHasher: CryptoHasher,
+                    password: bunPassword,
+                    deepEquals: bunDeepEquals,
+                    escapeHTML: bunEscapeHTML,
+                    inspect: bunInspect,
+                    sleep: bunSleep,
+                    sleepSync: bunSleepSync,
+                    nanoseconds: bunNanoseconds,
+                    which: bunWhich,
+                    randomUUIDv7: bunRandomUUIDv7,
+                    gzipSync: bunGzipSync,
+                    gunzipSync: bunGunzipSync,
+                    deflateSync: bunDeflateSync,
+                    inflateSync: bunInflateSync,
+                    stringWidth: bunStringWidth,
                 };
             })();
         """.trimIndent()

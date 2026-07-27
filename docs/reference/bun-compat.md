@@ -94,9 +94,9 @@ single-threaded-Context caveat, which this inherits identically).
   Bun-detected script — they are not leaked into plain Node-compat scripts).
 - Returned server handle: `.port`, `.hostname`, `.development`, `.url`, `.fetch`, `.stop()`,
   `.reload({ fetch })`.
-- **Not implemented**: WebSocket upgrades (`server.upgrade(req)`), TLS options, unix socket
-  listening, `idleTimeout`, request/response streaming bodies (bodies are read/written
-  fully-buffered, never as a `ReadableStream`).
+- **Not implemented (this HTTP-only path)**: TLS options, unix socket listening,
+  `idleTimeout`, request/response streaming bodies (bodies are read/written fully-buffered,
+  never as a `ReadableStream`).
 - **Known limitation: non-ASCII header values are mangled.** Real Bun preserves raw
   non-ASCII bytes in request/response header values byte-for-byte — verified directly: a
   request header value containing literal UTF-8 bytes for `é` sent to a real `bun`
@@ -111,6 +111,132 @@ single-threaded-Context caveat, which this inherits identically).
   this would likely require replacing the JDK `HttpServer` backing (or post-processing raw
   header bytes before the JDK's own parsing touches them), which hasn't been attempted here
   — documented as a known gap rather than silently fixed or hidden.
+
+### WebSocket support in `Bun.serve({ websocket })`
+
+`Bun.serve({ fetch, websocket })` — real Bun's `server.upgrade(req, { data, headers })` +
+`websocket: { open, message, close, ping, pong, drain, sendPings }` shape.
+
+**Architecturally, this is a wholesale separate server implementation from the plain-HTTP
+`Bun.serve` above, not an extension of it.** `com.sun.net.httpserver.HttpServer` (the plain
+path's backing) cannot support a WebSocket upgrade at all: `HttpExchange` has no API to hijack
+the underlying socket, and calling `sendResponseHeaders` with no fixed `Content-Length`
+installs a chunked- or fixed-length framing filter on the response stream that's incompatible
+with then writing a raw byte stream (the WebSocket frames) over the same connection — there is
+no clean way to keep using `HttpServer` once a connection needs to stop looking like discrete
+request/response pairs. So: **when, and only when, `options.websocket` is present**, `Bun.serve`
+routes to a completely separate code path that runs its own minimal HTTP/1.1 server directly
+over `java.net.ServerSocket`/`Socket` — parsing requests, performing the RFC 6455 upgrade
+handshake, and framing WebSocket messages entirely by hand. **The plain-HTTP `Bun.serve` path
+(no `websocket` option) is completely unchanged** — same `HttpServer` backing, same code,
+verified by BunCompatTest.kt's/BunFuzzTest.kt's full existing suite still passing unmodified.
+
+What's implemented on the WebSocket-capable path:
+
+- RFC 6455 opening handshake: validates `Upgrade: websocket` / `Connection: Upgrade` /
+  `Sec-WebSocket-Key`, computes `Sec-WebSocket-Accept` via the RFC's fixed formula
+  (`base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`) — independently
+  cross-checked in `BunSocketTest.kt` (a from-scratch client implementation computes its own
+  expected Accept header and asserts the server's matches, rather than trusting the shim's own
+  math).
+- `server.upgrade(req, { data, headers })` — returns `true`/`false` exactly like real Bun
+  (`false` for a non-upgrade request or a request already upgraded, never throws); `data`
+  becomes `ws.data`, `headers` are merged into the 101 response.
+- `ServerWebSocket`: `.send()`/`.sendText()`/`.sendBinary()`, `.ping()`/`.pong()` (auto-replies
+  to an incoming Ping with a Pong unless `sendPings: false`), `.close(code, reason)` (sends a
+  Close frame then closes the socket — does **not** wait for the peer's own Close-frame
+  acknowledgement first, a simplification vs. the strict RFC closing handshake),
+  `.terminate()` (abrupt, `SO_LINGER(0)`), `.subscribe()`/`.unsubscribe()`/`.isSubscribed()`/
+  `.subscriptions`, `.data`, `.readyState`, `.remoteAddress`, `.cork()` (runs the callback
+  synchronously — no actual batching optimization, since every write here is already a
+  synchronous blocking Java I/O call).
+- `server.publish(topic, data)` / `ws.publish()`/`.publishText()`/`.publishBinary()` — pub/sub
+  across every WebSocket connection this one `Bun.serve()` call owns.
+- Message fragmentation (continuation frames) is reassembled correctly; both directions were
+  exercised with real fragmented input in `BunSocketTest.kt`
+  (`bunServeWebSocketFragmentedFrames`).
+- Messages spanning the 16-bit and 64-bit RFC 6455 extended-length encoding are handled (a
+  200 KiB round-trip is exercised live in `bunServeWebSocketLargeMessage`).
+
+**Known gaps on this path, not silently faked:**
+
+- **No HTTP keep-alive** — every connection is closed after exactly one HTTP request/response
+  (or, if upgraded, runs its WebSocket lifetime and then closes) — a real client that expects
+  to reuse a connection for a second plain HTTP request will find it already closed.
+- **No chunked request bodies** — `Content-Length` only.
+- **No permessage-deflate (WebSocket compression)** — the `compress` argument accepted by
+  `.send()`/`.publish()`/etc. for API-shape compatibility is silently ignored (never actually
+  compresses); a client that requires compression will simply get an uncompressed frame.
+- **`idleTimeout`/`maxPayloadLength`/`backpressureLimit`/`closeOnBackpressureLimit` are not
+  enforced.**
+- **No TLS, no unix-socket listening** for this path either.
+- **The closing handshake doesn't wait for the peer's Close-frame acknowledgement** before
+  tearing down the TCP connection (see `.close()` above).
+
+### `Bun.connect(options)` / `Bun.listen(options)` — raw TCP sockets
+
+`Bun.connect({ hostname, port, socket, data })` (client) and
+`Bun.listen({ hostname, port, socket, data })` (server), both backed by plain
+`java.net.Socket`/`java.net.ServerSocket`. `SocketHandler` callbacks implemented:
+`open`/`data`/`close`/`error`/`end`/`connectError`/`timeout` (`drain`/`handshake` are accepted
+as handler properties for API-shape compatibility but never invoked — see below).
+`Socket<Data>` instance surface: `.write()`/`.end()`/`.ref()`/`.unref()`/`.timeout()`/
+`.terminate()`/`.shutdown()`/`.flush()`/`.reload()`/`.readyState`/`.remoteAddress`/
+`.remotePort`/`.remoteFamily`/`.localAddress`/`.localPort`. `Bun.listen`'s returned
+`TCPSocketListener`: `.port`/`.hostname`/`.data`/`.stop()`/`.ref()`/`.unref()`/`.reload()`.
+
+- **Not implemented**: TLS (`{ tls: ... }`), unix domain sockets (`{ unix: ... }`), fd-based
+  sockets (`{ fd: ... }`) — all throw a clear, specific error rather than silently behaving
+  like a plain TCP socket. `socket.upgradeTLS()` doesn't exist. Backpressure is never actually
+  reported (every write is a synchronous blocking Java I/O call, so `.write()` either fully
+  succeeds or returns `-1`, never a partial/backpressure signal) — the `drain` handler is
+  therefore never invoked.
+- Verified against real Bun 1.3.13's documented `bun.d.ts` type shapes (this repo has a full
+  `bun` source checkout available for cross-referencing exact signatures, e.g. `readyState`'s
+  numeric meanings) — **not independently re-verified by hand-probing every field against a
+  live process**, unlike the MIME table/`Bun.write`/`Bun.spawn` sections above. Live
+  wire-protocol correctness (the part that actually matters for interop) IS checked in both
+  directions in `BunSocketTest.kt`: the shim as a `Bun.connect` client against a real `bun`
+  `Bun.listen` server, and a real `bun` `Bun.connect` client against the shim's own
+  `Bun.listen` server — see that file's own top comment.
+
+### `Bun.udpSocket(options)`
+
+`Bun.udpSocket({ hostname, port, socket })` (unconnected — `socket.data(sock, buf, port,
+address)`, `sock.send(data, port, address)`) and `Bun.udpSocket({ connect: { hostname, port },
+socket })` (connected to a fixed peer — `sock.send(data)` takes no destination), backed by
+`java.net.DatagramSocket`. `sendMany` matches real Bun's documented shapes: a flat
+`[data, data, ...]` array for a connected socket, a flat
+`[data, port, address, data, port, address, ...]` triplet array for an unconnected one.
+
+- Not exercised against a real `bun` UDP peer in `BunSocketTest.kt` (only shim-to-shim) —
+  unlike the TCP/WebSocket sections above, there is no live-parity check for this one yet.
+- No TLS-equivalent (DTLS) — not a thing real Bun's UDP socket supports either.
+
+### Concurrency model for all of the above (and why it's structured this way)
+
+None of `Bun.connect`/`Bun.listen`/`Bun.udpSocket`/the WebSocket path spawn a dedicated
+`java.lang.Thread` to block on socket I/O and call back into the shared GraalJS `Context` —
+that pattern (used by `node-stdlib/net.mjs`'s own `Socket#_startReader`/`Server#listen`) is
+NOT safe in general: `TimerManager.kt`'s own doc comment and `node-stdlib/child_process.mjs`'s
+`_startIoThread` doc comment both describe an actually-hit bug in this codebase's history — a
+background `Thread` newly started from a guest callback isn't guaranteed a clean shot at
+(re-)entering the shared, non-multithreaded-by-default GraalJS Context, and losing that race
+throws `IllegalStateException: Multi threaded access requested ... but is not allowed` *before
+a single line of the thread's own body runs*. Instead, every accept/read/receive loop here is
+driven by `globalThis.setTimeout` ticks on whichever thread already owns the Context (the same
+thread that called `runFile`/`eval`) — each socket gets a short `SO_TIMEOUT` (~20ms); each tick
+attempts one bounded-blocking read/accept/receive, delivering data (or a new connection)
+immediately and rescheduling with zero delay to drain a burst promptly, while a
+`SocketTimeoutException` (nothing arrived within the bound) just reschedules the next poll.
+HTTP request parsing and WebSocket framing on the `Bun.serve({ websocket })` path additionally
+buffer raw bytes across ticks and parse incrementally, so a request/frame arriving fragmented
+across several small reads (or several arriving in one read) is handled correctly without ever
+blocking on a read for more than one poll's timeout. This means a listening
+`Bun.listen`/`Bun.serve({ websocket })` server (or an open `Bun.connect` socket) keeps
+`runFile`'s event loop alive for as long as it's open, matching real Node/Bun/Deno's own
+"the process stays alive while a listener is open" behavior — a script must explicitly
+`.stop()`/`.close()`/`.terminate()` everything it opened, or `runFile` never returns.
 
 ### `Bun.env`
 
@@ -534,7 +660,7 @@ by name:
 - **`Bun.build`**, **`Bun.Transpiler`**,
   **`Bun.S3Client`/`Bun.s3`**, **`Bun.redis`**, **`Bun.SQL`/`Bun.sql`**,
   **`Bun.color`**, **`Bun.semver`**, **`Bun.Cookie`/`Bun.CookieMap`**, **`Bun.Worker`**,
-  **`Bun.connect`/`Bun.listen`/`Bun.udpSocket`** (raw TCP/UDP), **`Bun.FileSystemRouter`**,
+  **`Bun.FileSystemRouter`**,
   **`Bun.plugin`**, **`Bun.deepMatch`**, **`Bun.hash.cityHash32`/`.xxHash32`/`.xxHash64`/
   `.xxHash3`/`.rapidhash`** — none implemented (`Bun.hash`'s other sub-algorithms, plus
   `CryptoHasher`/`password`/`deepEquals`/`escapeHTML`/`inspect`/`sleep`/`sleepSync`/
@@ -552,11 +678,18 @@ by name:
   reachable via `Java.type(...)` interop. Implementing this would need either patching
   GraalJS internals or waiting a microtask turn (which would silently violate `peek`'s whole
   synchronous contract) — left unimplemented rather than faked.
+- **`Bun.connect`/`Bun.listen`/`Bun.udpSocket`, and WebSocket support in `Bun.serve` are now
+  IMPLEMENTED** — see their own sections above (moved out of this list; TLS/unix-socket
+  variants of all three, and a handful of other specifics, remain unimplemented as noted
+  there).
+- **Client-side `new WebSocket(url)`** (connecting OUT to a server, as opposed to
+  `Bun.serve`'s server-side `ServerWebSocket`) is **not implemented** — this shim only
+  implements the server side of the WebSocket protocol. A script that needs to connect to a
+  remote WebSocket server (rather than accept incoming ones) needs real Bun/Node.
 - **`bun:test`** — Bun's built-in test runner is not available; Mycelium has no Bun-specific
   test-runner integration.
-- WebSocket support anywhere (`Bun.serve`'s `server.upgrade`, `new WebSocket(...)`,
-  `Bun.serve`'s `websocket` handler option).
-- `Bun.serve`'s streaming request/response bodies, TLS, unix sockets, `idleTimeout`.
+- `Bun.serve`'s streaming request/response bodies (both the plain-HTTP and
+  `websocket`-enabled paths).
 - Deno compatibility (`Deno.*`) — a separate, unimplemented follow-up; not attempted here at
   all, including no detection logic for it.
 

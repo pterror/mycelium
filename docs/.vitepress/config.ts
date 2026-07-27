@@ -12,14 +12,30 @@ export default withMermaid(
 
     themeConfig: {
       nav: [
-        { text: 'Guide', link: '/mod-authoring' },
+        { text: 'Guide', link: '/guide/getting-started' },
+        { text: 'Reference', link: '/reference/languages' },
+        { text: 'Mods', link: '/mods/' },
         { text: 'Research', link: '/research/java-modding-systems' },
       ],
 
       sidebar: [
         {
           text: 'Guide',
-          items: [{ text: 'Mod authoring', link: '/mod-authoring' }],
+          items: [
+            { text: 'Getting started', link: '/guide/getting-started' },
+            { text: 'Architecture', link: '/guide/architecture' },
+          ],
+        },
+        {
+          text: 'Reference',
+          items: [{ text: 'Language support', link: '/reference/languages' }],
+        },
+        {
+          text: 'Mods',
+          items: [
+            { text: 'Overview', link: '/mods/' },
+            { text: 'Mod authoring guide', link: '/mod-authoring' },
+          ],
         },
         {
           text: 'Research',

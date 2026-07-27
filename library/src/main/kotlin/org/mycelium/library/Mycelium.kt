@@ -1208,11 +1208,14 @@ class Mycelium(
         // `Bun.sqlite`/`bun:sqlite` (would need a JVM SQLite binding, e.g. sqlite-jdbc, as a
         // new dependency — same open question TODO.md already has for Node's own
         // `node:sqlite`), `Bun.$` (shell), `Bun.hash`, `Bun.password`, `Bun.build`,
-        // `Bun.Transpiler`, `bun:test`, and WebSocket upgrade support in `Bun.serve` — see
-        // docs/reference/bun-compat.md for the authoritative, checked-against-upstream list
-        // of what is/isn't covered. `Bun.write` and `Bun.spawn`/`Bun.spawnSync` *are*
-        // implemented below (see their own comments) — verified against real `bun` 1.3.13
-        // via small probe scripts, same discipline as everything else in this file.
+        // `Bun.Transpiler`, `bun:test`, and client-side `new WebSocket(url)` (connecting OUT
+        // to a remote server) — see docs/reference/bun-compat.md for the authoritative,
+        // checked-against-upstream list of what is/isn't covered. `Bun.write`,
+        // `Bun.spawn`/`Bun.spawnSync`, `Bun.connect`/`Bun.listen`/`Bun.udpSocket`, and
+        // server-side WebSocket support in `Bun.serve({ websocket })` *are* implemented below
+        // (see their own comments) — verified against real `bun` 1.3.13 via small probe
+        // scripts and, for the networking primitives, live wire-protocol parity tests in
+        // BunSocketTest.kt, same discipline as everything else in this file.
         //
         // Golden values below (MIME-type guesses, the non-Response-return placeholder body,
         // the default-error-response body, ENOENT error shape, Bun.argv's shape) were
@@ -2376,6 +2379,1136 @@ class Mycelium(
                 if (typeof globalThis.Request === 'undefined') globalThis.Request = MyceliumRequest;
                 if (typeof globalThis.Response === 'undefined') globalThis.Response = MyceliumResponse;
 
+                // --- Networking: Bun.connect / Bun.listen / Bun.udpSocket / Bun.serve's
+                // `websocket` option ---
+                //
+                // All backed by plain java.net sockets (Socket/ServerSocket/DatagramSocket) —
+                // there's no real OS-level event loop here, same caveat as node-stdlib's
+                // http.mjs/net.mjs/child_process.mjs. UNLIKE net.mjs's own Socket#_startReader/
+                // Server#listen (which spawn a dedicated `java.lang.Thread` that blocks on I/O
+                // and calls straight back into the shared GraalJS context), every read/accept/
+                // receive loop below is driven entirely by `globalThis.setTimeout` ticks on
+                // whichever thread already owns the Context — see TimerManager.kt's own doc
+                // comment and, concretely, node-stdlib/child_process.mjs's `_startIoThread` doc
+                // comment: a background Thread newly started from a guest callback "isn't
+                // guaranteed a clean shot at (re-)entering the shared GraalJS context, and
+                // losing that race throws [an] IllegalStateException ... before a single line
+                // of the thread's own body runs" — an actually-hit bug in this codebase's
+                // history (it's what TimerManager.kt itself replaced a one-thread-per-timer
+                // design with), not a theoretical one. Each socket/server-socket gets a short
+                // SO_TIMEOUT (tens of ms); each tick attempts one bounded-blocking read/accept/
+                // receive — data (or a new connection) is delivered immediately and the next
+                // tick is scheduled with zero delay to drain any burst promptly, while a
+                // SocketTimeoutException (nothing arrived within the bound) just reschedules
+                // the next poll. HTTP request parsing and WebSocket framing additionally
+                // accumulate raw bytes into a small per-connection buffer across ticks and
+                // parse incrementally, so a request/frame arriving fragmented across several
+                // small reads (or several arriving in one read) is handled correctly without
+                // ever blocking on a read for more than one poll's timeout.
+                //
+                // TLS (`{ tls: ... }`) and UNIX domain sockets (`{ unix: ... }`/`{ fd: ... }`)
+                // are NOT implemented for any of Bun.connect/Bun.listen/Bun.udpSocket — plain
+                // TCP/UDP host:port only, matching net.mjs's own documented UNIX-socket gap.
+                // Calling with those options throws a clear, specific error rather than
+                // silently behaving like a plain TCP/UDP socket.
+
+                var JSocketClient = Java.type('java.net.Socket');
+                var JServerSocketRaw = Java.type('java.net.ServerSocket');
+                var JDatagramSocket = Java.type('java.net.DatagramSocket');
+                var JDatagramPacket = Java.type('java.net.DatagramPacket');
+                var JInetAddress = Java.type('java.net.InetAddress');
+                var JSocketTimeoutException = Java.type('java.net.SocketTimeoutException');
+                var JMessageDigest = Java.type('java.security.MessageDigest');
+                var JBase64 = Java.type('java.util.Base64');
+
+                // Converts a (possibly partial) Java byte[] into a JS Uint8Array — the mirror
+                // image of jsBytesToJava above. `len` defaults to the array's full length;
+                // callers pass an explicit shorter length when the array is a reusable
+                // scratch buffer that's only partially filled (e.g. a socket read/UDP receive
+                // buffer).
+                function bytesToU8(jBytes, len) {
+                    var n = len === undefined ? jBytes.length : len;
+                    var arr = new Uint8Array(n);
+                    for (var i = 0; i < n; i++) arr[i] = jBytes[i] & 0xFF;
+                    return arr;
+                }
+
+                function stringToU8(str) {
+                    return bytesToU8(toJByteArray(str));
+                }
+
+                // Normalizes any of Bun's socket-write-accepted "data" shapes (string,
+                // ArrayBuffer, TypedArray/DataView) down to a Java byte[] — same shape as
+                // javaBytesFromWriteData above, minus the BunFile/Response/Promise cases that
+                // don't apply to socket writes.
+                function socketDataToJavaBytes(data) {
+                    if (typeof data === 'string') return toJByteArray(data);
+                    if (data instanceof ArrayBuffer) return jsBytesToJava(new Uint8Array(data));
+                    if (ArrayBuffer.isView(data)) {
+                        return jsBytesToJava(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+                    }
+                    return toJByteArray(String(data));
+                }
+
+                // --- Bun.connect() / Bun.listen(): raw TCP client/server sockets ---
+                //
+                // Verified against real Bun 1.3.13's documented `SocketHandler` shape
+                // (open/close/error/data/drain/end/connectError/timeout/handshake) and
+                // `Socket` instance surface (write/end/ref/unref/timeout/terminate/shutdown/
+                // readyState/remoteAddress/remotePort/remoteFamily/localAddress/localPort/
+                // flush/reload) via bun.d.ts (this repo has a full bun source checkout
+                // available for cross-referencing type signatures where a live probe can't
+                // easily exercise the exact shape, e.g. readyState's numeric meanings).
+                // `drain` (backpressure) and `handshake` (TLS) are accepted as handler
+                // properties but never invoked — this shim's writes are always synchronous
+                // blocking Java I/O, so there's no backpressure state to report, and there's
+                // no TLS support at all (see the section-level comment above).
+
+                // Shared by Bun.connect's client socket and Bun.listen's per-accepted-socket
+                // wrapper — wraps an already-open (or about-to-open, for the client case)
+                // java.net.Socket as the `Socket<Data>` object real Bun scripts see, and
+                // starts the dedicated reader thread that drives `handler.data`/`.end`/
+                // `.error`/`.close`.
+                function makeBunSocketWrapper(jSocket, handler, dataCtx, listenerHandle) {
+                    var closed = false;
+                    var readyState = 1; // 1 = Established, matching bun.d.ts's Socket#readyState doc
+                    var wrapper = { data: dataCtx };
+                    if (listenerHandle !== undefined && listenerHandle !== null) wrapper.listener = listenerHandle;
+                    Object.defineProperty(wrapper, 'readyState', { get: function () { return readyState; } });
+                    try {
+                        wrapper.remoteAddress = String(jSocket.getInetAddress().getHostAddress());
+                        wrapper.remoteFamily = wrapper.remoteAddress.indexOf(':') !== -1 ? 'IPv6' : 'IPv4';
+                        wrapper.remotePort = jSocket.getPort();
+                        wrapper.localAddress = String(jSocket.getLocalAddress().getHostAddress());
+                        wrapper.localFamily = wrapper.localAddress.indexOf(':') !== -1 ? 'IPv6' : 'IPv4';
+                        wrapper.localPort = jSocket.getLocalPort();
+                    } catch (e) {
+                        // best-effort — leave address fields undefined if the JVM can't report them
+                    }
+                    wrapper.authorized = false; // no TLS support — never authorized
+                    wrapper.alpnProtocol = null;
+
+                    function closeSocket() {
+                        if (closed) return;
+                        closed = true;
+                        readyState = 0;
+                        try { if (!jSocket.isClosed()) jSocket.close(); } catch (e) {}
+                    }
+
+                    wrapper.write = function (data, byteOffset, byteLength) {
+                        if (closed) return -1;
+                        try {
+                            var bytes;
+                            if (typeof data === 'string' || byteOffset === undefined) {
+                                bytes = socketDataToJavaBytes(data);
+                            } else {
+                                var view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                                var end = byteLength === undefined ? view.length : (byteOffset + byteLength);
+                                bytes = jsBytesToJava(view.subarray(byteOffset, end));
+                            }
+                            jSocket.getOutputStream().write(bytes, 0, bytes.length);
+                            return bytes.length;
+                        } catch (e) {
+                            return -1;
+                        }
+                    };
+                    wrapper.end = function (data, byteOffset, byteLength) {
+                        var n = -1;
+                        if (data !== undefined) n = wrapper.write(data, byteOffset, byteLength);
+                        try { if (!jSocket.isOutputShutdown() && !jSocket.isClosed()) jSocket.shutdownOutput(); } catch (e) {}
+                        return n;
+                    };
+                    wrapper.shutdown = function (halfClose) {
+                        try {
+                            if (halfClose) {
+                                if (!jSocket.isOutputShutdown()) jSocket.shutdownOutput();
+                            } else {
+                                closeSocket();
+                            }
+                        } catch (e) {}
+                    };
+                    wrapper.terminate = function () {
+                        try { jSocket.setSoLinger(true, 0); } catch (e) {}
+                        closeSocket();
+                    };
+                    wrapper.close = wrapper.terminate;
+                    wrapper.timeout = function (seconds) {
+                        try { jSocket.setSoTimeout(Math.max(0, Math.floor(Number(seconds) * 1000))); } catch (e) {}
+                    };
+                    wrapper.flush = function () {};
+                    wrapper.ref = function () {};
+                    wrapper.unref = function () {};
+                    wrapper.reload = function (newHandler) {
+                        if (newHandler) handler = newHandler;
+                    };
+                    wrapper.disableRenegotiation = function () {};
+
+                    // Reads are driven by `globalThis.setTimeout` ticks on the SAME thread
+                    // that owns the GraalJS Context (see TIMERS_INIT_SCRIPT/TimerManager),
+                    // never by a dedicated `java.lang.Thread` calling back into the Context —
+                    // see this section's own top comment and, concretely, child_process.mjs's
+                    // `_startIoThread` doc comment: a background Thread newly started from a
+                    // guest callback "isn't guaranteed a clean shot at (re-)entering the
+                    // shared GraalJS context, and losing that race throws ... before a single
+                    // line of the thread's own body runs" — an actually-hit bug in this
+                    // codebase's history, not a theoretical one. Each tick sets a short
+                    // SO_TIMEOUT on the socket and attempts one bounded-blocking read: data
+                    // available within the timeout is delivered immediately (and the next
+                    // tick is scheduled with zero delay, to drain a burst of data promptly);
+                    // no data within the timeout raises SocketTimeoutException, which just
+                    // means "nothing new yet" and reschedules the next poll normally.
+                    var SOCKET_POLL_TIMEOUT_MS = 20;
+                    var SOCKET_POLL_IDLE_DELAY_MS = 5;
+                    try { jSocket.setSoTimeout(SOCKET_POLL_TIMEOUT_MS); } catch (e) {}
+                    var readBuf = new JByteArray(65536);
+                    function pollTick() {
+                        if (closed) return;
+                        var n;
+                        try {
+                            n = jSocket.getInputStream().read(readBuf, 0, readBuf.length);
+                        } catch (e) {
+                            if (e instanceof JSocketTimeoutException) {
+                                globalThis.setTimeout(pollTick, SOCKET_POLL_IDLE_DELAY_MS);
+                                return;
+                            }
+                            if (!closed && typeof handler.error === 'function') {
+                                try {
+                                    handler.error(wrapper, e instanceof Error ? e : new Error(String(e && e.message ? e.message : e)));
+                                } catch (e2) {
+                                    console.error('mycelium: Bun socket error handler threw:', e2 && e2.stack ? e2.stack : e2);
+                                }
+                            }
+                            closeSocket();
+                            if (typeof handler.close === 'function') {
+                                try { handler.close(wrapper, new Error('socket closed after an I/O error')); } catch (e3) {
+                                    console.error('mycelium: Bun socket close handler threw:', e3 && e3.stack ? e3.stack : e3);
+                                }
+                            }
+                            return;
+                        }
+                        if (n === -1) {
+                            if (typeof handler.end === 'function') {
+                                try { handler.end(wrapper); } catch (e) {
+                                    console.error('mycelium: Bun socket end handler threw:', e && e.stack ? e.stack : e);
+                                }
+                            }
+                            closeSocket();
+                            if (typeof handler.close === 'function') {
+                                try { handler.close(wrapper, undefined); } catch (e) {
+                                    console.error('mycelium: Bun socket close handler threw:', e && e.stack ? e.stack : e);
+                                }
+                            }
+                            return;
+                        }
+                        if (n > 0 && typeof handler.data === 'function') {
+                            var chunk = globalThis.Buffer.from(bytesToU8(readBuf, n));
+                            try {
+                                handler.data(wrapper, chunk);
+                            } catch (e) {
+                                console.error('mycelium: Bun socket data handler threw:', e && e.stack ? e.stack : e);
+                            }
+                        }
+                        if (!closed) globalThis.setTimeout(pollTick, 0);
+                    }
+                    globalThis.setTimeout(pollTick, 0);
+                    return wrapper;
+                }
+
+                function bunConnect(options) {
+                    options = options || {};
+                    return new Promise(function (resolve, reject) {
+                        if (options.unix) {
+                            reject(new Error('mycelium: Bun.connect() to a UNIX domain socket is not implemented — only TCP hostname:port connections are supported'));
+                            return;
+                        }
+                        if (options.fd !== undefined) {
+                            reject(new Error('mycelium: Bun.connect() to an existing file descriptor is not implemented'));
+                            return;
+                        }
+                        if (options.tls) {
+                            reject(new Error('mycelium: Bun.connect() does not support TLS ({ tls: ... }) — plain TCP only'));
+                            return;
+                        }
+                        var handler = options.socket || {};
+                        var host = String(options.hostname);
+                        var port = Number(options.port);
+                        var jSocket = new JSocketClient();
+                        try {
+                            jSocket.connect(new JInetSocketAddress(host, port), 0);
+                        } catch (e) {
+                            var err = e instanceof Error ? e : new Error(String(e && e.message ? e.message : e));
+                            if (typeof handler.connectError === 'function') {
+                                try { handler.connectError(undefined, err); } catch (e2) {}
+                            }
+                            reject(err);
+                            return;
+                        }
+                        var wrapper = makeBunSocketWrapper(jSocket, handler, options.data, undefined);
+                        if (typeof handler.open === 'function') {
+                            try { handler.open(wrapper); } catch (e) {
+                                console.error('mycelium: Bun.connect socket.open handler threw:', e && e.stack ? e.stack : e);
+                            }
+                        }
+                        resolve(wrapper);
+                    });
+                }
+
+                function bunListen(options) {
+                    options = options || {};
+                    if (options.unix) {
+                        throw new Error('mycelium: Bun.listen() on a UNIX domain socket is not implemented — only TCP hostname:port listening is supported');
+                    }
+                    if (options.tls) {
+                        throw new Error('mycelium: Bun.listen() does not support TLS ({ tls: ... }) — plain TCP only');
+                    }
+                    var handler = options.socket || {};
+                    var host = options.hostname || '0.0.0.0';
+                    var port = options.port !== undefined ? Number(options.port) : 0;
+                    var jServerSocket = new JServerSocketRaw();
+                    jServerSocket.bind(new JInetSocketAddress(host, port));
+                    var actualPort = jServerSocket.getLocalPort();
+
+                    var listenerHandle = {
+                        port: actualPort,
+                        hostname: host,
+                        data: options.data,
+                        stop: function (closeActiveConnections) {
+                            try { if (!jServerSocket.isClosed()) jServerSocket.close(); } catch (e) {}
+                        },
+                        ref: function () {},
+                        unref: function () {},
+                        reload: function (newOptions) {
+                            if (newOptions && newOptions.socket) handler = newOptions.socket;
+                        },
+                    };
+
+                    // Accept polling, same setTimeout-tick discipline as makeBunSocketWrapper's
+                    // reader above (no dedicated java.lang.Thread) — see that function's doc
+                    // comment for why.
+                    try { jServerSocket.setSoTimeout(20); } catch (e) {}
+                    function acceptTick() {
+                        if (jServerSocket.isClosed()) return;
+                        var jClientSocket;
+                        try {
+                            jClientSocket = jServerSocket.accept();
+                        } catch (e) {
+                            if (e instanceof JSocketTimeoutException) {
+                                globalThis.setTimeout(acceptTick, 5);
+                                return;
+                            }
+                            return; // server socket closed (or some other terminal accept error) — stop polling
+                        }
+                        var wrapper = makeBunSocketWrapper(jClientSocket, handler, undefined, listenerHandle);
+                        if (typeof handler.open === 'function') {
+                            try { handler.open(wrapper); } catch (e) {
+                                console.error('mycelium: Bun.listen socket.open handler threw:', e && e.stack ? e.stack : e);
+                            }
+                        }
+                        globalThis.setTimeout(acceptTick, 0);
+                    }
+                    globalThis.setTimeout(acceptTick, 0);
+
+                    return listenerHandle;
+                }
+
+                // --- Bun.udpSocket(): UDP client/server ---
+                //
+                // Verified against real Bun 1.3.13's `Bun.udpSocket` typings (bun.d.ts's
+                // `udp` namespace): unconnected sockets get `data(socket, buf, port, address)`
+                // and `send(data, port, address)`; a socket created with `{ connect: {
+                // hostname, port } }` gets a fixed peer instead — `data(socket, buf, port,
+                // address)` still reports the sender per-packet, but `send(data)` takes no
+                // destination (always the connected peer). `sendMany` matches bun's
+                // documented shapes: a flat `[data, data, ...]` array for a connected socket,
+                // a flat `[data, port, address, data, port, address, ...]` triplet array for
+                // an unconnected one.
+                function bunUdpSocket(options) {
+                    options = options || {};
+                    return new Promise(function (resolve, reject) {
+                        try {
+                            var handler = options.socket || {};
+                            var binaryType = options.binaryType || 'buffer';
+                            var isConnected = !!options.connect;
+                            var jSocket;
+                            if (isConnected) {
+                                jSocket = new JDatagramSocket();
+                                jSocket.connect(JInetAddress.getByName(String(options.connect.hostname)), Number(options.connect.port));
+                            } else {
+                                var bindPort = options.port !== undefined ? Number(options.port) : 0;
+                                var bindHost = options.hostname || '0.0.0.0';
+                                jSocket = new JDatagramSocket(new JInetSocketAddress(bindHost, bindPort));
+                            }
+                            var closed = false;
+                            var localAddr = jSocket.getLocalAddress();
+                            var localHostname = String(localAddr ? localAddr.getHostAddress() : (options.hostname || '0.0.0.0'));
+                            var localPort = jSocket.getLocalPort();
+
+                            function convertIncoming(jBytes, len) {
+                                var u8 = bytesToU8(jBytes, len);
+                                if (binaryType === 'arraybuffer') {
+                                    var ab = new ArrayBuffer(u8.length);
+                                    new Uint8Array(ab).set(u8);
+                                    return ab;
+                                }
+                                if (binaryType === 'uint8array') return u8;
+                                return globalThis.Buffer.from(u8);
+                            }
+
+                            var socketObj = { hostname: localHostname, port: localPort, binaryType: binaryType };
+                            Object.defineProperty(socketObj, 'closed', { get: function () { return closed; } });
+                            Object.defineProperty(socketObj, 'address', { get: function () {
+                                return { address: socketObj.hostname, port: socketObj.port, family: socketObj.hostname.indexOf(':') !== -1 ? 'IPv6' : 'IPv4' };
+                            } });
+                            if (isConnected) {
+                                Object.defineProperty(socketObj, 'remoteAddress', { get: function () {
+                                    return { address: String(options.connect.hostname), port: Number(options.connect.port), family: String(options.connect.hostname).indexOf(':') !== -1 ? 'IPv6' : 'IPv4' };
+                                } });
+                            }
+                            socketObj.ref = function () {};
+                            socketObj.unref = function () {};
+                            socketObj.close = function () {
+                                if (closed) return;
+                                closed = true;
+                                try { jSocket.close(); } catch (e) {}
+                            };
+                            socketObj.reload = function (newHandler) { if (newHandler) handler = newHandler; };
+                            socketObj.send = isConnected
+                                ? function (data) {
+                                    if (closed) return false;
+                                    try {
+                                        var bytes = socketDataToJavaBytes(data);
+                                        jSocket.send(new JDatagramPacket(bytes, bytes.length));
+                                        return true;
+                                    } catch (e) { return false; }
+                                }
+                                : function (data, port, address) {
+                                    if (closed) return false;
+                                    try {
+                                        var bytes = socketDataToJavaBytes(data);
+                                        jSocket.send(new JDatagramPacket(bytes, bytes.length, JInetAddress.getByName(String(address)), Number(port)));
+                                        return true;
+                                    } catch (e) { return false; }
+                                };
+                            socketObj.sendMany = function (packets) {
+                                var sent = 0;
+                                if (isConnected) {
+                                    for (var i = 0; i < packets.length; i++) {
+                                        if (socketObj.send(packets[i])) sent++;
+                                    }
+                                } else {
+                                    for (var j = 0; j + 2 < packets.length; j += 3) {
+                                        if (socketObj.send(packets[j], packets[j + 1], packets[j + 2])) sent++;
+                                    }
+                                }
+                                return sent;
+                            };
+
+                            // setTimeout-tick polling, not a dedicated java.lang.Thread — same
+                            // rationale as makeBunSocketWrapper's reader above.
+                            try { jSocket.setSoTimeout(20); } catch (e) {}
+                            var udpBuf = new JByteArray(65536);
+                            function udpTick() {
+                                if (closed) return;
+                                try {
+                                    var packet = new JDatagramPacket(udpBuf, udpBuf.length);
+                                    jSocket.receive(packet);
+                                    if (typeof handler.data === 'function') {
+                                        var fromAddr = String(packet.getAddress().getHostAddress());
+                                        var fromPort = packet.getPort();
+                                        var payload = convertIncoming(udpBuf, packet.getLength());
+                                        try {
+                                            handler.data(socketObj, payload, fromPort, fromAddr);
+                                        } catch (e) {
+                                            console.error('mycelium: Bun.udpSocket data handler threw:', e && e.stack ? e.stack : e);
+                                        }
+                                    }
+                                } catch (e) {
+                                    if (e instanceof JSocketTimeoutException) {
+                                        if (!closed) globalThis.setTimeout(udpTick, 5);
+                                        return;
+                                    }
+                                    if (!closed && typeof handler.error === 'function') {
+                                        try {
+                                            handler.error(socketObj, e instanceof Error ? e : new Error(String(e && e.message ? e.message : e)));
+                                        } catch (e2) {}
+                                    }
+                                    return;
+                                }
+                                if (!closed) globalThis.setTimeout(udpTick, 0);
+                            }
+                            globalThis.setTimeout(udpTick, 0);
+
+                            resolve(socketObj);
+                        } catch (e) {
+                            reject(e instanceof Error ? e : new Error(String(e && e.message ? e.message : e)));
+                        }
+                    });
+                }
+
+                // --- WebSocket protocol (RFC 6455) support for Bun.serve({ websocket }) ---
+                //
+                // The regular (non-WebSocket) Bun.serve path below stays backed by
+                // com.sun.net.httpserver.HttpServer, completely unchanged. `HttpServer`
+                // cannot be used for WebSocket upgrades at all: `HttpExchange` exposes no way
+                // to hijack the underlying socket, and `sendResponseHeaders` with no
+                // Content-Length installs a framing filter (chunked or fixed-length) on the
+                // response stream that is incompatible with writing a raw byte stream
+                // afterward — there is no clean way to keep using `HttpServer` once a
+                // connection has to stop looking like discrete request/response pairs. So:
+                // when `options.websocket` is present, Bun.serve takes a COMPLETELY SEPARATE
+                // code path (bunServeWithWebSocket below) that runs its own minimal HTTP/1.1
+                // server directly over `java.net.ServerSocket`/`Socket`, handling both plain
+                // `fetch` requests and the WebSocket upgrade handshake + framing by hand. This
+                // is a deliberately narrow HTTP/1.1 implementation — enough to serve a
+                // `fetch`-handler response or perform the upgrade handshake — NOT a general
+                // replacement for the JDK HttpServer: no keep-alive (every connection closes
+                // after one request/response, or after the WebSocket closes), no chunked
+                // request bodies, no HTTP/2, no permessage-deflate compression. These gaps
+                // are listed in docs/reference/bun-compat.md rather than hidden.
+                var WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+                var WS_STATUS_TEXT = {
+                    101: 'Switching Protocols', 200: 'OK', 400: 'Bad Request',
+                    404: 'Not Found', 500: 'Internal Server Error',
+                };
+
+                function sha1Base64(str) {
+                    var md = JMessageDigest.getInstance('SHA-1');
+                    var digest = md.digest(toJByteArray(str));
+                    return String(JBase64.getEncoder().encodeToString(digest));
+                }
+
+                // Both parsers below are INCREMENTAL — they take a plain JS array of already-
+                // received byte values (0-255) accumulated so far across possibly many
+                // setTimeout-tick reads (see bunServeWithWebSocket's handleConnection/
+                // runWebSocketConnection) and either return `null` ("not a complete
+                // request/frame yet — keep polling for more bytes") or the parsed result plus
+                // how many leading bytes of the buffer it consumed. This shape — rather than
+                // blocking InputStream reads — is what lets HTTP request parsing and WebSocket
+                // framing both tolerate a request/frame arriving fragmented across many small
+                // TCP reads (or several frames arriving in a single read) without ever
+                // blocking the Context-owning thread inside a read call for more than one
+                // bounded-timeout poll.
+
+                // Minimal HTTP/1.1 request-line + header parser — Content-Length request
+                // bodies only (no chunked transfer-encoding on the request side). Returns
+                // `null` when the header block (and, once Content-Length is known, the body)
+                // isn't fully buffered yet. `{ error: true, consumed }` signals a malformed
+                // request line (missing method/path) — the caller closes the connection.
+                function tryParseRawHttpRequest(bufArr) {
+                    var headerEnd = -1;
+                    var headerEndLen = 0;
+                    for (var i = 0; i + 3 < bufArr.length; i++) {
+                        if (bufArr[i] === 13 && bufArr[i + 1] === 10 && bufArr[i + 2] === 13 && bufArr[i + 3] === 10) {
+                            headerEnd = i;
+                            headerEndLen = 4;
+                            break;
+                        }
+                    }
+                    if (headerEnd === -1) {
+                        for (var k = 0; k + 1 < bufArr.length; k++) {
+                            if (bufArr[k] === 10 && bufArr[k + 1] === 10) {
+                                headerEnd = k;
+                                headerEndLen = 2;
+                                break;
+                            }
+                        }
+                    }
+                    if (headerEnd === -1) return null; // header block not fully received yet
+
+                    var headerBytes = new JByteArray(headerEnd);
+                    for (var h = 0; h < headerEnd; h++) {
+                        var hv = bufArr[h];
+                        headerBytes[h] = hv > 127 ? hv - 256 : hv;
+                    }
+                    var headerText = String(new JString(headerBytes, JCharset.UTF_8));
+                    var lines = headerText.split(/\r\n|\n/);
+                    var requestLine = lines[0] || '';
+                    var parts = requestLine.split(' ');
+                    if (parts.length < 2) return { error: true, consumed: headerEnd + headerEndLen };
+                    var method = parts[0];
+                    var path = parts[1];
+                    var headers = {};
+                    for (var li = 1; li < lines.length; li++) {
+                        var line = lines[li];
+                        if (line === '') continue;
+                        var idx = line.indexOf(':');
+                        if (idx === -1) continue;
+                        var key = line.slice(0, idx).trim().toLowerCase();
+                        var value = line.slice(idx + 1).trim();
+                        headers[key] = headers[key] !== undefined ? headers[key] + ', ' + value : value;
+                    }
+                    var contentLength = headers['content-length'] ? parseInt(headers['content-length'], 10) : 0;
+                    var bodyStart = headerEnd + headerEndLen;
+                    if (bufArr.length < bodyStart + contentLength) return null; // body not fully received yet
+                    var bodyBytes = new JByteArray(contentLength);
+                    for (var bi = 0; bi < contentLength; bi++) {
+                        var bv = bufArr[bodyStart + bi];
+                        bodyBytes[bi] = bv > 127 ? bv - 256 : bv;
+                    }
+                    return { method: method, path: path, headers: headers, bodyBytes: bodyBytes, consumed: bodyStart + contentLength };
+                }
+
+                // Parses one WebSocket frame off the front of `bufArr` (a plain JS array of
+                // already-received byte values), returning `null` if the buffer doesn't yet
+                // contain a complete frame. Client-to-server frames are always masked per RFC
+                // 6455 §5.3 — unmasked here (the returned `payload` is a plain Uint8Array of
+                // application bytes). Extended 64-bit lengths are decoded as a JS number (safe
+                // for the message sizes any realistic test/usage here would exercise;
+                // genuinely multi-petabyte frames would lose precision — an accepted gap given
+                // this is a compat shim, not a production WebSocket server).
+                function tryParseWsFrame(bufArr) {
+                    if (bufArr.length < 2) return null;
+                    var b0 = bufArr[0];
+                    var b1 = bufArr[1];
+                    var fin = (b0 & 0x80) !== 0;
+                    var opcode = b0 & 0x0F;
+                    var masked = (b1 & 0x80) !== 0;
+                    var len = b1 & 0x7F;
+                    var pos = 2;
+                    if (len === 126) {
+                        if (bufArr.length < pos + 2) return null;
+                        len = (bufArr[pos] << 8) | bufArr[pos + 1];
+                        pos += 2;
+                    } else if (len === 127) {
+                        if (bufArr.length < pos + 8) return null;
+                        len = 0;
+                        for (var i = 0; i < 8; i++) len = len * 256 + bufArr[pos + i];
+                        pos += 8;
+                    }
+                    var maskKey = null;
+                    if (masked) {
+                        if (bufArr.length < pos + 4) return null;
+                        maskKey = [bufArr[pos], bufArr[pos + 1], bufArr[pos + 2], bufArr[pos + 3]];
+                        pos += 4;
+                    }
+                    if (bufArr.length < pos + len) return null; // payload not fully received yet
+                    var payload = new Uint8Array(len);
+                    for (var p = 0; p < len; p++) {
+                        var v = bufArr[pos + p];
+                        payload[p] = masked ? (v ^ maskKey[p % 4]) : v;
+                    }
+                    return { fin: fin, opcode: opcode, payload: payload, consumed: pos + len };
+                }
+
+                // Encodes one server-to-client WebSocket frame. Per RFC 6455 §5.1, server
+                // frames are NEVER masked (only client-to-server frames are).
+                function encodeWsFrame(opcode, payloadJBytes, fin) {
+                    var len = payloadJBytes.length;
+                    var headerLen = len < 126 ? 2 : (len <= 0xFFFF ? 4 : 10);
+                    var header = new JByteArray(headerLen);
+                    header[0] = ((fin === false ? 0x00 : 0x80) | (opcode & 0x0F)) << 24 >> 24;
+                    if (len < 126) {
+                        header[1] = len;
+                    } else if (len <= 0xFFFF) {
+                        header[1] = 126;
+                        header[2] = (len >> 8) & 0xFF;
+                        header[3] = (len & 0xFF) << 24 >> 24;
+                    } else {
+                        header[1] = 127 << 24 >> 24;
+                        for (var i = 0; i < 8; i++) {
+                            var byteVal = Math.floor(len / Math.pow(2, 8 * (7 - i))) & 0xFF;
+                            header[2 + i] = byteVal << 24 >> 24;
+                        }
+                    }
+                    var full = new JByteArray(headerLen + len);
+                    for (var h = 0; h < headerLen; h++) full[h] = header[h];
+                    for (var p = 0; p < len; p++) full[headerLen + p] = payloadJBytes[p];
+                    return full;
+                }
+
+                // Bun.serve's WebSocket-capable path — see this section's own top comment for
+                // why this is a wholesale separate implementation from the JDK-HttpServer-
+                // backed bunServeHttpServer below, engaged only when `options.websocket` is
+                // present (so the existing, JDK-backed non-WebSocket Bun.serve path — and
+                // every test written against it — is entirely unaffected).
+                function bunServeWithWebSocket(options, fetchHandler, errorHandler, host, requestedPort) {
+                    var wsHandler = options.websocket;
+                    if (typeof wsHandler.message !== 'function') {
+                        throw new TypeError('Bun.serve({ websocket }) requires a "message" handler function');
+                    }
+                    var sendPings = wsHandler.sendPings !== false;
+                    var jServerSocket = new JServerSocketRaw();
+                    jServerSocket.bind(new JInetSocketAddress(host, requestedPort));
+                    var actualPort = jServerSocket.getLocalPort();
+                    var displayHost = host === '0.0.0.0' ? 'localhost' : host;
+
+                    var topics = {};
+                    function registerTopic(topic, ws) {
+                        if (!topics[topic]) topics[topic] = [];
+                        if (topics[topic].indexOf(ws) === -1) topics[topic].push(ws);
+                    }
+                    function unregisterTopic(topic, ws) {
+                        if (!topics[topic]) return;
+                        var idx = topics[topic].indexOf(ws);
+                        if (idx !== -1) topics[topic].splice(idx, 1);
+                    }
+                    function unregisterAllTopics(ws) {
+                        Object.keys(topics).forEach(function (t) { unregisterTopic(t, ws); });
+                    }
+
+                    var serverHandle = {
+                        port: actualPort,
+                        hostname: host,
+                        development: !!options.development,
+                        fetch: fetchHandler,
+                        get url() {
+                            return new globalThis.URL('http://' + displayHost + ':' + actualPort + '/');
+                        },
+                        stop: function (closeActiveConnections) {
+                            try { if (!jServerSocket.isClosed()) jServerSocket.close(); } catch (e) {}
+                        },
+                        reload: function (newOptions) {
+                            if (newOptions && typeof newOptions.fetch === 'function') fetchHandler = newOptions.fetch;
+                        },
+                        // Upgrades the in-flight request whose raw connection context was
+                        // stashed on it by handleConnection below. Returns false (never
+                        // throws) for anything that isn't a genuine WebSocket upgrade request
+                        // — missing/foreign request object, already-upgraded, or missing the
+                        // `Upgrade: websocket`/`Connection: Upgrade`/`Sec-WebSocket-Key`
+                        // headers a real client would send — matching real Bun's
+                        // `server.upgrade()` returning `false` rather than throwing.
+                        upgrade: function (request, upgradeOptions) {
+                            var ctx = request && request.__mysocketCtx;
+                            if (!ctx || ctx.upgraded) return false;
+                            var reqHeaders = ctx.rawHeaders;
+                            var upgradeHeader = (reqHeaders['upgrade'] || '').toLowerCase();
+                            var connectionHeader = (reqHeaders['connection'] || '').toLowerCase();
+                            var key = reqHeaders['sec-websocket-key'];
+                            if (upgradeHeader !== 'websocket' || connectionHeader.indexOf('upgrade') === -1 || !key) {
+                                return false;
+                            }
+                            upgradeOptions = upgradeOptions || {};
+                            var respLines = [
+                                'HTTP/1.1 101 Switching Protocols',
+                                'Upgrade: websocket',
+                                'Connection: Upgrade',
+                                'Sec-WebSocket-Accept: ' + sha1Base64(key + WS_GUID),
+                            ];
+                            if (upgradeOptions.headers) {
+                                var extra = upgradeOptions.headers;
+                                if (typeof extra.forEach === 'function') {
+                                    extra.forEach(function (v, k) { respLines.push(k + ': ' + v); });
+                                } else {
+                                    Object.keys(extra).forEach(function (k) { respLines.push(k + ': ' + extra[k]); });
+                                }
+                            }
+                            respLines.push('', '');
+                            try {
+                                var headerBytes = toJByteArray(respLines.join('\r\n'));
+                                ctx.outStream.write(headerBytes, 0, headerBytes.length);
+                                ctx.outStream.flush();
+                            } catch (e) {
+                                return false;
+                            }
+                            ctx.upgraded = true;
+                            ctx.wsData = upgradeOptions.data;
+                            return true;
+                        },
+                        publish: function (topic, data, compress) {
+                            var subs = topics[topic];
+                            if (!subs || subs.length === 0) return 0;
+                            var sent = 0;
+                            subs.slice().forEach(function (ws) {
+                                var status = ws.send(data, compress);
+                                if (status > 0) sent += status;
+                            });
+                            return sent;
+                        },
+                    };
+
+                    // Wraps one upgraded connection as the `ServerWebSocket` object real Bun
+                    // scripts see, closing over this server's topic registry (registerTopic/
+                    // unregisterTopic/serverHandle.publish) so `ws.subscribe`/`ws.publish`
+                    // work across every connection this same Bun.serve() call owns.
+                    function makeServerWebSocket(jSocket, outStream, ctx) {
+                        var closed = false;
+                        var readyState = 1; // OPEN
+                        var subs = [];
+                        var ws = { data: ctx.wsData, binaryType: 'nodebuffer' };
+                        Object.defineProperty(ws, 'readyState', { get: function () { return readyState; } });
+                        Object.defineProperty(ws, 'remoteAddress', { get: function () {
+                            try { return String(jSocket.getInetAddress().getHostAddress()); } catch (e) { return ''; }
+                        } });
+                        Object.defineProperty(ws, 'subscriptions', { get: function () { return subs.slice(); } });
+
+                        function rawSend(opcode, payloadU8) {
+                            if (closed) return 0;
+                            try {
+                                var jBytes = jsBytesToJava(payloadU8);
+                                var frame = encodeWsFrame(opcode, jBytes, true);
+                                outStream.write(frame, 0, frame.length);
+                                outStream.flush();
+                                return jBytes.length;
+                            } catch (e) {
+                                return 0;
+                            }
+                        }
+                        function toU8(data) {
+                            if (typeof data === 'string') return stringToU8(data);
+                            if (data instanceof ArrayBuffer) return new Uint8Array(data);
+                            if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                            return stringToU8(String(data));
+                        }
+
+                        function finish(code, reason, sendCloseFrame) {
+                            if (closed) return;
+                            closed = true;
+                            readyState = 3; // CLOSED
+                            if (sendCloseFrame) {
+                                try {
+                                    var reasonU8 = stringToU8(reason || '');
+                                    var payload = new Uint8Array(2 + reasonU8.length);
+                                    payload[0] = (code >> 8) & 0xFF;
+                                    payload[1] = code & 0xFF;
+                                    payload.set(reasonU8, 2);
+                                    rawSend(0x8, payload);
+                                } catch (e) {}
+                            }
+                            unregisterAllTopics(ws);
+                            try { if (!jSocket.isClosed()) jSocket.close(); } catch (e) {}
+                            if (typeof wsHandler.close === 'function') {
+                                try { wsHandler.close(ws, code, reason); } catch (e) {
+                                    console.error('mycelium: Bun.serve websocket.close handler threw:', e && e.stack ? e.stack : e);
+                                }
+                            }
+                        }
+
+                        ws.send = function (data, compress) { return rawSend(typeof data === 'string' ? 0x1 : 0x2, toU8(data)); };
+                        ws.sendText = function (data, compress) { return rawSend(0x1, toU8(String(data))); };
+                        ws.sendBinary = function (data, compress) { return rawSend(0x2, toU8(data)); };
+                        ws.ping = function (data) { return rawSend(0x9, data !== undefined ? toU8(data) : new Uint8Array(0)); };
+                        ws.pong = function (data) { return rawSend(0xA, data !== undefined ? toU8(data) : new Uint8Array(0)); };
+                        ws.publish = function (topic, data, compress) { return serverHandle.publish(topic, data, compress); };
+                        ws.publishText = function (topic, data) { return serverHandle.publish(topic, String(data)); };
+                        ws.publishBinary = function (topic, data) { return serverHandle.publish(topic, data); };
+                        ws.subscribe = function (topic) {
+                            if (subs.indexOf(topic) === -1) subs.push(topic);
+                            registerTopic(topic, ws);
+                        };
+                        ws.unsubscribe = function (topic) {
+                            var idx = subs.indexOf(topic);
+                            if (idx !== -1) subs.splice(idx, 1);
+                            unregisterTopic(topic, ws);
+                        };
+                        ws.isSubscribed = function (topic) { return subs.indexOf(topic) !== -1; };
+                        ws.cork = function (callback) { return callback(ws); };
+                        ws.getBufferedAmount = function () { return 0; };
+                        ws.close = function (code, reason) { finish(code !== undefined ? code : 1000, reason || '', true); };
+                        ws.terminate = function () {
+                            try { jSocket.setSoLinger(true, 0); } catch (e) {}
+                            finish(1006, '', false);
+                        };
+                        ws.__finishAbrupt = function (code, reason) { finish(code, reason, false); };
+                        ws.__isClosed = function () { return closed; };
+                        return ws;
+                    }
+
+                    // Drives one upgraded connection's frame-read loop to completion —
+                    // reassembling fragmented messages (continuation frames), answering pings
+                    // automatically (unless `sendPings: false`), and running the RFC 6455
+                    // closing handshake (echoing the peer's Close frame) when the peer
+                    // initiates a close. Like handleConnection below, this is driven entirely
+                    // by `globalThis.setTimeout` ticks on the Context-owning thread — NOT a
+                    // dedicated `java.lang.Thread` blocked in a read loop — see
+                    // makeBunSocketWrapper's doc comment (above, in the Bun.connect/Bun.listen
+                    // section) for why a background Thread calling back into the Context is
+                    // unsafe in this codebase. `initialBuf` seeds the frame buffer with any
+                    // bytes handleConnection's HTTP parser already read past the end of the
+                    // upgrade request itself (e.g. a client that pipelines its first WS frame
+                    // immediately behind the upgrade request in the same TCP segment).
+                    function runWebSocketConnection(jSocket, inStream, outStream, ctx, initialBuf) {
+                        var ws = makeServerWebSocket(jSocket, outStream, ctx);
+                        if (typeof wsHandler.open === 'function') {
+                            try { wsHandler.open(ws); } catch (e) {
+                                console.error('mycelium: Bun.serve websocket.open handler threw:', e && e.stack ? e.stack : e);
+                            }
+                        }
+                        var fragments = null;
+                        var fragmentsOpcode = null;
+                        var wsBuf = initialBuf ? initialBuf.slice() : [];
+                        var wsReadChunk = new JByteArray(65536);
+
+                        function dispatchMessage(opcode, parts) {
+                            var total = 0;
+                            for (var i = 0; i < parts.length; i++) total += parts[i].length;
+                            var combined = new Uint8Array(total);
+                            var off = 0;
+                            for (var i2 = 0; i2 < parts.length; i2++) { combined.set(parts[i2], off); off += parts[i2].length; }
+                            var messageArg = opcode === 0x1
+                                ? String(new JString(jsBytesToJava(combined), JCharset.UTF_8))
+                                : globalThis.Buffer.from(combined);
+                            try {
+                                var r = wsHandler.message(ws, messageArg);
+                                if (r && typeof r.then === 'function') {
+                                    r.catch(function (e) {
+                                        console.error('mycelium: Bun.serve websocket.message handler rejected:', e);
+                                    });
+                                }
+                            } catch (e) {
+                                console.error('mycelium: Bun.serve websocket.message handler threw:', e && e.stack ? e.stack : e);
+                            }
+                        }
+
+                        function finalizeAbrupt() {
+                            if (!ws.__isClosed()) ws.__finishAbrupt(1006, ''); // no Close frame seen
+                            try { if (!jSocket.isClosed()) jSocket.close(); } catch (e) {}
+                        }
+
+                        // Parses as many complete frames as are already sitting in `wsBuf`
+                        // (there may be several if the peer's writes and our reads didn't
+                        // line up 1:1). Returns `false` once the connection has been finished
+                        // (Close frame handled, or a parse/handler path closed it) — callers
+                        // must stop scheduling further ticks in that case — or `true` to mean
+                        // "keep polling for more bytes".
+                        function processBufferedFrames() {
+                            while (true) {
+                                var frame = tryParseWsFrame(wsBuf);
+                                if (frame === null) return true; // not enough bytes yet for a full frame
+                                wsBuf = wsBuf.slice(frame.consumed);
+
+                                if (frame.opcode === 0x8) { // Close
+                                    var payload = frame.payload;
+                                    var code = 1005;
+                                    var reason = '';
+                                    if (payload.length >= 2) {
+                                        code = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
+                                        if (payload.length > 2) {
+                                            var reasonBytes = new JByteArray(payload.length - 2);
+                                            for (var ri = 2; ri < payload.length; ri++) reasonBytes[ri - 2] = payload[ri];
+                                            reason = String(new JString(reasonBytes, JCharset.UTF_8));
+                                        }
+                                    }
+                                    ws.close(code, reason); // echoes the Close frame, then closes the socket
+                                    return false;
+                                }
+                                if (frame.opcode === 0x9) { // Ping
+                                    var pingPayload = frame.payload;
+                                    if (sendPings) ws.pong(pingPayload);
+                                    if (typeof wsHandler.ping === 'function') {
+                                        try { wsHandler.ping(ws, globalThis.Buffer.from(pingPayload)); } catch (e) {}
+                                    }
+                                } else if (frame.opcode === 0xA) { // Pong
+                                    if (typeof wsHandler.pong === 'function') {
+                                        try { wsHandler.pong(ws, globalThis.Buffer.from(frame.payload)); } catch (e) {}
+                                    }
+                                } else if (frame.opcode === 0x1 || frame.opcode === 0x2) { // Text / Binary
+                                    fragments = [frame.payload];
+                                    fragmentsOpcode = frame.opcode;
+                                    if (frame.fin) {
+                                        dispatchMessage(fragmentsOpcode, fragments);
+                                        fragments = null;
+                                        fragmentsOpcode = null;
+                                    }
+                                } else if (frame.opcode === 0x0) { // Continuation
+                                    if (fragments !== null) {
+                                        fragments.push(frame.payload);
+                                        if (frame.fin) {
+                                            dispatchMessage(fragmentsOpcode, fragments);
+                                            fragments = null;
+                                            fragmentsOpcode = null;
+                                        }
+                                    }
+                                }
+                                // else: unrecognized opcode — ignore rather than fail the connection
+
+                                if (ws.__isClosed()) return false; // the message handler itself may have called ws.close()/terminate()
+                            }
+                        }
+
+                        function tick() {
+                            if (ws.__isClosed() || jSocket.isClosed()) return;
+                            if (!processBufferedFrames()) return;
+                            if (ws.__isClosed() || jSocket.isClosed()) return;
+                            var n;
+                            try {
+                                n = inStream.read(wsReadChunk, 0, wsReadChunk.length);
+                            } catch (e) {
+                                if (e instanceof JSocketTimeoutException) {
+                                    globalThis.setTimeout(tick, 5);
+                                    return;
+                                }
+                                finalizeAbrupt();
+                                return;
+                            }
+                            if (n === -1) {
+                                finalizeAbrupt(); // peer closed the TCP connection without a Close frame
+                                return;
+                            }
+                            for (var i = 0; i < n; i++) wsBuf.push(wsReadChunk[i] & 0xFF);
+                            globalThis.setTimeout(tick, 0);
+                        }
+
+                        if (processBufferedFrames()) globalThis.setTimeout(tick, 0);
+                    }
+
+                    // Reads and dispatches exactly one HTTP request off `jClientSocket`, then
+                    // either sends a plain response and closes (no keep-alive — see this
+                    // section's top comment) or, if the fetch handler upgraded the request,
+                    // hands the connection off to runWebSocketConnection. Driven entirely by
+                    // `globalThis.setTimeout` ticks — see runWebSocketConnection's doc comment
+                    // just above for why (no dedicated java.lang.Thread).
+                    function handleConnection(jClientSocket) {
+                        try { jClientSocket.setTcpNoDelay(true); } catch (e) {}
+                        try { jClientSocket.setSoTimeout(20); } catch (e) {}
+                        var inStream, outStream;
+                        try {
+                            inStream = jClientSocket.getInputStream();
+                            outStream = jClientSocket.getOutputStream();
+                        } catch (e) {
+                            try { jClientSocket.close(); } catch (e2) {}
+                            return;
+                        }
+                        var recvBuf = [];
+                        var readChunk = new JByteArray(8192);
+
+                        function dispatchRequest(parsed) {
+                            var bodyText = parsed.bodyBytes.length > 0 ? String(new JString(parsed.bodyBytes, JCharset.UTF_8)) : '';
+                            var fullUrl = 'http://' + displayHost + ':' + actualPort + parsed.path;
+                            var ctx = { rawHeaders: parsed.headers, outStream: outStream, upgraded: false, wsData: undefined };
+                            var req = new MyceliumRequest(fullUrl, { method: parsed.method, headers: parsed.headers, _bodyText: bodyText });
+                            req.__mysocketCtx = ctx;
+
+                            function writeRawResponse(status, bytes, headers) {
+                                var lines = ['HTTP/1.1 ' + status + ' ' + (WS_STATUS_TEXT[status] || 'OK')];
+                                var seenContentLength = false;
+                                if (headers) {
+                                    headers.forEach(function (v, k) {
+                                        lines.push(k + ': ' + v);
+                                        if (k.toLowerCase() === 'content-length') seenContentLength = true;
+                                    });
+                                }
+                                if (!seenContentLength) lines.push('Content-Length: ' + bytes.length);
+                                lines.push('Connection: close');
+                                lines.push('', '');
+                                try {
+                                    var headerBytes = toJByteArray(lines.join('\r\n'));
+                                    outStream.write(headerBytes, 0, headerBytes.length);
+                                    if (bytes.length > 0) outStream.write(bytes, 0, bytes.length);
+                                    outStream.flush();
+                                } catch (e) {
+                                    // best-effort — nothing more to do if even the error path fails
+                                }
+                            }
+                            function sendDefault500() {
+                                var msg = 'Something went wrong!';
+                                writeRawResponse(500, toJByteArray(msg), (function () {
+                                    var h = new MyceliumHeaders(); h.set('content-type', 'text/plain'); return h;
+                                })());
+                            }
+                            function sendResponse(responseLike) {
+                                var response = responseLike instanceof MyceliumResponse
+                                    ? responseLike
+                                    : new MyceliumResponse('Welcome to Bun! To get started, return a Response object.');
+                                writeRawResponse(response.status, toJByteArray(response._bodyText || ''), response.headers);
+                            }
+                            function handleThrown(e) {
+                                console.error('mycelium: Bun.serve fetch handler threw:', e && e.stack ? e.stack : e);
+                                if (errorHandler) {
+                                    try {
+                                        var errResult = errorHandler(e);
+                                        if (errResult) { sendResponse(errResult); return; }
+                                    } catch (e2) {
+                                        // fall through to the default 500 below
+                                    }
+                                }
+                                sendDefault500();
+                            }
+                            function afterFetch(value) {
+                                if (ctx.upgraded) {
+                                    runWebSocketConnection(jClientSocket, inStream, outStream, ctx, recvBuf.slice(parsed.consumed));
+                                    return;
+                                }
+                                sendResponse(value);
+                                try { jClientSocket.close(); } catch (e) {}
+                            }
+
+                            var result;
+                            try {
+                                result = fetchHandler(req, serverHandle);
+                            } catch (syncErr) {
+                                if (ctx.upgraded) {
+                                    console.error('mycelium: Bun.serve fetch handler threw after upgrading:', syncErr && syncErr.stack ? syncErr.stack : syncErr);
+                                    runWebSocketConnection(jClientSocket, inStream, outStream, ctx, recvBuf.slice(parsed.consumed));
+                                } else {
+                                    handleThrown(syncErr);
+                                    try { jClientSocket.close(); } catch (e) {}
+                                }
+                                return;
+                            }
+                            if (result && typeof result.then === 'function') {
+                                result.then(afterFetch, function (e) {
+                                    if (ctx.upgraded) {
+                                        runWebSocketConnection(jClientSocket, inStream, outStream, ctx, recvBuf.slice(parsed.consumed));
+                                    } else {
+                                        handleThrown(e);
+                                        try { jClientSocket.close(); } catch (e2) {}
+                                    }
+                                });
+                            } else {
+                                afterFetch(result);
+                            }
+                        }
+
+                        function readTick() {
+                            if (jClientSocket.isClosed()) return;
+                            var n;
+                            try {
+                                n = inStream.read(readChunk, 0, readChunk.length);
+                            } catch (e) {
+                                if (e instanceof JSocketTimeoutException) {
+                                    globalThis.setTimeout(readTick, 5);
+                                    return;
+                                }
+                                try { jClientSocket.close(); } catch (e2) {}
+                                return;
+                            }
+                            if (n === -1) {
+                                try { jClientSocket.close(); } catch (e) {}
+                                return;
+                            }
+                            for (var i = 0; i < n; i++) recvBuf.push(readChunk[i] & 0xFF);
+                            var parsed;
+                            try {
+                                parsed = tryParseRawHttpRequest(recvBuf);
+                            } catch (e) {
+                                try { jClientSocket.close(); } catch (e2) {}
+                                return;
+                            }
+                            if (parsed === null) {
+                                globalThis.setTimeout(readTick, 0);
+                                return;
+                            }
+                            if (parsed.error) {
+                                try { jClientSocket.close(); } catch (e) {}
+                                return;
+                            }
+                            dispatchRequest(parsed);
+                        }
+
+                        globalThis.setTimeout(readTick, 0);
+                    }
+
+                    try { jServerSocket.setSoTimeout(20); } catch (e) {}
+                    function wsServerAcceptTick() {
+                        if (jServerSocket.isClosed()) return;
+                        var jClientSocket;
+                        try {
+                            jClientSocket = jServerSocket.accept();
+                        } catch (e) {
+                            if (e instanceof JSocketTimeoutException) {
+                                globalThis.setTimeout(wsServerAcceptTick, 5);
+                                return;
+                            }
+                            return; // server socket closed (or some other terminal accept error) — stop polling
+                        }
+                        handleConnection(jClientSocket);
+                        globalThis.setTimeout(wsServerAcceptTick, 0);
+                    }
+                    globalThis.setTimeout(wsServerAcceptTick, 0);
+
+                    return serverHandle;
+                }
+
                 // --- Bun.serve() ---
                 //
                 // Backed by the same com.sun.net.httpserver.HttpServer primitive as the
@@ -2385,6 +3518,12 @@ class Mycelium(
                 // because GraalJS transfers Context ownership to whichever thread calls into
                 // it, and no other thread may concurrently be inside the Context at the same
                 // moment — true here the same way it's true for http.mjs).
+                //
+                // Dispatches to bunServeWithWebSocket (see its own top comment) whenever
+                // `options.websocket` is present — HttpServer cannot support a WebSocket
+                // upgrade, so that case is handled by a wholesale separate raw-socket server
+                // instead. Every other option/behavior below is completely unchanged from
+                // before WebSocket support existed.
                 function bunServe(options) {
                     options = options || {};
                     var fetchHandler = options.fetch;
@@ -2394,7 +3533,13 @@ class Mycelium(
                     var errorHandler = typeof options.error === 'function' ? options.error : null;
                     var host = options.hostname || '0.0.0.0';
                     var requestedPort = options.port !== undefined ? Number(options.port) : 3000;
+                    if (options.websocket) {
+                        return bunServeWithWebSocket(options, fetchHandler, errorHandler, host, requestedPort);
+                    }
+                    return bunServeHttpServer(fetchHandler, errorHandler, host, requestedPort, !!options.development);
+                }
 
+                function bunServeHttpServer(fetchHandler, errorHandler, host, requestedPort, development) {
                     var httpServer = JHttpServer.create(new JInetSocketAddress(host, requestedPort), 0);
                     var displayHost = host === '0.0.0.0' ? 'localhost' : host;
 
@@ -2513,7 +3658,7 @@ class Mycelium(
                     var serverHandle = {
                         port: actualPort,
                         hostname: host,
-                        development: !!options.development,
+                        development: development,
                         fetch: fetchHandler,
                         get url() {
                             return new globalThis.URL('http://' + displayHost + ':' + actualPort + '/');
@@ -2567,6 +3712,9 @@ class Mycelium(
                     spawn: bunSpawn,
                     spawnSync: bunSpawnSync,
                     serve: bunServe,
+                    connect: bunConnect,
+                    listen: bunListen,
+                    udpSocket: bunUdpSocket,
                 };
             })();
         """.trimIndent()

@@ -97,9 +97,9 @@ val jvmRun by tasks.registering(JavaExec::class) {
     // exposed as a JS global. ptc-mod patches ReturnNode$TerminalPositionReturnNode,
     // JSFunctionCallNode, and FunctionRootNode to trampoline self tail-recursive calls
     // (`return f(...)` inside `f`) so they run in a loop instead of growing the stack. See
-    // mod-loader/ for the generic loader, example-mod/, null-safe-mod/,
-    // strict-equality-mod/, integer-division-mod/, operator-overloading-mod/, and ptc-mod/
-    // for those mods. Pass `-PmodsDir=<path>` to point at a
+    // mods/mod-loader/ for the generic loader, mods/example-mod/, mods/null-safe-mod/,
+    // mods/strict-equality-mod/, mods/integer-division-mod/, mods/operator-overloading-mod/,
+    // and mods/ptc-mod/ for those mods. Pass `-PmodsDir=<path>` to point at a
     // different mods directory instead of the default (a `mods/` staging directory under
     // the build dir, populated with all mods' jars).
     if (project.hasProperty("mod")) {

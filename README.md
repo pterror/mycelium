@@ -135,11 +135,11 @@ per-language-JAR loading, ~17GB to build, produced an ~887MB binary). JVM mode
   coroutines, and the `string`/`math`/`table`/`io`/`os`/`debug`/`package` standard
   libraries. Registered as language ID `lua`, loaded via the `luaLang` Gradle
   configuration like any other language pack.
-- **`mod-loader/`** — the generic Java agent (bytecode-patching DSL over ASM) that loads
-  and applies mods described by a `mod.json` manifest.
-- **`example-mod/`, `null-safe-mod/`, `strict-equality-mod/`, `integer-division-mod/`,
-  `operator-overloading-mod/`, `ptc-mod/`** — working example mods, each a standalone
-  Gradle module producing its own jar.
+- **`mods/mod-loader/`** — the generic Java agent (bytecode-patching DSL over ASM) that
+  loads and applies mods described by a `mod.json` manifest.
+- **`mods/example-mod/`, `mods/null-safe-mod/`, `mods/strict-equality-mod/`,
+  `mods/integer-division-mod/`, `mods/operator-overloading-mod/`, `mods/ptc-mod/`** —
+  working example mods, each a standalone Gradle module producing its own jar.
 - **`buildSrc/`** — shared Gradle Kotlin-DSL convention plugins.
 - **`docs/`** — mod-authoring guide plus research notes (Java modding systems survey,
   Mixin evaluation, Truffle-mod-loader feasibility).

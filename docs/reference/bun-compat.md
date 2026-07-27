@@ -214,6 +214,117 @@ GraalJS-Context-reentrancy reason).
 - `options.timeout`/`killSignal` (present on `node-stdlib/child_process.mjs`'s `spawn`) are
   **not** implemented for `Bun.spawn`/`Bun.spawnSync`.
 
+### `Bun.Glob`
+
+`new Bun.Glob(pattern)` exposes `.match(path)`, `.scan(cwdOrOptions)` (async-iterable),
+`.scanSync(cwdOrOptions)` (synchronous). Verified against real Bun 1.3.13 via probe scripts
+against a scratch directory tree (nested dirs, dotfiles, symlinks).
+
+- **Confirmed defaults**: `cwd` = `process.cwd()`, `dot: false`, `absolute: false`,
+  `onlyFiles: true`, `followSymlinks: false`. A nonexistent `cwd` throws an ENOENT-shaped
+  `Error`.
+- **`dot` only filters `.scan()`'s filesystem traversal, not `.match()`** — verified:
+  `new Bun.Glob("*").match(".dotfile")` is `true` against real Bun even though a default
+  `.scan()` of the same pattern excludes dotfiles. This shim reproduces that exactly:
+  `.match()` is a pure string test with no dot-based filtering at all.
+- **`onlyFiles`/`followSymlinks` interact non-obviously with symlinks**: a symlink pointing
+  at a regular file is excluded from a *default* (`onlyFiles: true, followSymlinks: false`)
+  scan the same way a directory is — it only appears once `onlyFiles: false` or
+  `followSymlinks: true` is set. Verified against real Bun and reproduced here via explicit
+  `NOFOLLOW_LINKS` checks (Java's own `Files.isRegularFile(path)` default *follows* symlinks,
+  which would otherwise misclassify a symlink-to-a-file as "a regular file").
+- **Supported glob syntax** (hand-rolled matcher — deliberately not
+  `java.nio.file.FileSystems.getPathMatcher("glob:...")`, whose semantics were checked and
+  diverge from Bun's, e.g. Java's `**` doesn't mean "zero or more path segments including
+  zero" the way a top-level `**/*.txt` matching a top-level file does against real Bun):
+  `*` (any run of chars within one path segment), `**` (zero or more entire path segments),
+  `?` (one char within a segment), `[abc]`/`[a-z]`/`[!abc]`/`[^abc]` (character classes),
+  `{a,b,c}` brace alternation (expanded into N separate OR'd patterns up front; top-level/
+  non-nested splitting only).
+- **Extglob forms are NOT implemented** (`!(pattern)`, `+(pattern)`, `@(pattern)`) —
+  probing real Bun found `new Bun.Glob("!(*.js)").match("y.js")` returns `true` for *both*
+  a `.js` name and a non-`.js` name, i.e. real Bun's own extglob-negation handling isn't a
+  consistent, faithfully-copyable signal in the first place. A leading `!`/`+`/`@` before a
+  `(` is treated as an ordinary literal character here.
+- No cycle detection when `followSymlinks: true` walks into a symlinked directory that
+  cycles back on itself — an accepted shim-scope limitation.
+
+### `Bun.$` (Bun Shell)
+
+**Honest scope note**: real Bun ships its own from-scratch, cross-platform shell
+interpreter (works on Windows too) with built-in implementations of common coreutils
+(`ls`/`cat`/`echo`/`sort`/`rm`/`mv`/`cp`/`mkdir`/`pwd`/`which`/`seq`/`yes`/...) that don't
+depend on `$PATH` at all — confirmed by probing real Bun 1.3.13: `` $`sort` ``
+`.env({FOO:'bar'})` still finds `sort` and works even though `.env()` **replaces** the
+entire visible environment, dropping `PATH` entirely.
+
+This shim instead shells out to the real host **`/bin/sh -c "<command>"`** via
+`ProcessBuilder` — a deliberate, documented trade-off:
+
+- Genuine POSIX pipes (`|`), `&&`/`||`, redirection (`>`, `>>`), and command substitution
+  (`$(...)`) come "for free" from the real shell — all confirmed against real Bun's own
+  behavior first, then confirmed to also work via a plain `/bin/sh -c`.
+- In exchange: this depends on external binaries actually being on `$PATH` (unlike real
+  Bun's built-in coreutils), and is **not cross-platform** — no Windows, since there is no
+  `/bin/sh` there.
+- Because of the `$PATH` dependency, `.env(...)` here **merges** onto the current process's
+  environment rather than fully replacing it the way real Bun's `.env()` does (safe for
+  real Bun only because its shell builtins don't need `PATH` at all) — an explicit,
+  documented divergence.
+- Real Bun's own shell-builtin glob expansion of bare/uninterpolated words (e.g. a literal
+  `*.txt` inside a command) is not reimplemented — whatever `/bin/sh` itself does with an
+  unquoted glob word is what happens (a plain non-interactive `sh -c` does not expand globs
+  the way an interactive shell's globbing might, in every case — this is a known gap, not a
+  parity claim).
+- Since `exit N` inside `sh -c` terminates the **entire** shell invocation immediately
+  (standard POSIX behavior), `` $`exit 1 || echo fallback` `` does **not** run the
+  fallback under this shim (the whole command exits 1) — real Bun's own shell apparently
+  treats a bare `exit` differently in that position. Use `false`/a nonzero-exiting external
+  command instead of a literal `exit N` when a command needs to participate in `&&`/`||`
+  chaining under this shim.
+
+**Interpolation is always inserted as a single shell-quoted literal argument, never
+re-parsed as shell syntax** — verified against real Bun with injection payloads
+(`$(...)`, a backtick command, `; ...`, `&& ...`, a bare `*.txt` glob) that all came back
+through `echo` completely unexpanded/uninterpreted. This shim reproduces that by
+POSIX-single-quoting each interpolated value (`'` → `'\''`) before splicing it into the
+command string handed to `/bin/sh -c`. An interpolated `Array` is joined with spaces, each
+element quoted individually (matches real Bun's `` $`echo ${["x","y","z"]}` `` → `"x y z"`).
+
+- `.text()`, `.json()`, `.quiet()`, `.nothrow()`, `.cwd(dir)`, `.env(obj)` are all supported.
+- Nonzero exit throws a `ShellError` (`.exitCode`, `.stdout`, `.stderr`) unless `.nothrow()`
+  was called.
+- Without `.quiet()`, output is captured **and** also written to the real process's
+  stdout/stderr (matching real Bun's default of both showing output live and making it
+  available on the awaited result).
+- `result.stdout`/`.stderr` are `Uint8Array`s with `.toString()`/`.text()`/`.json()`
+  convenience methods.
+
+### `Bun.resolveSync(specifier, parent)` / `Bun.resolve(specifier, parent)`
+
+Delegates to the exact same resolver that already backs CJS `require.resolve`
+(`InterceptingFileSystem.resolveRequireSpecifier`/`CjsRuntime.resolveRequireSpecifier`)
+rather than reimplementing Node/npm module resolution a second time — extensionless
+resolution, directory-index resolution, and `node_modules` package resolution all come from
+that single shared implementation. The one adaptation: real Bun reports a Node core module
+with a `node:`-prefix (`Bun.resolveSync('fs', dir)` → `'node:fs'`, verified against real Bun
+1.3.13) where the shared CJS resolver returns the bare specifier unchanged (matching Node's
+own `require.resolve` convention instead) — this shim adds the prefix itself for that one
+case. Throws a plain `Error` (not real Bun's `ResolveMessage` class) on an unresolvable
+specifier. `Bun.resolve` is the same resolution, wrapped in a `Promise`.
+
+### `Bun.pathToFileURL(path)` / `Bun.fileURLToPath(url)`
+
+Backed by `java.nio.file.Path`'s own `.toUri()` / `Paths.get(URI)` rather than hand-rolled
+URL-encoding logic. `fileURLToPath` accepts either a `URL` object or a `file:`-scheme
+string and throws a `TypeError` for any other scheme. Implementing this correctly surfaced
+(and fixed) a real, separate bug in the shared Node-compat `URL` polyfill
+(`node-stdlib/url.mjs`): its `href` getter only emitted the `//` authority marker when
+`hostname`/`username` were non-empty, so a `file:` URL for a local absolute path (always an
+empty-host URL) serialized as `file:/tmp/x` instead of the WHATWG-correct
+`file:///tmp/x` — this affected `url.pathToFileURL` too (same shared class), not just
+`Bun.pathToFileURL`. Fixed by special-casing `file:` to always include `//`.
+
 ## Not supported
 
 Everything below is genuinely absent — not stubbed, not throwing a clear "not implemented"

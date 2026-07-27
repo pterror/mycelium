@@ -219,7 +219,16 @@ class URL {
 
     get href() {
         let out = this._protocol;
-        if (this._hostname || this._username) {
+        // WHATWG "special" schemes (of which `file:` is one) always serialize the "//"
+        // authority marker even when the host is empty — e.g. `file:///tmp/x` (empty
+        // host, still "//"), not `file:/tmp/x`. This matters in practice for
+        // `pathToFileURL`/`Bun.pathToFileURL` below and Node's own `url.pathToFileURL`
+        // (same class): a local absolute path always parses to an empty-host `file:`
+        // URL, and without this, the "//" was silently dropped (verified as a real
+        // divergence from both Node's and real Bun's own `file:///...` output — this
+        // class has no `_hasAuthority` flag from parsing to fall back on, so `file:` is
+        // special-cased explicitly here rather than generalized to every scheme).
+        if (this._hostname || this._username || this._protocol === "file:") {
             out += "//";
             if (this._username) {
                 out += this._password ? `${this._username}:${this._password}@` : `${this._username}@`;

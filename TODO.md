@@ -344,18 +344,107 @@ All 60 `:library:test` tests pass and `:app:nativeCompile` succeeds at 25.0.0. `
 *Open threads from a previous session. Treat as starting context, not instructions — verify
 relevance before acting.*
 
-### Truffle Lua implementation — next focus
-Full from-scratch Lua 5.1 interpreter on GraalVM Truffle with polyglot interop. **Target Lua
-5.1 first** (smaller spec, widely embedded in C codebases, industrial baseline). Not blocked by
-upstream (unlike Python). Code comments must reference specific Lua 5.1 spec sections for
-clarity. Complements existing language support (JS/Ruby native, compile-to-JS languages,
-LLVM/WASM compiled languages). Covers: parser, AST nodes with Truffle specializations, table
-implementation (with metatables/metamethods), standard libraries (string/math/table/io/os),
-coroutines (via Truffle continuations), and polyglot interop annotations. Open questions:
-coroutine strategy on Truffle (continuations vs threads?), Lua's 1-based indexing in polyglot
-interop, LuaJIT extensions later. Value: Lua is widely used for config/scripting (embedded
-contexts, game engines); native Truffle implementation brings that entire ecosystem into
-Mycelium's shared polyglot Context alongside npm/PyPI/RubyGems.
+### HttpClient resource leak causing full-suite `:library:test` OOM — HIGH PRIORITY, newly found
+Reproducible on a quiet machine: each of `BunUtilTest`, `BunGlobShellTest`, `BunSocketTest`,
+`BunCompatTest`, `BunFuzzTest`, `BunWriteSpawnTest`, `NodeParityTest`,
+`MyceliumIntegrationTest` passes individually (376 tests total, 0 failures), but running them
+together in one Gradle test JVM triggers a non-terminating `OutOfMemoryError` cascade — errors
+thrown from `UncaughtExceptionHandler` in threads named `HttpClient-NNN-SelectorManager`,
+`HTTP-Dispatcher`, `idle-timeout-task`, with `NNN` climbing into the hundreds — exhausting the
+2g test-worker heap. **The full `:library:test` suite currently cannot complete in a single
+invocation** (two attempts, ~25min and ~9min+, neither finished).
+
+Suspected cause: `java.net.http.HttpClient` instances and their selector/dispatcher threads
+created per-test and never closed, accumulating across test classes that share one JVM.
+**Confirmed via git history** (not just a lead): `BunFuzzTest.kt`'s `httpClient` (a `by lazy`
+instance property, `library/src/test/kotlin/org/mycelium/library/BunFuzzTest.kt:156`) was
+introduced in commit `1bd6e41` ("feat: expand MIME_TYPES table to 454 entries + add fuzz
+property tests") — the same commit's own comment explains *why* it switched from
+`HttpURLConnection` to `HttpClient`: `HttpURLConnection` hard-rejects the `PATCH` method.
+jqwik property tests construct a fresh test-class instance per property iteration by default,
+so this `by lazy val` likely means one live `HttpClient` (and its selector-manager thread) per
+iteration, never closed — a plausible mechanism for the thread-count runaway, though not yet
+proven by a heap/thread dump. `MyceliumIntegrationTest.kt` only *mentions* `HttpClient` in a
+comment (line ~2033, about HTTP/2-to-1.1 fallback) — it does not appear to construct one
+itself, so on current evidence the leak is most likely isolated to `BunFuzzTest`, not spread
+across both files as originally suspected.
+
+JDK level: `flake.nix` pins the devShell's `JAVA_HOME` to `jdk21` (`graalvm-ce` itself is
+25.0.2-ish but `java = jdk21` is set explicitly, see `flake.nix:36,50`), and
+`java.net.http.HttpClient` became `AutoCloseable` in JDK 21 — so `httpClient.use { }` or an
+explicit `.close()`/shutdown in a `@AfterEach`/`@AfterAll` should be directly applicable, no
+JDK bump needed.
+
+Not yet checked: whether `Bun.serve`/`Bun.listen`/`Bun.udpSocket` shim servers started by other
+tests in the suite are all being stopped — they may leak their own threads/sockets
+independently of the `HttpClient` mechanism above, and could be a second contributing cause.
+
+### Daemon socket sharing / staleness risk — needs investigation, may or may not be a real bug
+Observed once, this session: a `mycelium` CLI invocation run from one git worktree was
+silently served by a stale daemon process started earlier from a *different* worktree with a
+different language-pack set, yielding a wrong-but-plausible result (`A language with id 'js'
+is not available. Available languages are: [python]`) instead of an error. The daemon socket
+appears to be a fixed path (`/run/user/1000/mycelium/daemon.sock`) — see `App.kt`'s
+`tryRunViaDaemon`/`DaemonLauncher`.
+
+This project's daemon already has a version handshake (see "Daemon reliability" above), but it's
+unclear whether that handshake also covers config/language-pack identity, or just binary
+version. Open questions, none answered yet:
+- Is the socket path keyed on anything (project dir, build hash, language-pack set), or always
+  the same fixed path regardless of what's running?
+- Is there an idle-timeout/staleness check that would have caught this (the 1h idle timeout
+  documented under "Daemon reliability" is about memory reclamation, not about detecting a
+  config mismatch)?
+- What happens if a user upgrades mycelium while an old daemon is still running, or works
+  across two projects needing different language packs, in the common case (not just this
+  sandbox)?
+
+Candidate fixes to weigh if this turns out to be real: key the socket path on project dir +
+language-pack set; extend the handshake so the client sends its expected config/language-pack
+set and the daemon refuses or restarts on mismatch (rather than just checking version); ensure
+an explicit no-daemon escape hatch exists (`--no-daemon` already exists per test usage
+elsewhere in this file — confirm it's documented/discoverable).
+
+**Caveat**: this was observed in a sandbox with concurrent agent sessions running against the
+same repo from multiple worktrees — it's possible (though not established either way) that
+this is partly an artifact of that environment rather than something a normal single-user
+workflow would hit.
+
+### Truffle Lua implementation — DONE (this section was stale — see below)
+**Correction to this file's own prior framing**: this section previously read "next focus" as
+if Lua support hadn't started. It has: `dfbd1b0` ("feat: Truffle Lua 5.1 — from-scratch
+interpreter with polyglot interop") through `a470176` ("fix: Lua 5.1 hardening") landed a full
+from-scratch Lua 5.1 Truffle language (own Gradle module, `lua/src/main/java/org/mycelium/lua/`)
+with parser, table/metatable implementation, string/math/table/io/os standard libraries,
+coroutines, 105+ spec-compliance tests, and acid tests against 6 real-world pure-Lua packages
+(`lua/src/test/resources/lua-libs/`: `inspect`, `middleclass`, `json`, `30log`, `serpent`,
+`fun`, `lume`, `luaunit`). It's wired into `Mycelium.kt`'s default language list
+(`LuaSupport`) alongside JS/Ruby/Python/C/Rust/TinyGo.
+
+**What's newly found to be open, not previously tracked**: `LanguageSupport.generateShim` (the
+mechanism a *host* language uses to expose values *to* an importing language) is confirmed
+exercised for Lua as the shim *target* — `jsImportsLua` in `MyceliumIntegrationTest.kt` proves
+JS importing from a `.lua` module works. **Lua as the *host* doing the importing is NOT
+verified** — `LuaSupport.generateShim` exists (`Languages.kt:376`) but there's no
+Lua-side `require`-equivalent wired up to exercise the reverse direction (Lua importing a JS/
+Ruby/other module) at all. Worth either implementing that direction or documenting the
+asymmetry more prominently in Lua-facing docs (there don't appear to be any yet beyond the
+README mention added in `bdd6135`).
+
+### Test suite housekeeping — fixed port + slow live-bun subprocess runs
+Two smaller, unrelated test-infra items surfaced this session, separate from the HttpClient
+OOM above:
+- **Tests bind fixed port 3000**, which collides when multiple test runs happen concurrently
+  (e.g. parallel git worktrees, as this session's environment has). `BunCompatTest.kt`'s
+  `bunServeDefaultPortIsUnspecified`-style test already self-skips via `assumeTrue` when 3000
+  is taken, but other `Bun.serve`/`Bun.listen` tests that don't specifically need to assert
+  the *default*-port behavior could bind an ephemeral port (`port: 0` and read back the actual
+  bound port) instead, removing the collision risk entirely rather than just detecting it.
+- **The suite spawns a real `bun` subprocess per live-parity check**, and runs with
+  `--no-daemon`, making full runs slow. If this becomes painful: batch the live-bun probes into
+  fewer subprocess invocations — `tooling/generate-bun-mime-table.mjs` already demonstrates
+  this pattern (700+ probes in one `bun` invocation) — and/or tag live-parity tests so they can
+  be run separately from the fast in-shim tests.
 
 ### HTTP imports could become first RemoteFileSystem provider
 Currently HTTP and RemoteFileSystem are separate paths in InterceptingFileSystem. Might be worth
@@ -480,9 +569,29 @@ question as Node's own `node:sqlite`), plus a long tail of Bun's real ~100+-memb
 object (`Bun.write`, `Bun.spawn`, `Bun.$`, `Bun.hash`, `Bun.password`, `Bun.build`,
 `Bun.Transpiler`, WebSocket support, ...) — see `docs/reference/bun-compat.md` for the
 checked-against-upstream "what's NOT supported" list, and `BunCompatTest.kt` for coverage
-including golden values obtained from a real `bun` 1.3.13 binary. Deno side: still not
-started at all (separate follow-up task, deliberately untouched by the Bun work) — the API
-surface for `Deno.*` globals remains well-documented upstream but large.
+including golden values obtained from a real `bun` 1.3.13 binary. **Structurally largest
+remaining Bun gaps** (see `docs/reference/bun-compat.md`'s "Not supported" section for the
+full, checked-against-upstream list — not re-enumerated here): `bun:ffi`/`Bun.dlopen` (needs a
+JVM foreign-function mechanism, e.g. the Java Foreign Function & Memory API or JNI — this is
+*not* blocked on N-API, which is Node's native-addon ABI and a separate concern), `bun:sqlite`
+(needs a JVM SQLite binding such as `sqlite-jdbc` as a new dependency — not Bun-specific,
+Node's own `node:sqlite` has the identical open question), `Bun.build`, `Bun.Transpiler`,
+`bun:test`, and the `Bun.S3`/`Bun.redis`/`Bun.SQL` clients. Smaller documented gaps (client-side
+`new WebSocket()`, TLS/unix-domain sockets for `Bun.connect`/`listen`/`udpSocket`,
+permessage-deflate, WebSocket-path keep-alive, backpressure/`drain`, several `Bun.hash`
+algorithms, some `CryptoHasher` algorithms, `Bun.peek`, `Bun.password`'s PBKDF2-not-argon2id
+divergence, `Bun.$`'s `/bin/sh`-backed divergences, `Bun.Glob` extglob negation,
+`Bun.openInEditor`, non-ASCII header mangling) are all cataloged in `bun-compat.md` with the
+reasoning for each — cross-reference there rather than duplicating.
+
+Deno side: still not started at all (separate follow-up task, deliberately untouched by the
+Bun work) — no `Deno.*` globals, no `Deno.readTextFile`/`writeTextFile`/`args`/`env`/`serve`,
+no `deno.json`/`deno.jsonc`/import-map handling, no `Deno.dlopen`, and **no detection logic**
+(`deno.lock`, `deno.json(c)`, URL-import signals) at all — the three-way Node→Bun→Deno
+priority order this file and `ROADMAP.md` describe under "Bun/Deno Compatibility Strategy" is
+still just the intended design for the Bun half; the Deno third is unimplemented in every
+respect, not partially started. The API surface for `Deno.*` globals is well-documented
+upstream but large.
 
 ### Value proposition — advanced this session, not settled
 Previously "genuinely unclear beyond 'it's funny.'" This session explored it extensively and

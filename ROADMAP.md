@@ -186,21 +186,31 @@ niche/deprecated modules, and the `NodeParityTest.kt` coverage gap) has since be
 see "npm acid testing" and "Node stdlib completion" above. Only genuinely open items remain
 below.*
 
-### Truffle Lua implementation — high priority
-Full from-scratch Lua interpreter on GraalVM Truffle with polyglot interop. Covers:
-- Parser and AST nodes with Truffle specializations (direct/computed assignment, locals vs globals)
-- Table implementation (Lua's unified hash/array data structure with metatables)
-- Standard libraries: string, math, table, io, os (API surface matching Lua 5.3+)
-- Metatables and metamethods (custom operators, indexing, arithmetic)
-- Coroutines (via Truffle continuation integration, `coroutine.create`/`resume`/`yield`)
-- Polyglot interop annotations for seamless Java/JS/Ruby/Python calls from Lua scripts
-- Code comments should reference specific Lua spec sections where relevant
+### Truffle Lua implementation — DONE (this entry was stale, corrected in this update)
+This entry previously read "high priority" as if unstarted. **It's done**: a full
+from-scratch Lua 5.1 interpreter (own Gradle module, `lua/src/main/java/org/mycelium/lua/`, not
+a GraalVM-published language) landed across `dfbd1b0` ("feat: Truffle Lua 5.1 — from-scratch
+interpreter with polyglot interop") through `a470176` ("fix: Lua 5.1 hardening — 3 bug fixes +
+6 missing stdlib functions"), covering:
+- Parser + AST with Truffle specializations
+- Table implementation with metatables/metamethods
+- Standard libraries: string, math, table, io, os (Lua 5.1 surface, not 5.3+ — 5.1 was the
+  deliberate target: smaller spec, the industrial-embedding baseline)
+- Coroutines
+- 105+ Lua-5.1-spec-compliance tests plus acid tests against 6 real-world pure-Lua packages
+  (`inspect`, `middleclass`, `json`, `30log`, `serpent`, `fun`, `lume`, `luaunit` — see
+  `lua/src/test/resources/lua-libs/`)
+- Wired into `Mycelium.kt`'s default language list (`LuaSupport`) alongside JS/Ruby/Python/C/
+  Rust/TinyGo, with `jsImportsLua` in `MyceliumIntegrationTest.kt` proving JS can import a
+  `.lua` module.
 
-Rationale: Lua is widely used in embedded contexts (game scripting, config files, extensions);
-a native Truffle implementation unifies Lua's ecosystem with Node/PyPI/RubyGems in Mycelium's
-polyglot context. Not blocked by upstream (unlike Python). Complements existing language
-coverage (JS native, Ruby native, Go/Rust/C as compile-to-LLVM/WASM; Lua would be the third
-native language after JS/Ruby).
+**What's newly open** (not previously tracked, and not part of the original "high priority"
+scope above): Lua as the *host* doing a cross-language import — as opposed to Lua as the
+import *target*, which `jsImportsLua` already proves works — is unverified.
+`LuaSupport.generateShim` exists but nothing exercises it from the Lua side, because Lua has no
+`require`-equivalent wired up to Mycelium's cross-language resolver yet. Worth either
+implementing that direction or documenting the asymmetry more prominently (see `TODO.md`'s
+"Truffle Lua implementation — DONE" entry for the same finding in more detail).
 
 - **In-flight, not yet landed**: stream/path submodules (`stream/promises`,
   `stream/consumers`, `stream/web`, `path/posix`, `path/win32`), a real `console` module, and
@@ -242,12 +252,24 @@ native language after JS/Ruby).
 - Present exactly one of {Bun, Deno} globals per package — never expose both `Bun` and
   `Deno` globals simultaneously (a package with inconsistent internal detection order would
   enter an untested mixed-codepath state).
-- Bun globals/APIs: `Bun.serve`, `Bun.file`, `Bun.env`, `Bun.argv`, `Bun.version`,
-  `Bun.revision` — **implemented**, first slice. `Bun.spawn`/`Bun.write`/`Bun.$`/`Bun.hash`/
-  `Bun.password`/`Bun.build`/`Bun.Transpiler`/`Bun.dlopen`/`bun:ffi`/`bun:sqlite`/`bun:test`/
-  WebSocket support and the rest of Bun's much larger real API surface — not started. See
-  `docs/reference/bun-compat.md` for the full, checked-against-upstream breakdown.
-- Deno globals/APIs: `Deno.readFile`, `Deno.serve`, `Deno.permissions`, etc. — not started.
+- Bun globals/APIs: **substantially more than "first slice" now** — `Bun.serve` (including
+  server-side WebSocket support), `Bun.file`, `Bun.write`, `Bun.spawn`/`spawnSync`, `Bun.$`
+  (shell), `Bun.Glob`, `Bun.connect`/`Bun.listen`/`Bun.udpSocket`, `Bun.hash` (most
+  sub-algorithms), `Bun.CryptoHasher`, `Bun.password` (PBKDF2, not real Bun's argon2id/bcrypt —
+  documented divergence), `Bun.deepEquals`, `Bun.escapeHTML`, `Bun.inspect`, `Bun.sleep`/
+  `sleepSync`, `Bun.nanoseconds`, `Bun.which`, `Bun.randomUUIDv7`, gzip/deflate helpers,
+  `Bun.stringWidth`, `Bun.resolveSync`/`resolve`, `Bun.pathToFileURL`/`fileURLToPath`, `Bun.env`/
+  `argv`/`version`/`revision` are all implemented. Structurally still missing:
+  `bun:ffi`/`Bun.dlopen` (needs a JVM FFI mechanism — unrelated to Node's N-API), `bun:sqlite`
+  (needs a JVM SQLite binding, e.g. `sqlite-jdbc` — same open question as Node's own
+  `node:sqlite`), `Bun.build`, `Bun.Transpiler`, `bun:test`, `Bun.S3`/`Bun.redis`/`Bun.SQL`,
+  client-side `new WebSocket()`. See `docs/reference/bun-compat.md`'s "Not supported" section
+  for the full, checked-against-upstream list (smaller gaps: TLS/unix sockets, permessage-
+  deflate, keep-alive, backpressure/`drain`, a few hash algorithms, `Bun.peek`, `Bun.Glob`
+  extglob negation, non-ASCII header mangling, and more — not re-enumerated here).
+- Deno globals/APIs: `Deno.readFile`, `Deno.serve`, `Deno.permissions`, etc. — **not started at
+  all**, including detection logic (no `deno.lock`/`deno.json(c)`/URL-import sniffing exists
+  yet either).
 - JSR registry support for Deno packages — not started.
 - Strategic framing: Node compat is the trojan horse; polyglot is the payload.
 
@@ -482,6 +504,9 @@ shimming mechanism used for Ruby/C.
 Direct Truffle support, no compile step.
 - JavaScript — **done** (the core language).
 - Ruby — **done**.
+- **Lua — done** (its own from-scratch Truffle language, `lua/` Gradle module, not GraalVM's;
+  this row was stale until this update — see "Truffle Lua implementation" under "Next" below,
+  which has been corrected from "high priority, not started" to "done").
 - Python — **blocked upstream** (see Medium term).
 - R (FastR) — GraalVM project exists, not yet integrated.
 - Espresso (Java-on-Truffle) — run Java as a guest language; not yet integrated.
@@ -597,14 +622,48 @@ new libraries, (2) most high-value npm packages that truly require native code a
    (`kotlinc-js`), but since Mycelium is itself a Kotlin/JVM application, it may be possible to
    invoke the Kotlin/JS compiler as an in-process library call instead of shelling out, saving
    process-spawn overhead per compile.
-8. **Stream/path submodules + console, and the readline circular-import fix — IN FLIGHT, not
-   yet landed as of this update.** `stream/promises`, `stream/consumers`, `stream/web`,
-   `path/posix`, `path/win32`, and a real `console` module were being added, and a fix for a
-   `readline`/`readline-promises` circular-import issue was in progress, at the time this doc
-   was last refreshed. Verify current status in-tree before relying on this as done or not
-   done — check for `stream-promises.mjs`/`stream-consumers.mjs`/`stream-web.mjs`/
-   `path-posix.mjs`/`path-win32.mjs`/`console.mjs` under
-   `library/src/main/resources/node-stdlib/` and whether they're committed.
+9. **HttpClient resource leak causing full-suite `:library:test` OOM — HIGH PRIORITY, newly
+   found.** Each of `BunUtilTest`/`BunGlobShellTest`/`BunSocketTest`/`BunCompatTest`/
+   `BunFuzzTest`/`BunWriteSpawnTest`/`NodeParityTest`/`MyceliumIntegrationTest` passes alone
+   (376 tests, 0 failures), but running them together in one Gradle test JVM triggers a
+   non-terminating `OutOfMemoryError` cascade from `HttpClient-NNN-SelectorManager`/
+   `HTTP-Dispatcher`/`idle-timeout-task` threads (`NNN` climbing into the hundreds) — the full
+   suite currently can't complete in one invocation. Confirmed via git history (`1bd6e41`) that
+   `BunFuzzTest.kt`'s `by lazy val httpClient` (switched from `HttpURLConnection` because it
+   rejects `PATCH`) is a plausible leak source — jqwik constructs a fresh test instance per
+   property iteration, so this may be one un-closed `HttpClient` per iteration. JDK is 21
+   (`flake.nix`), where `HttpClient` is `AutoCloseable`, so a fix (`.use { }` or explicit
+   close in `@AfterEach`) should be straightforward once confirmed. Not yet checked: whether
+   `Bun.serve`/`listen`/`udpSocket` shim servers in other tests are all stopped too. Full
+   detail in `TODO.md`'s matching entry.
+10. **Test suite housekeeping** — two smaller items found alongside the OOM investigation:
+    fixed port 3000 in several `Bun.serve`/`Bun.listen` tests collides across concurrent test
+    runs (e.g. parallel worktrees) — one test already `assumeTrue`-skips when 3000 is taken,
+    others could use an ephemeral port instead; and the suite's live-`bun`-subprocess parity
+    checks run with `--no-daemon` per invocation, making full runs slow — batching probes into
+    fewer subprocess calls (as `tooling/generate-bun-mime-table.mjs` already does) or tagging
+    live-parity tests separately from fast in-shim tests are both options if this becomes
+    painful.
+11. **Daemon socket sharing/staleness — needs investigation, not confirmed as a real bug.** One
+    observed incident: a `mycelium` invocation from one worktree was served by a stale daemon
+    from a different worktree with a different language-pack set, returning a wrong-but-
+    plausible result instead of an error. Daemon socket path appears fixed
+    (`/run/user/1000/mycelium/daemon.sock`); unclear whether the existing version handshake (see
+    "Daemon architecture" item 2 above) also covers config/language-pack identity, or just
+    binary version. Possibly an artifact of the concurrent-agent-worktree sandbox this was
+    observed in rather than a general-workflow bug — not established either way. Full detail
+    and candidate fixes in `TODO.md`'s matching entry.
+12. **Lua as cross-language import host — unverified, newly found.** Lua as the import *target*
+    is proven (`jsImportsLua`); Lua as the *host* doing an import of another language is not —
+    `LuaSupport.generateShim` exists but nothing exercises it, since Lua has no
+    `require`-equivalent wired to the cross-language resolver. See the corrected "Truffle Lua
+    implementation" entry under "Next" above (this whole item was stale until this update — Lua
+    is actually done, not "high priority, not started").
+13. **Stream/path submodules + console, and the readline circular-import fix — DONE (this entry
+    was stale).** This entry previously said "in flight, not yet landed" — confirmed in-tree
+    this session: `stream-promises.mjs`, `stream-consumers.mjs`, `stream-web.mjs`,
+    `path-posix.mjs`, `path-win32.mjs`, and `console.mjs` all exist under
+    `library/src/main/resources/node-stdlib/` (matches `TODO.md`'s "landed (`eb0611a`)" note).
 
 ## Open design questions
 
